@@ -1,0 +1,284 @@
+{
+  "$defs": {
+    "AuthoringPolicy": {
+      "additionalProperties": false,
+      "description": "One new immutable policy revision, optionally cloned from an applied one.",
+      "properties": {
+        "account_ids": {
+          "anyOf": [
+            {
+              "items": {
+                "pattern": "^acc_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                "title": "AccountId",
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Account Ids"
+        },
+        "account_selector": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Account Selector"
+        },
+        "allowed_triggers": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/RouteTrigger"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Allowed Triggers"
+        },
+        "clone_from_policy_id": {
+          "anyOf": [
+            {
+              "pattern": "^pol_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+              "title": "PolicyRevisionId",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Clone From Policy Id"
+        },
+        "deadline_ms": {
+          "anyOf": [
+            {
+              "maximum": 9000000,
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Deadline Ms"
+        },
+        "macro": {
+          "anyOf": [
+            {
+              "pattern": "^[a-z][a-z0-9_-]{0,63}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Macro"
+        },
+        "max_concurrency": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max Concurrency"
+        },
+        "max_waiters": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max Waiters"
+        },
+        "name": {
+          "anyOf": [
+            {
+              "maxLength": 120,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Name"
+        },
+        "policy_id": {
+          "pattern": "^pol_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+          "title": "PolicyRevisionId",
+          "type": "string"
+        },
+        "queue_tier": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Queue Tier"
+        },
+        "queue_weight": {
+          "anyOf": [
+            {
+              "maximum": 64,
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Queue Weight"
+        },
+        "rebind_shared": {
+          "default": false,
+          "title": "Rebind Shared",
+          "type": "boolean"
+        },
+        "route_group_ids": {
+          "anyOf": [
+            {
+              "items": {
+                "pattern": "^rg_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                "title": "RouteGroupId",
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Route Group Ids"
+        }
+      },
+      "required": [
+        "policy_id"
+      ],
+      "title": "AuthoringPolicy",
+      "type": "object"
+    },
+    "PolicyMacro": {
+      "additionalProperties": false,
+      "description": "Reusable queue/deadline authoring defaults; never emitted to a bundle.",
+      "properties": {
+        "deadline_ms": {
+          "maximum": 9000000,
+          "minimum": 1,
+          "title": "Deadline Ms",
+          "type": "integer"
+        },
+        "max_concurrency": {
+          "minimum": 1,
+          "title": "Max Concurrency",
+          "type": "integer"
+        },
+        "max_waiters": {
+          "minimum": 0,
+          "title": "Max Waiters",
+          "type": "integer"
+        },
+        "queue_tier": {
+          "minimum": 1,
+          "title": "Queue Tier",
+          "type": "integer"
+        },
+        "queue_weight": {
+          "maximum": 64,
+          "minimum": 1,
+          "title": "Queue Weight",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "queue_tier",
+        "queue_weight",
+        "max_concurrency",
+        "max_waiters",
+        "deadline_ms"
+      ],
+      "title": "PolicyMacro",
+      "type": "object"
+    },
+    "RouteTrigger": {
+      "description": "Typed causes that may activate a non-primary leg (design: V1 triggers).",
+      "enum": [
+        "primary",
+        "capacity_spill",
+        "failure_fallback",
+        "quota_fallback",
+        "manual_emergency",
+        "shadow"
+      ],
+      "title": "RouteTrigger",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "description": "Secret-free authoring input applied as additions to one immutable base bundle.",
+  "properties": {
+    "macros": {
+      "patternProperties": {
+        "^[a-z][a-z0-9_-]{0,63}$": {
+          "$ref": "#/$defs/PolicyMacro"
+        }
+      },
+      "title": "Macros",
+      "type": "object"
+    },
+    "policies": {
+      "items": {
+        "$ref": "#/$defs/AuthoringPolicy"
+      },
+      "minItems": 1,
+      "title": "Policies",
+      "type": "array"
+    },
+    "schema_version": {
+      "const": 1,
+      "default": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "policies"
+  ],
+  "title": "AuthoringConfigV1",
+  "type": "object"
+}

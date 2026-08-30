@@ -11,7 +11,10 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
 ]
-dependencies = ["pydantic>=2.9,<3"]
+dependencies = [
+    "cryptography>=44,<47",
+    "pydantic>=2.9,<3",
+]
 
 [project.scripts]
 llmmaxxing = "llmmaxxing.cli.main:main"
