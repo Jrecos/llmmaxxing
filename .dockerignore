@@ -1,0 +1,15 @@
+.git
+.venv
+.github
+tests
+docs
+benchmarks
+compatibility
+schemas
+deploy
+**/__pycache__
+**/.mypy_cache
+**/.pytest_cache
+**/.ruff_cache
+ui/node_modules
+ui/dist

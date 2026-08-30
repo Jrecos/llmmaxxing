@@ -1,0 +1,10 @@
+{
+  "name": "llmmaxxing-ui",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/smoke.test.js",
+    "build": "mkdir -p dist && cp -r src/. dist/"
+  }
+}

@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+
+# Environment
+.env
+.env.*
+
+# Node / UI
+node_modules/
+ui/dist/
+
+# State and local artifacts
+/var/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# Editors and OS
+.idea/
+.vscode/
+.DS_Store
