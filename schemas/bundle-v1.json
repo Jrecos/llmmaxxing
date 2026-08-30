@@ -1,0 +1,434 @@
+{
+  "$defs": {
+    "AccountState": {
+      "description": "Provider Account lifecycle; DRAFT means unmeasured/never servable.",
+      "enum": [
+        "draft",
+        "active",
+        "disabled",
+        "tombstoned"
+      ],
+      "title": "AccountState",
+      "type": "string"
+    },
+    "ClientKeyRecord": {
+      "additionalProperties": false,
+      "description": "Gateway-verifiable client key record: only the HMAC verifier is stored.",
+      "properties": {
+        "credential_generation": {
+          "maximum": 2,
+          "minimum": 1,
+          "title": "Credential Generation",
+          "type": "integer"
+        },
+        "expires_at_s": {
+          "exclusiveMinimum": 0,
+          "title": "Expires At S",
+          "type": "integer"
+        },
+        "key_id": {
+          "pattern": "^[0-9a-f]{32}$",
+          "title": "Key Id",
+          "type": "string"
+        },
+        "policy_id": {
+          "pattern": "^pol_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+          "title": "PolicyRevisionId",
+          "type": "string"
+        },
+        "state": {
+          "$ref": "#/$defs/KeyLifecycleState"
+        },
+        "verifier_hex": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Verifier Hex",
+          "type": "string"
+        }
+      },
+      "required": [
+        "key_id",
+        "verifier_hex",
+        "policy_id",
+        "state",
+        "expires_at_s",
+        "credential_generation"
+      ],
+      "title": "ClientKeyRecord",
+      "type": "object"
+    },
+    "KeyLifecycleState": {
+      "description": "Client-key lifecycle: DRAFT → ENABLED ↔ SUSPENDED → REVOKED.",
+      "enum": [
+        "draft",
+        "enabled",
+        "suspended",
+        "revoked"
+      ],
+      "title": "KeyLifecycleState",
+      "type": "string"
+    },
+    "KeyPolicyRevision": {
+      "additionalProperties": false,
+      "description": "One complete immutable policy revision bound to client keys.",
+      "properties": {
+        "allowed_account_ids": {
+          "items": {
+            "pattern": "^acc_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+            "title": "AccountId",
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Allowed Account Ids",
+          "type": "array"
+        },
+        "allowed_triggers": {
+          "items": {
+            "$ref": "#/$defs/RouteTrigger"
+          },
+          "minItems": 1,
+          "title": "Allowed Triggers",
+          "type": "array"
+        },
+        "deadline_ms": {
+          "maximum": 9000000,
+          "minimum": 1,
+          "title": "Deadline Ms",
+          "type": "integer"
+        },
+        "max_concurrency": {
+          "minimum": 1,
+          "title": "Max Concurrency",
+          "type": "integer"
+        },
+        "max_waiters": {
+          "minimum": 0,
+          "title": "Max Waiters",
+          "type": "integer"
+        },
+        "name": {
+          "maxLength": 120,
+          "minLength": 1,
+          "title": "Name",
+          "type": "string"
+        },
+        "policy_id": {
+          "pattern": "^pol_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+          "title": "PolicyRevisionId",
+          "type": "string"
+        },
+        "queue_tier": {
+          "minimum": 1,
+          "title": "Queue Tier",
+          "type": "integer"
+        },
+        "queue_weight": {
+          "maximum": 64,
+          "minimum": 1,
+          "title": "Queue Weight",
+          "type": "integer"
+        },
+        "route_group_ids": {
+          "items": {
+            "pattern": "^rg_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+            "title": "RouteGroupId",
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Route Group Ids",
+          "type": "array"
+        }
+      },
+      "required": [
+        "policy_id",
+        "name",
+        "route_group_ids",
+        "allowed_account_ids",
+        "allowed_triggers",
+        "queue_tier",
+        "queue_weight",
+        "max_concurrency",
+        "max_waiters",
+        "deadline_ms"
+      ],
+      "title": "KeyPolicyRevision",
+      "type": "object"
+    },
+    "ProviderAccount": {
+      "additionalProperties": false,
+      "description": "One real shared upstream quota boundary (not a vendor brand).",
+      "properties": {
+        "account_id": {
+          "pattern": "^acc_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+          "title": "AccountId",
+          "type": "string"
+        },
+        "binding_ref": {
+          "default": "",
+          "title": "Binding Ref",
+          "type": "string"
+        },
+        "connection": {
+          "default": "",
+          "title": "Connection",
+          "type": "string"
+        },
+        "display_name": {
+          "maxLength": 120,
+          "minLength": 1,
+          "title": "Display Name",
+          "type": "string"
+        },
+        "max_in_flight": {
+          "maximum": 128,
+          "minimum": 1,
+          "title": "Max In Flight",
+          "type": "integer"
+        },
+        "monthly_quota_units": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Monthly Quota Units"
+        },
+        "provider_token": {
+          "default": "",
+          "title": "Provider Token",
+          "type": "string"
+        },
+        "rpm_limit": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Rpm Limit"
+        },
+        "state": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AccountState"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "tpm_limit": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Tpm Limit"
+        },
+        "window_seconds": {
+          "default": 60,
+          "exclusiveMinimum": 0,
+          "maximum": 3600,
+          "title": "Window Seconds",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "account_id",
+        "display_name",
+        "max_in_flight"
+      ],
+      "title": "ProviderAccount",
+      "type": "object"
+    },
+    "RouteGroupRevision": {
+      "additionalProperties": false,
+      "description": "Immutable revision of one client-visible model and its ordered legs.",
+      "properties": {
+        "legs": {
+          "items": {
+            "$ref": "#/$defs/RouteLeg"
+          },
+          "minItems": 1,
+          "title": "Legs",
+          "type": "array"
+        },
+        "name": {
+          "maxLength": 120,
+          "minLength": 1,
+          "title": "Name",
+          "type": "string"
+        },
+        "route_group_id": {
+          "pattern": "^rg_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+          "title": "RouteGroupId",
+          "type": "string"
+        },
+        "strategy": {
+          "$ref": "#/$defs/RouteStrategy"
+        }
+      },
+      "required": [
+        "route_group_id",
+        "name",
+        "strategy",
+        "legs"
+      ],
+      "title": "RouteGroupRevision",
+      "type": "object"
+    },
+    "RouteLeg": {
+      "additionalProperties": false,
+      "description": "One ordered candidate leg inside a Route Group revision.",
+      "properties": {
+        "account_id": {
+          "pattern": "^acc_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+          "title": "AccountId",
+          "type": "string"
+        },
+        "generation_id": {
+          "pattern": "^dg1_[0-9a-f]{64}$",
+          "title": "DeploymentGenerationId",
+          "type": "string"
+        },
+        "leg_id": {
+          "pattern": "^leg_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+          "title": "RouteLegId",
+          "type": "string"
+        },
+        "order": {
+          "minimum": 1,
+          "title": "Order",
+          "type": "integer"
+        },
+        "triggers": {
+          "items": {
+            "$ref": "#/$defs/RouteTrigger"
+          },
+          "minItems": 1,
+          "title": "Triggers",
+          "type": "array"
+        }
+      },
+      "required": [
+        "leg_id",
+        "order",
+        "triggers",
+        "account_id",
+        "generation_id"
+      ],
+      "title": "RouteLeg",
+      "type": "object"
+    },
+    "RouteStrategy": {
+      "description": "V1 supports exactly one deterministic strategy; others fail closed.",
+      "enum": [
+        "ordered_capacity"
+      ],
+      "title": "RouteStrategy",
+      "type": "string"
+    },
+    "RouteTrigger": {
+      "description": "Typed causes that may activate a non-primary leg (design: V1 triggers).",
+      "enum": [
+        "primary",
+        "capacity_spill",
+        "failure_fallback",
+        "quota_fallback",
+        "manual_emergency",
+        "shadow"
+      ],
+      "title": "RouteTrigger",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "description": "The complete immutable enforcement snapshot applied by one generation.",
+  "properties": {
+    "accounts": {
+      "items": {
+        "$ref": "#/$defs/ProviderAccount"
+      },
+      "minItems": 1,
+      "title": "Accounts",
+      "type": "array"
+    },
+    "backend_manifest_hash": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Backend Manifest Hash",
+      "type": "string"
+    },
+    "generation": {
+      "minimum": 1,
+      "title": "Generation",
+      "type": "integer"
+    },
+    "keys": {
+      "items": {
+        "$ref": "#/$defs/ClientKeyRecord"
+      },
+      "minItems": 1,
+      "title": "Keys",
+      "type": "array"
+    },
+    "min_reader": {
+      "title": "Min Reader",
+      "type": "string"
+    },
+    "policies": {
+      "items": {
+        "$ref": "#/$defs/KeyPolicyRevision"
+      },
+      "minItems": 1,
+      "title": "Policies",
+      "type": "array"
+    },
+    "required_features": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Required Features",
+      "type": "array"
+    },
+    "route_groups": {
+      "items": {
+        "$ref": "#/$defs/RouteGroupRevision"
+      },
+      "minItems": 1,
+      "title": "Route Groups",
+      "type": "array"
+    },
+    "schema_version": {
+      "const": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "schema_version",
+    "generation",
+    "min_reader",
+    "required_features",
+    "keys",
+    "policies",
+    "accounts",
+    "route_groups",
+    "backend_manifest_hash"
+  ],
+  "title": "PolicyBundleV1",
+  "type": "object"
+}
