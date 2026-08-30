@@ -152,7 +152,9 @@ def test_preview_binds_applied_base_fences_and_exact_key_set() -> None:
         }
     )
     with pytest.raises(StalePreview, match="base bundle|key set"):
-        preview.verify_against(changed_key_set)
+        preview.verify_against(
+            changed_key_set, source_fingerprint=preview.source_fingerprint
+        )
 
     changed_binding = PolicyBundleV1.model_validate(
         {
@@ -165,11 +167,16 @@ def test_preview_binds_applied_base_fences_and_exact_key_set() -> None:
         }
     )
     with pytest.raises(StalePreview):
-        preview.verify_against(changed_binding)
+        preview.verify_against(
+            changed_binding, source_fingerprint=preview.source_fingerprint
+        )
 
     preview.verify_against(base, source_fingerprint=preview.source_fingerprint)
     with pytest.raises(StalePreview, match="source fingerprint"):
         preview.verify_against(base, source_fingerprint="0" * 64)
+    with pytest.raises(StalePreview, match="fresh source fingerprint"):
+        preview.verify_against(base)
+
 
 
 def test_semantic_diff_and_impact_hash_are_exact_and_content_sensitive() -> None:
@@ -191,6 +198,87 @@ def test_semantic_diff_and_impact_hash_are_exact_and_content_sensitive() -> None
     assert changed.diff.changed_policy_ids == (NEW_POLICY_ID,)
     assert changed.target_content_hash != first.target_content_hash
     assert changed.impact_hash != first.impact_hash
+
+
+def test_affected_keys_use_each_policy_effective_authorized_leg_projection() -> None:
+    spill_account_id = AccountId("acc_bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+    spill_leg_id = RouteLegId("leg_bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+    primary = _account()
+    spill = ProviderAccount.model_validate(
+        {
+            **primary.model_dump(mode="python"),
+            "account_id": spill_account_id,
+            "display_name": "spill",
+            "connection": "spill-connection",
+            "provider_token": "spill-provider",
+            "binding_ref": "spill-binding",
+        }
+    )
+
+    def group(spill_digest: str) -> RouteGroupRevision:
+        return RouteGroupRevision(
+            route_group_id=GROUP_ID,
+            name="pooled",
+            strategy=RouteStrategy.ORDERED_CAPACITY,
+            legs=(
+                RouteLeg(
+                    leg_id=LEG_ID,
+                    order=10,
+                    triggers=(RouteTrigger.PRIMARY,),
+                    account_id=ACCOUNT_ID,
+                    generation_id=DeploymentGenerationId.from_digest("4" * 64),
+                ),
+                RouteLeg(
+                    leg_id=spill_leg_id,
+                    order=20,
+                    triggers=(RouteTrigger.CAPACITY_SPILL,),
+                    account_id=spill_account_id,
+                    generation_id=DeploymentGenerationId.from_digest(spill_digest * 64),
+                ),
+            ),
+        )
+
+    def trigger_policy(
+        policy_id: PolicyRevisionId, trigger: RouteTrigger
+    ) -> KeyPolicyRevision:
+        return KeyPolicyRevision(
+            policy_id=policy_id,
+            name=f"{trigger.value}-only",
+            route_group_ids=(GROUP_ID,),
+            allowed_account_ids=(ACCOUNT_ID, spill_account_id),
+            allowed_triggers=(trigger,),
+            queue_tier=20,
+            queue_weight=2,
+            max_concurrency=2,
+            max_waiters=4,
+            deadline_ms=60_000,
+        )
+
+    policies = (
+        trigger_policy(OLD_POLICY_ID, RouteTrigger.PRIMARY),
+        trigger_policy(NEW_POLICY_ID, RouteTrigger.CAPACITY_SPILL),
+    )
+
+    def bundle(generation: int, spill_digest: str) -> PolicyBundleV1:
+        return PolicyBundleV1(
+            schema_version=1,
+            generation=generation,
+            min_reader="1.0",
+            required_features=("ordered_capacity",),
+            keys=(
+                _key(KEY_A, OLD_POLICY_ID, "5"),
+                _key(KEY_B, NEW_POLICY_ID, "6"),
+            ),
+            policies=policies,
+            accounts=(primary, spill),
+            route_groups=(group(spill_digest),),
+            backend_manifest_hash="7" * 64,
+        )
+
+    preview = plan_change(bundle(20, "8"), bundle(21, "9"))
+
+    assert preview.diff.changed_leg_ids == (spill_leg_id,)
+    assert preview.affected_key_ids == (KEY_B,)
 
 
 def test_impact_plan_export_contains_no_secret_material() -> None:

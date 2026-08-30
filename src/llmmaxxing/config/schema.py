@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 import json
-import re
 import sys
 from typing import Annotated, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    WithJsonSchema,
+    field_validator,
+    model_validator,
+)
 
 from llmmaxxing.core.canonical import canonical_json_bytes, content_hash
 from llmmaxxing.core.ids import AccountId, PolicyRevisionId, RouteGroupId
@@ -15,11 +21,66 @@ from llmmaxxing.core.reasons import RouteTrigger
 
 _NAME = Annotated[str, Field(min_length=1, max_length=120)]
 _MACRO_NAME = Annotated[str, Field(pattern=r"^[a-z][a-z0-9_-]{0,63}$")]
+_LABEL_NAME = Annotated[str, Field(pattern=r"^[a-z][a-z0-9_.-]{0,63}$")]
+_LABEL_VALUE = Annotated[str, Field(min_length=1, max_length=120)]
+_ACCOUNT_SELECTOR = Annotated[
+    dict[_LABEL_NAME, _LABEL_VALUE],
+    Field(min_length=1, max_length=16),
+    WithJsonSchema(
+        {
+            "type": "object",
+            "minProperties": 1,
+            "maxProperties": 16,
+            "propertyNames": {"pattern": r"^[a-z][a-z0-9_.-]{0,63}$"},
+            "additionalProperties": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 120,
+            },
+        }
+    ),
+]
+_AUTHORING_POLICY_CONDITIONS = {
+    "allOf": [
+        {"not": {"required": ["account_ids", "account_selector"]}},
+        {
+            "anyOf": [
+                {
+                    "required": ["account_ids"],
+                    "properties": {"account_ids": {"type": "array"}},
+                },
+                {
+                    "required": ["account_selector"],
+                    "properties": {"account_selector": {"type": "object"}},
+                },
+                {
+                    "required": ["clone_from_policy_id"],
+                    "properties": {"clone_from_policy_id": {"type": "string"}},
+                },
+            ]
+        },
+        {
+            "if": {
+                "properties": {"rebind_shared": {"const": True}},
+                "required": ["rebind_shared"],
+            },
+            "then": {
+                "required": ["clone_from_policy_id"],
+                "properties": {"clone_from_policy_id": {"type": "string"}},
+            },
+        },
+    ]
+}
 _SOURCE_DOMAIN = b"llmmaxxing.authoring.v1\x00"
 
 
 class _AuthoringModel(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+    model_config = ConfigDict(
+        frozen=True,
+        strict=True,
+        extra="forbid",
+        revalidate_instances="always",
+    )
 
 
 class PolicyMacro(_AuthoringModel):
@@ -34,16 +95,24 @@ class PolicyMacro(_AuthoringModel):
 
 class AuthoringPolicy(_AuthoringModel):
     """One new immutable policy revision, optionally cloned from an applied one."""
+    model_config = ConfigDict(json_schema_extra=_AUTHORING_POLICY_CONDITIONS)
+
 
     policy_id: PolicyRevisionId
     name: _NAME | None = None
     clone_from_policy_id: PolicyRevisionId | None = None
     rebind_shared: bool = False
     macro: _MACRO_NAME | None = None
-    route_group_ids: tuple[RouteGroupId, ...] | None = None
-    account_ids: tuple[AccountId, ...] | None = None
-    account_selector: dict[str, str] | None = None
-    allowed_triggers: tuple[RouteTrigger, ...] | None = None
+    route_group_ids: tuple[RouteGroupId, ...] | None = Field(
+        default=None, min_length=1, json_schema_extra={"uniqueItems": True}
+    )
+    account_ids: tuple[AccountId, ...] | None = Field(
+        default=None, min_length=1, json_schema_extra={"uniqueItems": True}
+    )
+    account_selector: _ACCOUNT_SELECTOR | None = None
+    allowed_triggers: tuple[RouteTrigger, ...] | None = Field(
+        default=None, min_length=1, json_schema_extra={"uniqueItems": True}
+    )
     queue_tier: int | None = Field(default=None, ge=1)
     queue_weight: int | None = Field(default=None, ge=1, le=64)
     max_concurrency: int | None = Field(default=None, ge=1)
@@ -61,24 +130,23 @@ class AuthoringPolicy(_AuthoringModel):
 
     @field_validator("account_selector")
     @classmethod
-    def _selector_is_bounded(cls, value: dict[str, str] | None) -> dict[str, str] | None:
-        if value is None:
-            return None
-        if not value:
-            raise ValueError("account selector cannot be empty")
-        if len(value) > 16:
-            raise ValueError("account selector may contain at most 16 labels")
-        for key, item in value.items():
-            if not re.fullmatch(r"[a-z][a-z0-9_.-]{0,63}", key):
-                raise ValueError(f"invalid account selector label {key!r}")
-            if not item or len(item) > 120:
-                raise ValueError(f"invalid account selector value for {key!r}")
-        return value
+    def _copy_selector(
+        cls, value: dict[str, str] | None
+    ) -> dict[str, str] | None:
+        return None if value is None else dict(value)
 
     @model_validator(mode="after")
     def _authoring_mode_is_unambiguous(self) -> Self:
         if self.account_ids is not None and self.account_selector is not None:
             raise ValueError("use either exact account_ids or account_selector, never both")
+        if (
+            self.clone_from_policy_id is None
+            and self.account_ids is None
+            and self.account_selector is None
+        ):
+            raise ValueError(
+                "a direct policy requires account_ids or account_selector"
+            )
         if self.rebind_shared and self.clone_from_policy_id is None:
             raise ValueError("rebind_shared requires clone_from_policy_id")
         if self.clone_from_policy_id == self.policy_id:

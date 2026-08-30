@@ -2,6 +2,72 @@
   "$defs": {
     "AuthoringPolicy": {
       "additionalProperties": false,
+      "allOf": [
+        {
+          "not": {
+            "required": [
+              "account_ids",
+              "account_selector"
+            ]
+          }
+        },
+        {
+          "anyOf": [
+            {
+              "properties": {
+                "account_ids": {
+                  "type": "array"
+                }
+              },
+              "required": [
+                "account_ids"
+              ]
+            },
+            {
+              "properties": {
+                "account_selector": {
+                  "type": "object"
+                }
+              },
+              "required": [
+                "account_selector"
+              ]
+            },
+            {
+              "properties": {
+                "clone_from_policy_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "clone_from_policy_id"
+              ]
+            }
+          ]
+        },
+        {
+          "if": {
+            "properties": {
+              "rebind_shared": {
+                "const": true
+              }
+            },
+            "required": [
+              "rebind_shared"
+            ]
+          },
+          "then": {
+            "properties": {
+              "clone_from_policy_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "clone_from_policy_id"
+            ]
+          }
+        }
+      ],
       "description": "One new immutable policy revision, optionally cloned from an applied one.",
       "properties": {
         "account_ids": {
@@ -12,6 +78,7 @@
                 "title": "AccountId",
                 "type": "string"
               },
+              "minItems": 1,
               "type": "array"
             },
             {
@@ -19,13 +86,21 @@
             }
           ],
           "default": null,
-          "title": "Account Ids"
+          "title": "Account Ids",
+          "uniqueItems": true
         },
         "account_selector": {
           "anyOf": [
             {
               "additionalProperties": {
+                "maxLength": 120,
+                "minLength": 1,
                 "type": "string"
+              },
+              "maxProperties": 16,
+              "minProperties": 1,
+              "propertyNames": {
+                "pattern": "^[a-z][a-z0-9_.-]{0,63}$"
               },
               "type": "object"
             },
@@ -42,6 +117,7 @@
               "items": {
                 "$ref": "#/$defs/RouteTrigger"
               },
+              "minItems": 1,
               "type": "array"
             },
             {
@@ -49,7 +125,8 @@
             }
           ],
           "default": null,
-          "title": "Allowed Triggers"
+          "title": "Allowed Triggers",
+          "uniqueItems": true
         },
         "clone_from_policy_id": {
           "anyOf": [
@@ -177,6 +254,7 @@
                 "title": "RouteGroupId",
                 "type": "string"
               },
+              "minItems": 1,
               "type": "array"
             },
             {
@@ -184,7 +262,8 @@
             }
           ],
           "default": null,
-          "title": "Route Group Ids"
+          "title": "Route Group Ids",
+          "uniqueItems": true
         }
       },
       "required": [

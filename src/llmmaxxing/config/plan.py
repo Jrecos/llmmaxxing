@@ -94,6 +94,10 @@ class ImpactPlan(_Frozen):
         source_fingerprint: str | None = None,
     ) -> None:
         """Raise :class:`StalePreview` unless every reviewed base fence still matches."""
+        if source_fingerprint is None:
+            raise StalePreview(
+                "fresh source fingerprint is required to verify an impact plan"
+            )
         current = PolicyBundleV1.model_validate(current.model_dump(mode="python"))
         if current.generation != self.base_generation:
             raise StalePreview("base bundle generation changed")
@@ -107,7 +111,7 @@ class ImpactPlan(_Frozen):
             raise StalePreview("key set fence changed")
         if _key_bindings(current) != self.expected_key_bindings:
             raise StalePreview("exact key bindings changed")
-        if source_fingerprint is not None and source_fingerprint != self.source_fingerprint:
+        if source_fingerprint != self.source_fingerprint:
             raise StalePreview("source fingerprint changed")
 
 
@@ -206,37 +210,64 @@ def _semantic_diff(base: PolicyBundleV1, target: PolicyBundleV1) -> SemanticDiff
     )
 
 
+def _effective_key_projection(
+    bundle: PolicyBundleV1,
+    key_id: str,
+) -> object:
+    """Return only runtime semantics reachable through one key's policy."""
+    keys = {key.key_id: key for key in bundle.keys}
+    key = keys.get(key_id)
+    if key is None:
+        return None
+    policies = {policy.policy_id: policy for policy in bundle.policies}
+    groups = {group.route_group_id: group for group in bundle.route_groups}
+    accounts = {account.account_id: account for account in bundle.accounts}
+    policy = policies[key.policy_id]
+    allowed_accounts = frozenset(policy.allowed_account_ids)
+    allowed_triggers = frozenset(policy.allowed_triggers)
+    effective_groups = []
+    for group_id in policy.route_group_ids:
+        group = groups[group_id]
+        legs = [
+            {
+                "leg": leg.model_dump(mode="json"),
+                "account": accounts[leg.account_id].model_dump(mode="json"),
+            }
+            for leg in group.legs
+            if leg.account_id in allowed_accounts
+            and any(trigger in allowed_triggers for trigger in leg.triggers)
+        ]
+        effective_groups.append(
+            {
+                "route_group_id": group.route_group_id,
+                "name": group.name,
+                "strategy": group.strategy,
+                "legs": legs,
+            }
+        )
+    return {
+        "key": key.model_dump(mode="json"),
+        "policy": policy.model_dump(mode="json"),
+        "route_groups": effective_groups,
+    }
+
+
 def _affected_keys(
     base: PolicyBundleV1,
     target: PolicyBundleV1,
     diff: SemanticDiff,
 ) -> tuple[str, ...]:
-    bundles = (base, target)
-    affected = set(diff.changed_key_ids)
+    key_ids = {key.key_id for bundle in (base, target) for key in bundle.keys}
     if diff.backend_manifest_changed or diff.min_reader_changed or diff.required_features_changed:
-        affected.update(key.key_id for bundle in bundles for key in bundle.keys)
-
-    impacted_groups = set(diff.changed_route_group_ids)
-    changed_legs = frozenset(diff.changed_leg_ids)
-    changed_accounts = frozenset(diff.changed_account_ids)
-    for bundle in bundles:
-        for group in bundle.route_groups:
-            if any(
-                leg.leg_id in changed_legs or leg.account_id in changed_accounts
-                for leg in group.legs
-            ):
-                impacted_groups.add(group.route_group_id)
-
-    impacted_policies = set(diff.changed_policy_ids)
-    for bundle in bundles:
-        for policy in bundle.policies:
-            if (
-                set(policy.route_group_ids) & impacted_groups
-                or set(policy.allowed_account_ids) & changed_accounts
-            ):
-                impacted_policies.add(policy.policy_id)
-        affected.update(key.key_id for key in bundle.keys if key.policy_id in impacted_policies)
-    return tuple(sorted(affected))
+        return tuple(sorted(key_ids))
+    return tuple(
+        sorted(
+            key_id
+            for key_id in key_ids
+            if _effective_key_projection(base, key_id)
+            != _effective_key_projection(target, key_id)
+        )
+    )
 
 
 def _jsonable(value: object) -> object:

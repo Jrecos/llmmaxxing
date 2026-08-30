@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+import json
+
 from pathlib import Path
 
 import pytest
+from jsonschema import Draft202012Validator
+from jsonschema.exceptions import ValidationError as JsonSchemaValidationError
+from pydantic import ValidationError as PydanticValidationError
+
 
 from llmmaxxing.config.compile import DiscoverySnapshot, compile_authoring
 from llmmaxxing.config.schema import (
@@ -287,3 +293,58 @@ def test_authoring_schema_is_deterministic_and_contains_no_secret_fields() -> No
         b"binding_ref",
     ):
         assert forbidden not in generated
+
+
+def test_authoring_schema_and_pydantic_share_acceptance_vectors() -> None:
+    schema_validator = Draft202012Validator(AuthoringConfigV1.model_json_schema())
+    exact = _direct_policy(account_ids=(NAN_ID, ARLIAI_ID)).model_dump(
+        mode="json", exclude_none=True
+    )
+    selector = _direct_policy(
+        selector={"billing": "unlimited", "trust": "approved"}
+    ).model_dump(mode="json", exclude_none=True)
+    clone_rebind = AuthoringPolicy(
+        policy_id=SHARED_POLICY_ID,
+        clone_from_policy_id=BASE_POLICY_ID,
+        rebind_shared=True,
+    ).model_dump(mode="json", exclude_none=True)
+
+    for policy in (exact, selector, clone_rebind):
+        document = {"schema_version": 1, "policies": [policy]}
+        AuthoringConfigV1.model_validate_json(json.dumps(document))
+        schema_validator.validate(document)
+
+    invalid = (
+        {**selector, "account_selector": {}},
+        {**selector, "account_selector": {f"label-{index}": "x" for index in range(17)}},
+        {**selector, "account_selector": {"BadLabel": "x"}},
+        {**selector, "account_selector": {"billing": ""}},
+        {**exact, "account_selector": {"billing": "unlimited"}},
+        {**exact, "account_ids": [str(NAN_ID), str(NAN_ID)]},
+        {**clone_rebind, "clone_from_policy_id": None},
+        {**exact, "queue_tier": "20"},
+    )
+    for policy in invalid:
+        document = {"schema_version": 1, "policies": [policy]}
+        with pytest.raises(PydanticValidationError):
+            AuthoringConfigV1.model_validate_json(json.dumps(document))
+        with pytest.raises(JsonSchemaValidationError):
+            schema_validator.validate(document)
+
+
+def test_authoring_schema_emits_selector_membership_and_condition_constraints() -> None:
+    schema = AuthoringConfigV1.model_json_schema()
+    policy = schema["$defs"]["AuthoringPolicy"]
+    selector = policy["properties"]["account_selector"]["anyOf"][0]
+
+    assert selector["minProperties"] == 1
+    assert selector["maxProperties"] == 16
+    assert selector["propertyNames"]["pattern"] == r"^[a-z][a-z0-9_.-]{0,63}$"
+    assert selector["additionalProperties"] == {
+        "maxLength": 120,
+        "minLength": 1,
+        "type": "string",
+    }
+    for field in ("route_group_ids", "account_ids", "allowed_triggers"):
+        assert policy["properties"][field]["uniqueItems"] is True
+    assert policy["allOf"]
