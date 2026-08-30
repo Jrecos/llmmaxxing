@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Mapping, TypeVar
+
+from typing import Any, Mapping, TypeVar, cast
 
 from llmmaxxing.config.schema import AuthoringConfigV1, AuthoringPolicy, PolicyMacro
 from llmmaxxing.core.ids import AccountId, PolicyRevisionId
@@ -37,7 +38,7 @@ def _pick(
     if explicit is not None:
         return explicit
     if macro is not None and field in _QUEUE_FIELDS:
-        return getattr(macro, field)
+        return cast(_T, getattr(macro, field))
     if inherited is not None:
         return inherited
     raise ValueError(f"direct policy requires {field}")
@@ -120,10 +121,11 @@ def _validate_runtime_routes(
         account = accounts.get(account_id)
         if account is None:
             raise ValueError(f"policy {policy.policy_id} grants unknown account {account_id}")
-        if account.state is not AccountState.ACTIVE:
+        state = account.state
+        if state is not AccountState.ACTIVE:
             raise ValueError(
                 f"policy {policy.policy_id} grants non-active account {account_id} "
-                f"in state {account.state.value}"
+                f"in state {state.value if state is not None else 'unset'}"
             )
 
     allowed_accounts = frozenset(policy.allowed_account_ids)
