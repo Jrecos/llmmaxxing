@@ -95,9 +95,7 @@ class ImpactPlan(_Frozen):
     ) -> None:
         """Raise :class:`StalePreview` unless every reviewed base fence still matches."""
         if source_fingerprint is None:
-            raise StalePreview(
-                "fresh source fingerprint is required to verify an impact plan"
-            )
+            raise StalePreview("fresh source fingerprint is required to verify an impact plan")
         current = PolicyBundleV1.model_validate(current.model_dump(mode="python"))
         if current.generation != self.base_generation:
             raise StalePreview("base bundle generation changed")
@@ -264,8 +262,7 @@ def _affected_keys(
         sorted(
             key_id
             for key_id in key_ids
-            if _effective_key_projection(base, key_id)
-            != _effective_key_projection(target, key_id)
+            if _effective_key_projection(base, key_id) != _effective_key_projection(target, key_id)
         )
     )
 

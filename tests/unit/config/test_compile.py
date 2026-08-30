@@ -1,14 +1,12 @@
 from __future__ import annotations
 
 import json
-
 from pathlib import Path
 
 import pytest
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError as JsonSchemaValidationError
 from pydantic import ValidationError as PydanticValidationError
-
 
 from llmmaxxing.config.compile import DiscoverySnapshot, compile_authoring
 from llmmaxxing.config.schema import (
@@ -300,9 +298,9 @@ def test_authoring_schema_and_pydantic_share_acceptance_vectors() -> None:
     exact = _direct_policy(account_ids=(NAN_ID, ARLIAI_ID)).model_dump(
         mode="json", exclude_none=True
     )
-    selector = _direct_policy(
-        selector={"billing": "unlimited", "trust": "approved"}
-    ).model_dump(mode="json", exclude_none=True)
+    selector = _direct_policy(selector={"billing": "unlimited", "trust": "approved"}).model_dump(
+        mode="json", exclude_none=True
+    )
     clone_rebind = AuthoringPolicy(
         policy_id=SHARED_POLICY_ID,
         clone_from_policy_id=BASE_POLICY_ID,

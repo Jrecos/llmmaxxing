@@ -96,8 +96,8 @@ class PolicyMacro(_AuthoringModel):
 
 class AuthoringPolicy(_AuthoringModel):
     """One new immutable policy revision, optionally cloned from an applied one."""
-    model_config = ConfigDict(json_schema_extra=_AUTHORING_POLICY_CONDITIONS)
 
+    model_config = ConfigDict(json_schema_extra=_AUTHORING_POLICY_CONDITIONS)
 
     policy_id: PolicyRevisionId
     name: _NAME | None = None
@@ -131,9 +131,7 @@ class AuthoringPolicy(_AuthoringModel):
 
     @field_validator("account_selector")
     @classmethod
-    def _copy_selector(
-        cls, value: dict[str, str] | None
-    ) -> dict[str, str] | None:
+    def _copy_selector(cls, value: dict[str, str] | None) -> dict[str, str] | None:
         return None if value is None else dict(value)
 
     @model_validator(mode="after")
@@ -145,9 +143,7 @@ class AuthoringPolicy(_AuthoringModel):
             and self.account_ids is None
             and self.account_selector is None
         ):
-            raise ValueError(
-                "a direct policy requires account_ids or account_selector"
-            )
+            raise ValueError("a direct policy requires account_ids or account_selector")
         if self.rebind_shared and self.clone_from_policy_id is None:
             raise ValueError("rebind_shared requires clone_from_policy_id")
         if self.clone_from_policy_id == self.policy_id:

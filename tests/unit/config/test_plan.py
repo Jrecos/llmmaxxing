@@ -152,9 +152,7 @@ def test_preview_binds_applied_base_fences_and_exact_key_set() -> None:
         }
     )
     with pytest.raises(StalePreview, match="base bundle|key set"):
-        preview.verify_against(
-            changed_key_set, source_fingerprint=preview.source_fingerprint
-        )
+        preview.verify_against(changed_key_set, source_fingerprint=preview.source_fingerprint)
 
     changed_binding = PolicyBundleV1.model_validate(
         {
@@ -167,16 +165,13 @@ def test_preview_binds_applied_base_fences_and_exact_key_set() -> None:
         }
     )
     with pytest.raises(StalePreview):
-        preview.verify_against(
-            changed_binding, source_fingerprint=preview.source_fingerprint
-        )
+        preview.verify_against(changed_binding, source_fingerprint=preview.source_fingerprint)
 
     preview.verify_against(base, source_fingerprint=preview.source_fingerprint)
     with pytest.raises(StalePreview, match="source fingerprint"):
         preview.verify_against(base, source_fingerprint="0" * 64)
     with pytest.raises(StalePreview, match="fresh source fingerprint"):
         preview.verify_against(base)
-
 
 
 def test_semantic_diff_and_impact_hash_are_exact_and_content_sensitive() -> None:
@@ -238,9 +233,7 @@ def test_affected_keys_use_each_policy_effective_authorized_leg_projection() -> 
             ),
         )
 
-    def trigger_policy(
-        policy_id: PolicyRevisionId, trigger: RouteTrigger
-    ) -> KeyPolicyRevision:
+    def trigger_policy(policy_id: PolicyRevisionId, trigger: RouteTrigger) -> KeyPolicyRevision:
         return KeyPolicyRevision(
             policy_id=policy_id,
             name=f"{trigger.value}-only",
