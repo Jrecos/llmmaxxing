@@ -22,6 +22,16 @@ class KeyLifecycleState(_Closed):
 
 
 @final
+class CredentialVerifierStatus(_Closed):
+    """Lifecycle of one immutable client credential verifier generation."""
+
+    ACTIVE = "active"
+    RETIRING = "retiring"
+    RETIRED = "retired"
+    EXPIRED = "expired"
+
+
+@final
 class AccountState(_Closed):
     """Provider Account lifecycle; DRAFT means unmeasured/never servable."""
 

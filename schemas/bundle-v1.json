@@ -11,19 +11,76 @@
       "title": "AccountState",
       "type": "string"
     },
+    "ClientCredentialVerifier": {
+      "additionalProperties": false,
+      "description": "One immutable verifier generation; plaintext key material never enters bundles.",
+      "properties": {
+        "generation": {
+          "minimum": 1,
+          "title": "Generation",
+          "type": "integer"
+        },
+        "not_after_s": {
+          "exclusiveMinimum": 0,
+          "title": "Not After S",
+          "type": "integer"
+        },
+        "not_before_s": {
+          "exclusiveMinimum": 0,
+          "title": "Not Before S",
+          "type": "integer"
+        },
+        "pepper_version": {
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
+          "title": "Pepper Version",
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/CredentialVerifierStatus"
+        },
+        "verifier_hex": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Verifier Hex",
+          "type": "string"
+        }
+      },
+      "required": [
+        "generation",
+        "verifier_hex",
+        "pepper_version",
+        "not_before_s",
+        "not_after_s",
+        "status"
+      ],
+      "title": "ClientCredentialVerifier",
+      "type": "object"
+    },
     "ClientKeyRecord": {
       "additionalProperties": false,
-      "description": "Gateway-verifiable client key record: only the HMAC verifier is stored.",
+      "description": "One logical client key with at most two verifier generations.",
       "properties": {
-        "credential_generation": {
-          "maximum": 2,
-          "minimum": 1,
-          "title": "Credential Generation",
-          "type": "integer"
+        "credential_verifiers": {
+          "items": {
+            "$ref": "#/$defs/ClientCredentialVerifier"
+          },
+          "maxItems": 2,
+          "minItems": 1,
+          "title": "Credential Verifiers",
+          "type": "array"
         },
         "expires_at_s": {
           "exclusiveMinimum": 0,
           "title": "Expires At S",
+          "type": "integer"
+        },
+        "generation_high_water": {
+          "minimum": 1,
+          "title": "Generation High Water",
+          "type": "integer"
+        },
+        "issued_at_s": {
+          "exclusiveMinimum": 0,
+          "title": "Issued At S",
           "type": "integer"
         },
         "key_id": {
@@ -39,22 +96,35 @@
         "state": {
           "$ref": "#/$defs/KeyLifecycleState"
         },
-        "verifier_hex": {
-          "pattern": "^[0-9a-f]{64}$",
-          "title": "Verifier Hex",
-          "type": "string"
+        "time_high_water_s": {
+          "exclusiveMinimum": 0,
+          "title": "Time High Water S",
+          "type": "integer"
         }
       },
       "required": [
         "key_id",
-        "verifier_hex",
         "policy_id",
         "state",
+        "issued_at_s",
         "expires_at_s",
-        "credential_generation"
+        "time_high_water_s",
+        "generation_high_water",
+        "credential_verifiers"
       ],
       "title": "ClientKeyRecord",
       "type": "object"
+    },
+    "CredentialVerifierStatus": {
+      "description": "Lifecycle of one immutable client credential verifier generation.",
+      "enum": [
+        "active",
+        "retiring",
+        "retired",
+        "expired"
+      ],
+      "title": "CredentialVerifierStatus",
+      "type": "string"
     },
     "KeyLifecycleState": {
       "description": "Client-key lifecycle: DRAFT → ENABLED ↔ SUSPENDED → REVOKED.",

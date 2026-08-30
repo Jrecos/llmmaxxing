@@ -43,7 +43,20 @@ _ACCOUNT_SELECTOR = Annotated[
 ]
 _AUTHORING_POLICY_CONDITIONS: dict[str, _JsonValue] = {
     "allOf": [
-        {"not": {"required": ["account_ids", "account_selector"]}},
+        {
+            "not": {
+                "allOf": [
+                    {
+                        "required": ["account_ids"],
+                        "properties": {"account_ids": {"type": "array"}},
+                    },
+                    {
+                        "required": ["account_selector"],
+                        "properties": {"account_selector": {"type": "object"}},
+                    },
+                ]
+            }
+        },
         {
             "anyOf": [
                 {

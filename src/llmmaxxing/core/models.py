@@ -28,7 +28,11 @@ from llmmaxxing.core.reasons import (
     RouteStrategy,
     RouteTrigger,
 )
-from llmmaxxing.core.state_machines import AccountState, KeyLifecycleState
+from llmmaxxing.core.state_machines import (
+    AccountState,
+    CredentialVerifierStatus,
+    KeyLifecycleState,
+)
 
 _HEX32 = Annotated[str, Field(pattern=r"^[0-9a-f]{32}$")]
 _HEX64 = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
@@ -167,15 +171,79 @@ class KeyPolicyRevision(_Frozen):
         return v
 
 
+class ClientCredentialVerifier(_Frozen):
+    """One immutable verifier generation; plaintext key material never enters bundles."""
+
+    generation: int = Field(ge=1)
+    verifier_hex: _HEX64
+    pepper_version: Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")]
+    not_before_s: int = Field(gt=0)
+    not_after_s: int = Field(gt=0)
+    status: CredentialVerifierStatus
+
+    @model_validator(mode="after")
+    def _valid_window(self) -> Self:
+        if self.not_after_s < self.not_before_s:
+            raise ValueError("credential not_after_s precedes not_before_s")
+        return self
+
+
 class ClientKeyRecord(_Frozen):
-    """Gateway-verifiable client key record: only the HMAC verifier is stored."""
+    """One logical client key with at most two verifier generations."""
 
     key_id: _HEX32
-    verifier_hex: _HEX64
     policy_id: PolicyRevisionId
     state: KeyLifecycleState
+    issued_at_s: int = Field(gt=0)
     expires_at_s: int = Field(gt=0)
-    credential_generation: int = Field(ge=1, le=2)
+    time_high_water_s: int = Field(gt=0)
+    generation_high_water: int = Field(ge=1)
+    credential_verifiers: tuple[ClientCredentialVerifier, ...] = Field(
+        min_length=1, max_length=2
+    )
+
+    @model_validator(mode="after")
+    def _valid_lifetime_and_generations(self) -> Self:
+        if self.expires_at_s <= self.issued_at_s:
+            raise ValueError("client key expiry must follow issuance")
+        if self.expires_at_s - self.issued_at_s > 365 * 86_400:
+            raise ValueError("client key lifetime exceeds 365 days")
+        if self.time_high_water_s < self.issued_at_s:
+            raise ValueError("trusted time high-water precedes issuance")
+
+        generations = tuple(item.generation for item in self.credential_verifiers)
+        if generations != tuple(sorted(set(generations))):
+            raise ValueError("credential generations must be unique and increasing")
+        if generations[-1] != self.generation_high_water:
+            raise ValueError("generation high-water must equal the newest verifier generation")
+        if any(
+            item.not_before_s < self.issued_at_s or item.not_after_s > self.expires_at_s
+            for item in self.credential_verifiers
+        ):
+            raise ValueError("credential window must stay within logical key lifetime")
+
+        accepted = tuple(
+            item
+            for item in self.credential_verifiers
+            if item.status
+            in (CredentialVerifierStatus.ACTIVE, CredentialVerifierStatus.RETIRING)
+        )
+        active = tuple(
+            item
+            for item in self.credential_verifiers
+            if item.status is CredentialVerifierStatus.ACTIVE
+        )
+        if len(accepted) > 2:
+            raise ValueError("at most two credential generations may be accepted")
+        if (
+            self.state is KeyLifecycleState.REVOKED
+            or self.time_high_water_s >= self.expires_at_s
+        ):
+            if accepted:
+                raise ValueError("terminal key cannot retain accepted credential generations")
+        elif len(active) != 1 or active[0].generation != self.generation_high_water:
+            raise ValueError("nonterminal key requires one active newest credential generation")
+        return self
 
 
 class RequestProfile(_Frozen):
@@ -197,12 +265,12 @@ class RequestProfile(_Frozen):
 class RequestAuthorizationCeiling(_Frozen):
     """Admission-time ceiling; queue wakes intersect it with current authority.
 
-    ``intersection`` is contractively safe: sets shrink, bounds take the
-    minimum, and it refuses ceilings from different admitted identities.
+    Lower numeric queue tiers are higher priority. Intersection therefore takes
+    the maximum tier while every resource limit takes the minimum.
     """
 
     key_id: _HEX32
-    credential_generation: int = Field(ge=1, le=2)
+    credential_generation: int = Field(ge=1)
     policy_id: PolicyRevisionId
     bundle_generation: int = Field(ge=1)
     bundle_hash: BundleHash
@@ -210,9 +278,11 @@ class RequestAuthorizationCeiling(_Frozen):
     allowed_account_ids: tuple[AccountId, ...]
     leg_ids: tuple[RouteLegId, ...]
     allowed_triggers: tuple[RouteTrigger, ...]
-    max_tier: int = Field(ge=1)
-    max_weight: int = Field(ge=1, le=64)
-    max_deadline_ms: int = Field(ge=1, le=_MAX_DEADLINE_MS)
+    queue_tier: int = Field(ge=1)
+    queue_weight: int = Field(ge=1, le=64)
+    max_concurrency: int = Field(ge=1)
+    max_waiters: int = Field(ge=0)
+    deadline_ms: int = Field(ge=1, le=_MAX_DEADLINE_MS)
 
     def intersection(self, other: Self) -> Self:
         if (
@@ -232,9 +302,11 @@ class RequestAuthorizationCeiling(_Frozen):
                 ),
                 "leg_ids": keep(self.leg_ids, frozenset(other.leg_ids)),
                 "allowed_triggers": keep(self.allowed_triggers, frozenset(other.allowed_triggers)),
-                "max_tier": min(self.max_tier, other.max_tier),
-                "max_weight": min(self.max_weight, other.max_weight),
-                "max_deadline_ms": min(self.max_deadline_ms, other.max_deadline_ms),
+                "queue_tier": max(self.queue_tier, other.queue_tier),
+                "queue_weight": min(self.queue_weight, other.queue_weight),
+                "max_concurrency": min(self.max_concurrency, other.max_concurrency),
+                "max_waiters": min(self.max_waiters, other.max_waiters),
+                "deadline_ms": min(self.deadline_ms, other.deadline_ms),
             }
         )
 

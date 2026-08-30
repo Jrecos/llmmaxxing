@@ -15,8 +15,17 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from llmmaxxing.config.plan import ImpactPlan
-from llmmaxxing.core.canonical import canonical_json_bytes
+from llmmaxxing.core.canonical import (
+    bundle_hash,
+    canonical_bundle_bytes,
+    canonical_json_bytes,
+)
 from llmmaxxing.core.ids import BundleHash
+from llmmaxxing.core.key_lifecycle import (
+    exact_policy_reassignments,
+    validate_key_record_set_delta,
+)
+from llmmaxxing.core.models import PolicyBundleV1
 
 _HEX64 = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 _SIGNER_ID = Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")]
@@ -84,9 +93,29 @@ class SignedActivation:
 def sign_activation(
     envelope: ActivationEnvelope,
     private_key: Ed25519PrivateKey,
+    *,
+    base_bundle: PolicyBundleV1,
+    target_bundle: PolicyBundleV1,
 ) -> SignedActivation:
-    """Return the canonical envelope bytes and their detached Ed25519 signature."""
+    """Validate exact key lifecycle and return a canonical detached signature."""
     envelope = ActivationEnvelope.model_validate(envelope.model_dump(mode="python"))
+    base_bundle = PolicyBundleV1.model_validate(base_bundle.model_dump(mode="python"))
+    target_bundle = PolicyBundleV1.model_validate(target_bundle.model_dump(mode="python"))
+    validate_key_record_set_delta(
+        base_bundle.keys,
+        target_bundle.keys,
+        policy_reassignments=exact_policy_reassignments(
+            base_bundle.keys,
+            target_bundle.keys,
+        ),
+    )
+    if (
+        envelope.base_generation != base_bundle.generation
+        or envelope.base_bundle_hash != bundle_hash(canonical_bundle_bytes(base_bundle))
+        or envelope.target_generation != target_bundle.generation
+        or envelope.target_content_hash != bundle_hash(canonical_bundle_bytes(target_bundle))
+    ):
+        raise ValueError("activation envelope does not match exact base and target bundles")
     payload = canonical_json_bytes(envelope.model_dump(mode="json"))
     return SignedActivation(
         payload=payload,

@@ -23,6 +23,7 @@ from llmmaxxing.core.ids import (
     RouteLegId,
 )
 from llmmaxxing.core.models import (
+    ClientCredentialVerifier,
     ClientKeyRecord,
     KeyPolicyRevision,
     PolicyBundleV1,
@@ -32,7 +33,11 @@ from llmmaxxing.core.models import (
     RouteLeg,
 )
 from llmmaxxing.core.reasons import QuotaDimensionStatus, RouteStrategy, RouteTrigger
-from llmmaxxing.core.state_machines import AccountState, KeyLifecycleState
+from llmmaxxing.core.state_machines import (
+    AccountState,
+    CredentialVerifierStatus,
+    KeyLifecycleState,
+)
 
 NAN_ID = AccountId("acc_11111111-1111-4111-8111-111111111111")
 ARLIAI_ID = AccountId("acc_22222222-2222-4222-8222-222222222222")
@@ -99,11 +104,22 @@ def _policy(policy_id: PolicyRevisionId = BASE_POLICY_ID) -> KeyPolicyRevision:
 def _key(key_id: str, policy_id: PolicyRevisionId = BASE_POLICY_ID) -> ClientKeyRecord:
     return ClientKeyRecord(
         key_id=key_id,
-        verifier_hex=("c" if key_id == KEY_A else "d") * 64,
         policy_id=policy_id,
         state=KeyLifecycleState.ENABLED,
+        issued_at_s=1_970_000_000,
         expires_at_s=2_000_000_000,
-        credential_generation=1,
+        time_high_water_s=1_970_000_000,
+        generation_high_water=1,
+        credential_verifiers=(
+            ClientCredentialVerifier(
+                generation=1,
+                verifier_hex=("c" if key_id == KEY_A else "d") * 64,
+                pepper_version="p1",
+                not_before_s=1_970_000_000,
+                not_after_s=2_000_000_000,
+                status=CredentialVerifierStatus.ACTIVE,
+            ),
+        ),
     )
 
 
@@ -308,6 +324,20 @@ def test_authoring_schema_and_pydantic_share_acceptance_vectors() -> None:
     ).model_dump(mode="json", exclude_none=True)
 
     for policy in (exact, selector, clone_rebind):
+        document = {"schema_version": 1, "policies": [policy]}
+        AuthoringConfigV1.model_validate_json(json.dumps(document))
+        schema_validator.validate(document)
+
+    # Default model_dump() retains nullable authoring fields. JSON Schema must
+    # treat those nulls as absent, matching the Pydantic authoring contract.
+    for policy in (
+        _direct_policy(account_ids=(NAN_ID, ARLIAI_ID)).model_dump(mode="json"),
+        _direct_policy(selector={"billing": "unlimited"}).model_dump(mode="json"),
+        AuthoringPolicy(
+            policy_id=SHARED_POLICY_ID,
+            clone_from_policy_id=BASE_POLICY_ID,
+        ).model_dump(mode="json"),
+    ):
         document = {"schema_version": 1, "policies": [policy]}
         AuthoringConfigV1.model_validate_json(json.dumps(document))
         schema_validator.validate(document)

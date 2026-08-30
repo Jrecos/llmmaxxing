@@ -14,6 +14,7 @@ from llmmaxxing.core.ids import (
     RouteLegId,
 )
 from llmmaxxing.core.models import (
+    ClientCredentialVerifier,
     ClientKeyRecord,
     KeyPolicyRevision,
     PolicyBundleV1,
@@ -34,6 +35,7 @@ from llmmaxxing.core.reasons import (
 )
 from llmmaxxing.core.state_machines import (
     ActivationStage,
+    CredentialVerifierStatus,
     KeyLifecycleState,
     key_transition,
     next_activation_stage,
@@ -120,11 +122,22 @@ def key_record(
 ) -> ClientKeyRecord:
     return ClientKeyRecord(
         key_id=key_id,
-        verifier_hex="b" * 64,
         policy_id=policy_id,
         state=state,
+        issued_at_s=1_770_000_000,
         expires_at_s=1_800_000_000,
-        credential_generation=1,
+        time_high_water_s=1_770_000_000,
+        generation_high_water=1,
+        credential_verifiers=(
+            ClientCredentialVerifier(
+                generation=1,
+                verifier_hex="b" * 64,
+                pepper_version="p1",
+                not_before_s=1_770_000_000,
+                not_after_s=1_800_000_000,
+                status=CredentialVerifierStatus.ACTIVE,
+            ),
+        ),
     )
 
 
@@ -576,9 +589,11 @@ def ceiling(**overrides: object) -> RequestAuthorizationCeiling:
         "allowed_account_ids": tuple(a.account_id for a in b.accounts),
         "allowed_triggers": (RouteTrigger.PRIMARY, RouteTrigger.CAPACITY_SPILL),
         "leg_ids": tuple(lg.leg_id for lg in b.route_groups[0].legs),
-        "max_tier": 1,
-        "max_weight": 8,
-        "max_deadline_ms": 7_200_000,
+        "queue_tier": 1,
+        "queue_weight": 8,
+        "max_concurrency": 4,
+        "max_waiters": 16,
+        "deadline_ms": 7_200_000,
     }
     fields.update(overrides)
     return RequestAuthorizationCeiling.model_validate(fields)
@@ -590,17 +605,21 @@ def test_ceiling_intersection_only_contracts():
         allowed_account_ids=(full.allowed_account_ids[0],),
         leg_ids=(full.leg_ids[0],),
         allowed_triggers=(RouteTrigger.PRIMARY,),
-        max_weight=4,
-        max_tier=2,
-        max_deadline_ms=60_000,
+        queue_weight=4,
+        queue_tier=2,
+        max_concurrency=2,
+        max_waiters=8,
+        deadline_ms=60_000,
     )
     merged = full.intersection(current)
     assert merged.allowed_account_ids == (full.allowed_account_ids[0],)
     assert merged.leg_ids == (full.leg_ids[0],)
     assert merged.allowed_triggers == (RouteTrigger.PRIMARY,)
-    assert merged.max_weight == 4  # minimum bound, never the expansion
-    assert merged.max_tier == 1
-    assert merged.max_deadline_ms == 60_000
+    assert merged.queue_weight == 4
+    assert merged.queue_tier == 2  # higher numeric tier is worse and cannot improve
+    assert merged.max_concurrency == 2
+    assert merged.max_waiters == 8
+    assert merged.deadline_ms == 60_000
     assert current.intersection(full) == merged
 
 

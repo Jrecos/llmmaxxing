@@ -19,6 +19,10 @@ from llmmaxxing.core.ids import (
     RouteGroupId,
     RouteLegId,
 )
+from llmmaxxing.core.key_lifecycle import (
+    exact_policy_reassignments,
+    validate_key_record_set_delta,
+)
 from llmmaxxing.core.models import PolicyBundleV1
 
 _HEX64 = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
@@ -39,7 +43,7 @@ class _Frozen(BaseModel):
 class ExpectedKeyBinding(_Frozen):
     key_id: Annotated[str, Field(pattern=r"^[0-9a-f]{32}$")]
     policy_id: PolicyRevisionId
-    credential_generation: int = Field(ge=1, le=2)
+    generation_high_water: int = Field(ge=1)
 
 
 class SemanticDiff(_Frozen):
@@ -156,7 +160,7 @@ def _key_bindings(bundle: PolicyBundleV1) -> tuple[ExpectedKeyBinding, ...]:
         ExpectedKeyBinding(
             key_id=key.key_id,
             policy_id=key.policy_id,
-            credential_generation=key.credential_generation,
+            generation_high_water=key.generation_high_water,
         )
         for key in sorted(bundle.keys, key=lambda key: key.key_id)
     )
@@ -226,15 +230,21 @@ def _effective_key_projection(
     effective_groups = []
     for group_id in policy.route_group_ids:
         group = groups[group_id]
-        legs = [
-            {
-                "leg": leg.model_dump(mode="json"),
-                "account": accounts[leg.account_id].model_dump(mode="json"),
-            }
-            for leg in group.legs
-            if leg.account_id in allowed_accounts
-            and any(trigger in allowed_triggers for trigger in leg.triggers)
-        ]
+        legs = []
+        for leg in group.legs:
+            projected_triggers = tuple(
+                trigger for trigger in leg.triggers if trigger in allowed_triggers
+            )
+            if leg.account_id not in allowed_accounts or not projected_triggers:
+                continue
+            projected_leg = leg.model_dump(mode="json")
+            projected_leg["triggers"] = [trigger.value for trigger in projected_triggers]
+            legs.append(
+                {
+                    "leg": projected_leg,
+                    "account": accounts[leg.account_id].model_dump(mode="json"),
+                }
+            )
         effective_groups.append(
             {
                 "route_group_id": group.route_group_id,
@@ -286,6 +296,11 @@ def plan_change(
     target = PolicyBundleV1.model_validate(target.model_dump(mode="python"))
     if target.generation <= base.generation:
         raise ValueError("target generation must be strictly greater than applied base generation")
+    validate_key_record_set_delta(
+        base.keys,
+        target.keys,
+        policy_reassignments=exact_policy_reassignments(base.keys, target.keys),
+    )
 
     diff = _semantic_diff(base, target)
     target_source = source_fingerprint or _source_fingerprint(target)

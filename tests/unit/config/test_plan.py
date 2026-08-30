@@ -24,6 +24,7 @@ from llmmaxxing.core.ids import (
     RouteLegId,
 )
 from llmmaxxing.core.models import (
+    ClientCredentialVerifier,
     ClientKeyRecord,
     KeyPolicyRevision,
     PolicyBundleV1,
@@ -33,7 +34,11 @@ from llmmaxxing.core.models import (
     RouteLeg,
 )
 from llmmaxxing.core.reasons import RouteStrategy, RouteTrigger
-from llmmaxxing.core.state_machines import AccountState, KeyLifecycleState
+from llmmaxxing.core.state_machines import (
+    AccountState,
+    CredentialVerifierStatus,
+    KeyLifecycleState,
+)
 
 ACCOUNT_ID = AccountId("acc_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 GROUP_ID = RouteGroupId("rg_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
@@ -96,11 +101,22 @@ def _policy(policy_id: PolicyRevisionId, *, weight: int = 2) -> KeyPolicyRevisio
 def _key(key_id: str, policy_id: PolicyRevisionId, verifier: str) -> ClientKeyRecord:
     return ClientKeyRecord(
         key_id=key_id,
-        verifier_hex=verifier * 64,
         policy_id=policy_id,
         state=KeyLifecycleState.ENABLED,
+        issued_at_s=1_970_000_000,
         expires_at_s=2_000_000_000,
-        credential_generation=1,
+        time_high_water_s=1_970_000_000,
+        generation_high_water=1,
+        credential_verifiers=(
+            ClientCredentialVerifier(
+                generation=1,
+                verifier_hex=verifier * 64,
+                pepper_version="p1",
+                not_before_s=1_970_000_000,
+                not_after_s=2_000_000_000,
+                status=CredentialVerifierStatus.ACTIVE,
+            ),
+        ),
     )
 
 
@@ -274,6 +290,55 @@ def test_affected_keys_use_each_policy_effective_authorized_leg_projection() -> 
     assert preview.affected_key_ids == (KEY_B,)
 
 
+def test_affected_projection_replaces_leg_triggers_with_policy_intersection() -> None:
+    base = base_bundle()
+    leg = base.route_groups[0].legs[0]
+    expanded = leg.model_copy(
+        update={"triggers": (RouteTrigger.PRIMARY, RouteTrigger.CAPACITY_SPILL)}
+    )
+    target = PolicyBundleV1.model_validate(
+        {
+            **base.model_dump(mode="python"),
+            "generation": base.generation + 1,
+            "route_groups": (
+                base.route_groups[0].model_copy(update={"legs": (expanded,)}),
+            ),
+        }
+    )
+
+    preview = plan_change(base, target)
+
+    assert preview.diff.changed_leg_ids == (LEG_ID,)
+    assert preview.affected_key_ids == ()
+
+
+def test_plan_rejects_invalid_key_lifecycle_delta() -> None:
+    base = base_bundle()
+    key = base.keys[0]
+    target = PolicyBundleV1.model_validate(
+        {
+            **base.model_dump(mode="python"),
+            "generation": base.generation + 1,
+            "keys": (
+                key.model_copy(update={"expires_at_s": key.expires_at_s + 1}),
+                base.keys[1],
+            ),
+        }
+    )
+    with pytest.raises(ValueError, match="expiry extension"):
+        plan_change(base, target)
+
+    removed = PolicyBundleV1.model_validate(
+        {
+            **base.model_dump(mode="python"),
+            "generation": base.generation + 1,
+            "keys": (base.keys[1],),
+        }
+    )
+    with pytest.raises(ValueError, match="tombstones"):
+        plan_change(base, removed)
+
+
 def test_impact_plan_export_contains_no_secret_material() -> None:
     plan = plan_change(base_bundle(), target_bundle())
     exported = plan.model_dump_json()
@@ -290,11 +355,13 @@ def test_impact_plan_export_contains_no_secret_material() -> None:
 
 
 def test_activation_signatures_bind_explicit_epoch_and_key() -> None:
-    plan = plan_change(base_bundle(), target_bundle())
+    base = base_bundle()
+    target = target_bundle()
+    plan = plan_change(base, target)
     envelope = ActivationEnvelope.from_plan(plan, trust_epoch=7, signer_key_id="control-primary")
     private_key = Ed25519PrivateKey.generate()
 
-    signed = sign_activation(envelope, private_key)
+    signed = sign_activation(envelope, private_key, base_bundle=base, target_bundle=target)
     assert isinstance(signed, SignedActivation)
     assert signed.trust_epoch == 7
     assert signed.signer_key_id == "control-primary"
@@ -333,10 +400,12 @@ def test_activation_signatures_bind_explicit_epoch_and_key() -> None:
 
 
 def test_activation_rejects_tampering_and_noncanonical_payloads() -> None:
-    plan = plan_change(base_bundle(), target_bundle())
+    base = base_bundle()
+    target = target_bundle()
+    plan = plan_change(base, target)
     envelope = ActivationEnvelope.from_plan(plan, trust_epoch=4, signer_key_id="operator")
     private_key = Ed25519PrivateKey.generate()
-    signed = sign_activation(envelope, private_key)
+    signed = sign_activation(envelope, private_key, base_bundle=base, target_bundle=target)
     trust = {4: {"operator": private_key.public_key()}}
 
     tampered = signed.payload.replace(b'"target_generation":12', b'"target_generation":13')
@@ -346,3 +415,30 @@ def test_activation_rejects_tampering_and_noncanonical_payloads() -> None:
     noncanonical = json.dumps(json.loads(signed.payload), indent=2).encode()
     with pytest.raises(SignatureVerificationError, match="canonical"):
         verify_activation(noncanonical, private_key.sign(noncanonical), trust)
+
+
+def test_signing_revalidates_key_lifecycle_against_exact_bundles() -> None:
+    base = base_bundle()
+    target = target_bundle()
+    envelope = ActivationEnvelope.from_plan(
+        plan_change(base, target),
+        trust_epoch=4,
+        signer_key_id="operator",
+    )
+    invalid_target = target.model_copy(
+        update={
+            "keys": (
+                target.keys[0].model_copy(
+                    update={"expires_at_s": target.keys[0].expires_at_s + 1}
+                ),
+                target.keys[1],
+            )
+        }
+    )
+    with pytest.raises(ValueError, match="expiry extension"):
+        sign_activation(
+            envelope,
+            Ed25519PrivateKey.generate(),
+            base_bundle=base,
+            target_bundle=invalid_target,
+        )
