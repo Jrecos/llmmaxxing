@@ -27,12 +27,8 @@ def build_parser() -> argparse.ArgumentParser:
         prog="llmmaxxing",
         description="LiteLLM admission, fair-queue and routing-policy control plane",
     )
-    parser.add_argument(
-        "--version", action="version", version=f"llmmaxxing {__version__}"
-    )
-    subparsers = parser.add_subparsers(
-        dest="command", required=True, metavar="{gateway,control}"
-    )
+    parser.add_argument("--version", action="version", version=f"llmmaxxing {__version__}")
+    subparsers = parser.add_subparsers(dest="command", required=True, metavar="{gateway,control}")
     for name in DAEMONS:
         subparsers.add_parser(name, help=f"run the {name} daemon")
     return parser
