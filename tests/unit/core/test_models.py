@@ -287,9 +287,7 @@ def test_required_features_schema_and_pydantic_share_closed_unique_vectors():
         (("time_travel_routing",), False),
     )
     for features, accepted in vectors:
-        schema_accepts = (
-            len(set(features)) == len(features) and set(features) <= schema_values
-        )
+        schema_accepts = len(set(features)) == len(features) and set(features) <= schema_values
         assert schema_accepts is accepted
         if accepted:
             parsed = bundle(required_features=features).required_features

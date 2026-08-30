@@ -245,9 +245,7 @@ class PolicyBundleV1(_Frozen):
     schema_version: Literal[1]
     generation: int = Field(ge=1)
     min_reader: str
-    required_features: tuple[RequiredFeature, ...] = Field(
-        json_schema_extra={"uniqueItems": True}
-    )
+    required_features: tuple[RequiredFeature, ...] = Field(json_schema_extra={"uniqueItems": True})
     keys: tuple[ClientKeyRecord, ...] = Field(min_length=1)
     policies: tuple[KeyPolicyRevision, ...] = Field(min_length=1)
     accounts: tuple[ProviderAccount, ...] = Field(min_length=1)
@@ -269,9 +267,7 @@ class PolicyBundleV1(_Frozen):
 
     @field_validator("required_features")
     @classmethod
-    def _features_unique(
-        cls, v: tuple[RequiredFeature, ...]
-    ) -> tuple[RequiredFeature, ...]:
+    def _features_unique(cls, v: tuple[RequiredFeature, ...]) -> tuple[RequiredFeature, ...]:
         if len(set(v)) != len(v):
             raise ValueError("duplicate required feature")
         return v

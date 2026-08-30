@@ -137,9 +137,7 @@ def test_canonical_bundle_revalidates_bundle_and_nested_model_copies() -> None:
         canonical_bundle_bytes(missing_account)
 
     partial_binding = base.accounts[0].model_copy(update={"connection": ""})
-    invalid_nested = base.model_copy(
-        update={"accounts": (partial_binding, *base.accounts[1:])}
-    )
+    invalid_nested = base.model_copy(update={"accounts": (partial_binding, *base.accounts[1:])})
     with pytest.raises(ValidationError, match="binding"):
         canonical_bundle_bytes(invalid_nested)
 
