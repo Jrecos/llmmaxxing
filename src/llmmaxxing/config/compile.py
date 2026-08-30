@@ -2,16 +2,15 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
-
-from typing import Any, Mapping, TypeVar, cast
+from typing import Any, cast
 
 from llmmaxxing.config.schema import AuthoringConfigV1, AuthoringPolicy, PolicyMacro
 from llmmaxxing.core.ids import AccountId, PolicyRevisionId
 from llmmaxxing.core.models import KeyPolicyRevision, PolicyBundleV1
 from llmmaxxing.core.state_machines import AccountState
 
-_T = TypeVar("_T")
 _QUEUE_FIELDS = (
     "queue_tier",
     "queue_weight",
@@ -28,17 +27,17 @@ class DiscoverySnapshot:
     labels: dict[AccountId, dict[str, str]]
 
 
-def _pick(
-    explicit: _T | None,
-    inherited: _T | None,
+def _pick[T](
+    explicit: T | None,
+    inherited: T | None,
     *,
     field: str,
     macro: PolicyMacro | None = None,
-) -> _T:
+) -> T:
     if explicit is not None:
         return explicit
     if macro is not None and field in _QUEUE_FIELDS:
-        return cast(_T, getattr(macro, field))
+        return cast(T, getattr(macro, field))
     if inherited is not None:
         return inherited
     raise ValueError(f"direct policy requires {field}")
@@ -190,9 +189,7 @@ def compile_authoring(
         if spec.rebind_shared:
             assert spec.clone_from_policy_id is not None
             if spec.clone_from_policy_id in rebinds:
-                raise ValueError(
-                    f"multiple shared rebinds from policy {spec.clone_from_policy_id}"
-                )
+                raise ValueError(f"multiple shared rebinds from policy {spec.clone_from_policy_id}")
             if not any(key.policy_id == spec.clone_from_policy_id for key in base.keys):
                 raise ValueError(
                     f"shared rebind source policy {spec.clone_from_policy_id} has no keys"

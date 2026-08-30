@@ -187,13 +187,13 @@ def _direct_policy(
 def test_labels_are_compile_time_only_and_exact_lists_are_sorted() -> None:
     found = discovery()
     config = AuthoringConfigV1(
-        policies=(
-            _direct_policy(selector={"billing": "unlimited", "trust": "approved"}),
-        )
+        policies=(_direct_policy(selector={"billing": "unlimited", "trust": "approved"}),)
     )
 
     compiled = compile_authoring(config, found, base_bundle())
-    selected = next(policy for policy in compiled.policies if policy.policy_id == SELECTED_POLICY_ID)
+    selected = next(
+        policy for policy in compiled.policies if policy.policy_id == SELECTED_POLICY_ID
+    )
     assert selected.allowed_account_ids == (NAN_ID, ARLIAI_ID)
     assert selected.allowed_triggers == (RouteTrigger.CAPACITY_SPILL, RouteTrigger.PRIMARY)
     assert compiled.generation == 8
@@ -205,11 +205,11 @@ def test_labels_are_compile_time_only_and_exact_lists_are_sorted() -> None:
     assert "selector" not in runtime_json
     assert "labels" not in runtime_json
 
-    explicit = AuthoringConfigV1(
-        policies=(_direct_policy(account_ids=(ARLIAI_ID, NAN_ID)),)
-    )
+    explicit = AuthoringConfigV1(policies=(_direct_policy(account_ids=(ARLIAI_ID, NAN_ID)),))
     explicit_bundle = compile_authoring(explicit, discovery(), base_bundle())
-    exact = next(policy for policy in explicit_bundle.policies if policy.policy_id == SELECTED_POLICY_ID)
+    exact = next(
+        policy for policy in explicit_bundle.policies if policy.policy_id == SELECTED_POLICY_ID
+    )
     assert exact.allowed_account_ids == (NAN_ID, ARLIAI_ID)
 
 

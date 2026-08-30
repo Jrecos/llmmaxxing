@@ -176,7 +176,11 @@ def _changed_ids(
     right = {getattr(item, id_field): item.model_dump(mode="json") for item in after}
     return tuple(
         sorted(
-            (identity for identity in left.keys() | right.keys() if left.get(identity) != right.get(identity)),
+            (
+                identity
+                for identity in left.keys() | right.keys()
+                if left.get(identity) != right.get(identity)
+            ),
             key=str,
         )
     )
@@ -231,9 +235,7 @@ def _affected_keys(
                 or set(policy.allowed_account_ids) & changed_accounts
             ):
                 impacted_policies.add(policy.policy_id)
-        affected.update(
-            key.key_id for key in bundle.keys if key.policy_id in impacted_policies
-        )
+        affected.update(key.key_id for key in bundle.keys if key.policy_id in impacted_policies)
     return tuple(sorted(affected))
 
 

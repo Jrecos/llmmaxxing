@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 
 import pytest
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from llmmaxxing.config.plan import StalePreview, plan_change
 from llmmaxxing.config.signing import (
@@ -33,7 +34,6 @@ from llmmaxxing.core.models import (
 )
 from llmmaxxing.core.reasons import RouteStrategy, RouteTrigger
 from llmmaxxing.core.state_machines import AccountState, KeyLifecycleState
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 ACCOUNT_ID = AccountId("acc_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 GROUP_ID = RouteGroupId("rg_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
@@ -218,18 +218,24 @@ def test_activation_signatures_bind_explicit_epoch_and_key() -> None:
     assert signed.trust_epoch == 7
     assert signed.signer_key_id == "control-primary"
     assert json.loads(signed.payload)["trust_epoch"] == 7
-    assert verify_activation(
-        signed.payload,
-        signed.signature,
-        {7: {"control-primary": private_key.public_key()}},
-    ) == envelope
-    assert verify_activation(
-        signed.payload,
-        signed.signature,
-        private_key.public_key(),
-        expected_trust_epoch=7,
-        expected_signer_key_id="control-primary",
-    ) == envelope
+    assert (
+        verify_activation(
+            signed.payload,
+            signed.signature,
+            {7: {"control-primary": private_key.public_key()}},
+        )
+        == envelope
+    )
+    assert (
+        verify_activation(
+            signed.payload,
+            signed.signature,
+            private_key.public_key(),
+            expected_trust_epoch=7,
+            expected_signer_key_id="control-primary",
+        )
+        == envelope
+    )
 
     with pytest.raises(UnknownTrustEpoch):
         verify_activation(
@@ -238,7 +244,11 @@ def test_activation_signatures_bind_explicit_epoch_and_key() -> None:
             {8: {"control-primary": private_key.public_key()}},
         )
     with pytest.raises(UnknownSigningKey):
-        verify_activation(signed.payload, signed.signature, {7: {"other": private_key.public_key()}})
+        verify_activation(
+            signed.payload,
+            signed.signature,
+            {7: {"other": private_key.public_key()}},
+        )
 
 
 def test_activation_rejects_tampering_and_noncanonical_payloads() -> None:
