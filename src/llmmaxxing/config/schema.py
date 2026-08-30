@@ -22,6 +22,7 @@ from llmmaxxing.core.reasons import RouteTrigger
 _NAME = Annotated[str, Field(min_length=1, max_length=120)]
 _MACRO_NAME = Annotated[str, Field(pattern=r"^[a-z][a-z0-9_-]{0,63}$")]
 _LABEL_NAME = Annotated[str, Field(pattern=r"^[a-z][a-z0-9_.-]{0,63}$")]
+type _JsonValue = int | float | str | bool | None | list[_JsonValue] | dict[str, _JsonValue]
 _LABEL_VALUE = Annotated[str, Field(min_length=1, max_length=120)]
 _ACCOUNT_SELECTOR = Annotated[
     dict[_LABEL_NAME, _LABEL_VALUE],
@@ -40,7 +41,7 @@ _ACCOUNT_SELECTOR = Annotated[
         }
     ),
 ]
-_AUTHORING_POLICY_CONDITIONS = {
+_AUTHORING_POLICY_CONDITIONS: dict[str, _JsonValue] = {
     "allOf": [
         {"not": {"required": ["account_ids", "account_selector"]}},
         {
