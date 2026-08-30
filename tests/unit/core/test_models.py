@@ -18,18 +18,30 @@ from llmmaxxing.core.models import (
     KeyPolicyRevision,
     PolicyBundleV1,
     ProviderAccount,
+    QuotaDimension,
     RequestAuthorizationCeiling,
     RequestProfile,
     RouteGroupRevision,
     RouteLeg,
 )
-from llmmaxxing.core.reasons import Modality, RouteStrategy, RouteTrigger, TerminalOutcome
+from llmmaxxing.core.reasons import (
+    V1_FEATURES,
+    Modality,
+    QuotaDimensionStatus,
+    RouteStrategy,
+    RouteTrigger,
+    TerminalOutcome,
+)
 from llmmaxxing.core.state_machines import (
     ActivationStage,
     KeyLifecycleState,
     key_transition,
     next_activation_stage,
 )
+
+
+def quota(status: str = "known", value: int | None = 1) -> dict[str, object]:
+    return {"status": status, "value": value}
 
 
 def account(name: str = "nan", **overrides: object) -> ProviderAccount:
@@ -40,10 +52,10 @@ def account(name: str = "nan", **overrides: object) -> ProviderAccount:
         "provider_token": f"tok-{name}",
         "binding_ref": f"bind-{name}",
         "max_in_flight": 5,
-        "rpm_limit": 1800,
-        "tpm_limit": 6_000_000,
+        "rpm_limit": quota(value=1800),
+        "tpm_limit": quota(value=6_000_000),
         "window_seconds": 60,
-        "monthly_quota_units": 1_000,
+        "monthly_quota_units": quota(value=1_000),
     }
     fields.update(overrides)
     return ProviderAccount.model_validate(fields)
@@ -172,7 +184,7 @@ def profile_fields() -> dict[str, object]:
 
 
 def test_names_never_define_identity():
-    a = ProviderAccount(account_id=AccountId.new(), display_name="nan", max_in_flight=5)
+    a = account()
     b = a.model_copy(update={"display_name": "renamed"})
     assert a.account_id == b.account_id
 
@@ -259,6 +271,34 @@ def test_unknown_trigger_is_rejected():
         RouteTrigger("panic_fallback")
 
 
+def test_required_features_schema_and_pydantic_share_closed_unique_vectors():
+    schema = PolicyBundleV1.model_json_schema()
+    feature_schema = schema["properties"]["required_features"]
+    item_ref = feature_schema["items"]["$ref"].rsplit("/", 1)[-1]
+    schema_values = set(schema["$defs"][item_ref]["enum"])
+    assert feature_schema["uniqueItems"] is True
+    assert schema_values == V1_FEATURES
+
+    vectors = (
+        ((), True),
+        (("ordered_capacity",), True),
+        (tuple(sorted(V1_FEATURES)), True),
+        (("ordered_capacity", "ordered_capacity"), False),
+        (("time_travel_routing",), False),
+    )
+    for features, accepted in vectors:
+        schema_accepts = (
+            len(set(features)) == len(features) and set(features) <= schema_values
+        )
+        assert schema_accepts is accepted
+        if accepted:
+            parsed = bundle(required_features=features).required_features
+            assert tuple(feature.value for feature in parsed) == features
+        else:
+            with pytest.raises(ValidationError, match="required_features"):
+                bundle(required_features=features)
+
+
 # --- exact references -----------------------------------------------------
 
 
@@ -317,6 +357,19 @@ def test_duplicate_ids_are_rejected():
         bundle(**p)
 
 
+def test_route_group_rejects_duplicate_order_and_normalizes_legs():
+    primary = account(name="primary")
+    spill = account(name="spill")
+    first = leg(primary.account_id, 10, (RouteTrigger.PRIMARY,))
+    second = leg(spill.account_id, 20, (RouteTrigger.CAPACITY_SPILL,))
+
+    normalized = route_group((second, first))
+    assert normalized.legs == (first, second)
+
+    with pytest.raises(ValidationError, match="duplicate RouteLeg.order"):
+        route_group((first, second.model_copy(update={"order": first.order})))
+
+
 def test_account_binding_triple_is_globally_unique():
     p = parts()
     first, second = p["accounts"]
@@ -330,6 +383,53 @@ def test_account_binding_triple_is_globally_unique():
     p["accounts"] = (first, stolen)
     with pytest.raises(ValidationError, match="binding"):
         bundle(**p)
+
+
+def test_empty_binding_triples_do_not_collide():
+    first = account(name="unbound-a", connection="", provider_token="", binding_ref="")
+    second = account(name="unbound-b", connection="", provider_token="", binding_ref="")
+    group = route_group(
+        (
+            leg(first.account_id, 10, (RouteTrigger.PRIMARY,)),
+            leg(second.account_id, 20, (RouteTrigger.CAPACITY_SPILL,)),
+        )
+    )
+    pol = policy((group.route_group_id,), (first.account_id, second.account_id))
+
+    result = bundle(
+        accounts=(first, second),
+        route_groups=(group,),
+        policies=(pol,),
+        keys=(key_record(pol.policy_id),),
+    )
+    assert len(result.accounts) == 2
+
+
+@pytest.mark.parametrize(
+    ("connection", "provider_token", "binding_ref"),
+    (
+        ("connection", "", ""),
+        ("", "token", ""),
+        ("", "", "binding"),
+        ("connection", "token", ""),
+        ("connection", "", "binding"),
+        ("", "token", "binding"),
+    ),
+)
+def test_partial_account_binding_always_rejects(
+    connection: str, provider_token: str, binding_ref: str
+):
+    with pytest.raises(ValidationError, match="binding"):
+        account(
+            connection=connection,
+            provider_token=provider_token,
+            binding_ref=binding_ref,
+        )
+
+
+def test_active_account_requires_complete_binding():
+    with pytest.raises(ValidationError, match="ACTIVE.*complete binding"):
+        account(connection="", provider_token="", binding_ref="", state="active")
 
 
 def test_several_keys_may_share_one_policy():
@@ -394,16 +494,36 @@ def test_schema_version_and_generation_are_bounded():
             bundle(**bad)
 
 
-def test_unattested_capacity_never_means_unlimited():
-    unknown = account(rpm_limit=None, tpm_limit=None, monthly_quota_units=None)
-    assert unknown.state.value == "draft"
-    assert unknown.enforced_max_in_flight == 1
+def test_quota_dimensions_distinguish_known_unknown_and_attested_absent():
+    known = QuotaDimension(status="known", value=60)
+    unknown = QuotaDimension(status="unknown")
+    absent = QuotaDimension(status="attested_absent")
+    assert known.status is QuotaDimensionStatus.KNOWN
+    assert known.value == 60
+    assert unknown.status is QuotaDimensionStatus.UNKNOWN
+    assert absent.status is QuotaDimensionStatus.ATTESTED_ABSENT
+
+    for invalid in (
+        {"status": "known"},
+        {"status": "unknown", "value": 60},
+        {"status": "attested_absent", "value": 60},
+    ):
+        with pytest.raises(ValidationError, match="value"):
+            QuotaDimension.model_validate(invalid)
+
+    draft = account(rpm_limit=quota("unknown", None))
+    assert draft.state.value == "draft"
+    assert draft.enforced_max_in_flight == 1
     with pytest.raises(ValidationError, match="attested"):
-        account(rpm_limit=None, state="active")
-    attested = unknown.model_copy(
-        update={"rpm_limit": 60, "tpm_limit": 100_000, "monthly_quota_units": 1}
+        account(rpm_limit=quota("unknown", None), state="active")
+
+    unlimited = account(
+        rpm_limit=quota("attested_absent", None),
+        tpm_limit=quota("attested_absent", None),
+        monthly_quota_units=quota("attested_absent", None),
     )
-    assert attested.enforced_max_in_flight == unknown.max_in_flight
+    assert unlimited.state.value == "active"
+    assert unlimited.enforced_max_in_flight == unlimited.max_in_flight
 
 
 # --- key lifecycle / activation state machines -----------------------------

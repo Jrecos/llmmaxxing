@@ -70,19 +70,31 @@ class Modality(_Closed):
     IMAGE = "image"
 
 
+@final
+class QuotaDimensionStatus(_Closed):
+    """Whether one provider quota dimension is bounded, unknown, or unlimited."""
+
+    KNOWN = "known"
+    UNKNOWN = "unknown"
+    ATTESTED_ABSENT = "attested_absent"
+
+
+@final
+class RequiredFeature(_Closed):
+    """Closed V1 bundle feature bits."""
+
+    ORDERED_CAPACITY = "ordered_capacity"
+    WEIGHTED_FAIR_QUEUE = "weighted_fair_queue"
+    EXPIRY_DENY_OVERLAY = "expiry_deny_overlay"
+    EMERGENCY_LEG_ACTIVATION = "emergency_leg_activation"
+    SHADOW_LEGS = "shadow_legs"
+    CREDENTIAL_GENERATION_FENCE = "credential_generation_fence"
+
+
 #: Feature bits a bundle may require.  A Gateway binary must understand every
 #: listed feature before applying the bundle; unknown names are rejected at
 #: model validation time, never silently skipped.
-V1_FEATURES: frozenset[str] = frozenset(
-    {
-        "ordered_capacity",
-        "weighted_fair_queue",
-        "expiry_deny_overlay",
-        "emergency_leg_activation",
-        "shadow_legs",
-        "credential_generation_fence",
-    }
-)
+V1_FEATURES: frozenset[str] = frozenset(feature.value for feature in RequiredFeature)
 
 #: Highest Gateway reader version this build can satisfy.  A bundle whose
 #: ``min_reader`` exceeds it cannot be applied by V1 binaries (downgrade guard).

@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 from test_models import account, bundle, key_record, leg, policy, route_group
 
 from llmmaxxing.core.canonical import (
@@ -90,6 +91,23 @@ def test_jcs_numeric_form() -> None:
             canonical_json_bytes({"a": bad})
 
 
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    (
+        (-9_007_199_254_740_991, b"-9007199254740991"),
+        (9_007_199_254_740_991, b"9007199254740991"),
+    ),
+)
+def test_jcs_safe_integer_boundary_vectors(value: int, expected: bytes) -> None:
+    assert canonical_json_bytes(value) == expected
+
+
+@pytest.mark.parametrize("value", (-9_007_199_254_740_992, 9_007_199_254_740_992))
+def test_jcs_rejects_integers_outside_ecmascript_safe_range(value: int) -> None:
+    with pytest.raises(ValueError, match="ECMAScript safe integer"):
+        canonical_json_bytes(value)
+
+
 def test_jcs_string_and_key_ordering() -> None:
     # non-ASCII is emitted as raw UTF-8, never \\u escapes
     assert canonical_json_bytes({"k": "ñ"}) == '{"k":"ñ"}'.encode()
@@ -109,6 +127,21 @@ def test_hash_is_domain_separated_and_content_sensitive() -> None:
     again = canonical_bundle_bytes(bundle_fixture(order="reverse"))
     assert bundle_hash(payload) == bundle_hash(again)
     assert bundle_hash(payload) != bundle_hash(canonical_bundle_bytes(bundle(generation=8)))
+
+
+def test_canonical_bundle_revalidates_bundle_and_nested_model_copies() -> None:
+    base = bundle_fixture()
+
+    missing_account = base.model_copy(update={"accounts": (base.accounts[0],)})
+    with pytest.raises(ValidationError, match="unknown account"):
+        canonical_bundle_bytes(missing_account)
+
+    partial_binding = base.accounts[0].model_copy(update={"connection": ""})
+    invalid_nested = base.model_copy(
+        update={"accounts": (partial_binding, *base.accounts[1:])}
+    )
+    with pytest.raises(ValidationError, match="binding"):
+        canonical_bundle_bytes(invalid_nested)
 
 
 def test_semantic_change_changes_hash() -> None:

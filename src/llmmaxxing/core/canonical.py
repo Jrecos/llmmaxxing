@@ -26,6 +26,7 @@ from llmmaxxing.core.models import PolicyBundleV1
 _BUNDLE_DOMAIN = b"llmmaxxing.bundle.v1\x00"
 
 _ES6_NUMBER = re.compile(r"(\d+)(?:\.(\d*))?(?:[eE]([+-]\d+))?")
+_MAX_SAFE_INTEGER = (1 << 53) - 1
 
 
 def _es6_number(value: float) -> str:
@@ -68,8 +69,10 @@ def _serialize(value: Any) -> bytes:
         # JSON escaping of control characters matches RFC 8785.
         return json.dumps(value, ensure_ascii=False).encode()
     if isinstance(value, int):
-        # Contract: bundle integers are bounded (every model field caps them
-        # well below 2**53), so int and float spellings of one value agree.
+        if not -_MAX_SAFE_INTEGER <= value <= _MAX_SAFE_INTEGER:
+            raise ValueError(
+                f"integer {value} exceeds the ECMAScript safe integer range"
+            )
         return str(value).encode()
     if isinstance(value, float):
         return _es6_number(value).encode()
@@ -94,24 +97,31 @@ def canonical_json_bytes(value: Any) -> bytes:
     return _serialize(value)
 
 
-def _sort_collections(value: Any) -> Any:
-    """Recursively sort every array by canonical element bytes.
+def _sort_collections(value: Any, field_name: str | None = None) -> Any:
+    """Recursively normalize bundle arrays to deterministic total orders.
 
     Every array in a policy bundle is semantically a set (duplicate members
-    are rejected at validation) or carries its order in an explicit field
-    (``RouteLeg.order``), so member order never carries meaning the hash
-    needs to preserve.
+    are rejected at validation) except ``legs``, whose explicit unique
+    ``order`` field defines precedence.
     """
     if isinstance(value, dict):
-        return {key: _sort_collections(item) for key, item in value.items()}
+        return {
+            key: _sort_collections(item, field_name=key)
+            for key, item in value.items()
+        }
     if isinstance(value, list):
-        return sorted((_sort_collections(item) for item in value), key=_serialize)
+        normalized = [_sort_collections(item) for item in value]
+        if field_name == "legs":
+            return sorted(normalized, key=lambda leg: (leg["order"], leg["leg_id"]))
+        return sorted(normalized, key=_serialize)
     return value
 
 
 def canonical_bundle_bytes(bundle: PolicyBundleV1) -> bytes:
-    """Canonical bytes of a policy bundle: independent of member input order."""
-    return canonical_json_bytes(_sort_collections(bundle.model_dump(mode="json")))
+    """Validate a full dump, then return order-independent canonical bytes."""
+    dumped = bundle.model_dump(mode="python", round_trip=True, warnings=False)
+    validated = PolicyBundleV1.model_validate(dumped)
+    return canonical_json_bytes(_sort_collections(validated.model_dump(mode="json")))
 
 
 def content_hash(payload: bytes, domain: bytes = _BUNDLE_DOMAIN) -> str:

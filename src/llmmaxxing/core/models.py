@@ -22,8 +22,9 @@ from llmmaxxing.core.ids import (
 )
 from llmmaxxing.core.reasons import (
     MAX_MIN_READER,
-    V1_FEATURES,
     Modality,
+    QuotaDimensionStatus,
+    RequiredFeature,
     RouteStrategy,
     RouteTrigger,
 )
@@ -38,7 +39,22 @@ _MAX_DEADLINE_MS = 9_000_000
 class _Frozen(BaseModel):
     """Common contract: frozen value objects, exact fields only."""
 
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+
+class QuotaDimension(_Frozen):
+    """One RPM, TPM, or monthly quota dimension and its attestation state."""
+
+    status: QuotaDimensionStatus
+    value: int | None = Field(default=None, gt=0)
+
+    @model_validator(mode="after")
+    def _value_matches_status(self) -> Self:
+        if self.status is QuotaDimensionStatus.KNOWN and self.value is None:
+            raise ValueError("a known quota dimension requires a value")
+        if self.status is not QuotaDimensionStatus.KNOWN and self.value is not None:
+            raise ValueError("only a known quota dimension may carry a value")
+        return self
 
 
 class ProviderAccount(_Frozen):
@@ -51,19 +67,17 @@ class ProviderAccount(_Frozen):
     provider_token: str = ""
     binding_ref: str = ""
     max_in_flight: int = Field(ge=1, le=128)
-    # None means *not yet measured*: unknown never means unlimited.
-    rpm_limit: int | None = Field(default=None, gt=0)
-    tpm_limit: int | None = Field(default=None, gt=0)
+    rpm_limit: QuotaDimension
+    tpm_limit: QuotaDimension
     window_seconds: int = Field(default=60, gt=0, le=3600)
-    monthly_quota_units: int | None = Field(default=None, gt=0)
+    monthly_quota_units: QuotaDimension
     state: AccountState | None = None
 
     @property
     def fully_attested(self) -> bool:
-        return (
-            self.rpm_limit is not None
-            and self.tpm_limit is not None
-            and self.monthly_quota_units is not None
+        return all(
+            dimension.status is not QuotaDimensionStatus.UNKNOWN
+            for dimension in (self.rpm_limit, self.tpm_limit, self.monthly_quota_units)
         )
 
     @property
@@ -73,6 +87,11 @@ class ProviderAccount(_Frozen):
 
     @model_validator(mode="after")
     def _derive_and_guard_state(self) -> Self:
+        binding = (self.connection, self.provider_token, self.binding_ref)
+        if any(binding) and not all(binding):
+            raise ValueError("account binding must be fully populated or fully empty")
+        bound = all(binding)
+
         if not self.fully_attested:
             if self.state not in (None, AccountState.DRAFT):
                 raise ValueError(
@@ -81,8 +100,9 @@ class ProviderAccount(_Frozen):
                 )
             object.__setattr__(self, "state", AccountState.DRAFT)
             return self
+        if self.state is AccountState.ACTIVE and not bound:
+            raise ValueError("an ACTIVE account requires a complete binding")
         if self.state is None:
-            bound = bool(self.connection and self.provider_token and self.binding_ref)
             object.__setattr__(self, "state", AccountState.ACTIVE if bound else AccountState.DRAFT)
         return self
 
@@ -111,6 +131,18 @@ class RouteGroupRevision(_Frozen):
     name: str = Field(min_length=1, max_length=120)
     strategy: RouteStrategy
     legs: tuple[RouteLeg, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _orders_unique_and_normalized(self) -> Self:
+        orders = [leg.order for leg in self.legs]
+        if len(set(orders)) != len(orders):
+            raise ValueError("duplicate RouteLeg.order within route group")
+        object.__setattr__(
+            self,
+            "legs",
+            tuple(sorted(self.legs, key=lambda leg: (leg.order, str(leg.leg_id)))),
+        )
+        return self
 
 
 class KeyPolicyRevision(_Frozen):
@@ -213,7 +245,9 @@ class PolicyBundleV1(_Frozen):
     schema_version: Literal[1]
     generation: int = Field(ge=1)
     min_reader: str
-    required_features: tuple[str, ...]
+    required_features: tuple[RequiredFeature, ...] = Field(
+        json_schema_extra={"uniqueItems": True}
+    )
     keys: tuple[ClientKeyRecord, ...] = Field(min_length=1)
     policies: tuple[KeyPolicyRevision, ...] = Field(min_length=1)
     accounts: tuple[ProviderAccount, ...] = Field(min_length=1)
@@ -235,10 +269,9 @@ class PolicyBundleV1(_Frozen):
 
     @field_validator("required_features")
     @classmethod
-    def _features_known(cls, v: tuple[str, ...]) -> tuple[str, ...]:
-        unknown = sorted(set(v) - V1_FEATURES)
-        if unknown:
-            raise ValueError(f"unknown required feature: {', '.join(unknown)}")
+    def _features_unique(
+        cls, v: tuple[RequiredFeature, ...]
+    ) -> tuple[RequiredFeature, ...]:
         if len(set(v)) != len(v):
             raise ValueError("duplicate required feature")
         return v
@@ -259,7 +292,11 @@ class PolicyBundleV1(_Frozen):
             if len(set(seen)) != len(seen):
                 raise ValueError(f"duplicate {label} in bundle")
 
-        bindings = [(a.connection, a.provider_token, a.binding_ref) for a in self.accounts]
+        bindings = [
+            binding
+            for a in self.accounts
+            if any(binding := (a.connection, a.provider_token, a.binding_ref))
+        ]
         if len(set(bindings)) != len(bindings):
             raise ValueError("duplicate account binding triple across live and tombstoned accounts")
 
