@@ -18,9 +18,7 @@ from llmmaxxing.core.models import ClientCredentialVerifier, ClientKeyRecord
 from llmmaxxing.core.state_machines import CredentialVerifierStatus, KeyLifecycleState
 
 _PUBLIC_ERROR = "invalid client key"
-_ACCEPTED_STATUSES = frozenset(
-    (CredentialVerifierStatus.ACTIVE, CredentialVerifierStatus.RETIRING)
-)
+_ACCEPTED_STATUSES = frozenset((CredentialVerifierStatus.ACTIVE, CredentialVerifierStatus.RETIRING))
 _DUMMY_PEPPER = b"\x00" * 32
 _DUMMY_VERIFIER = b"\x00" * 32
 
@@ -111,9 +109,8 @@ def verify_client_key(
     runtime_view: AuthRuntimeView,
 ) -> AuthenticatedClient:
     """Verify locally with one index lookup and a fixed two constant-time compares."""
-    pepper_set_is_valid = (
-        1 <= len(runtime_view.accepted_peppers) <= 2
-        and all(len(pepper) >= 32 for pepper in runtime_view.accepted_peppers.values())
+    pepper_set_is_valid = 1 <= len(runtime_view.accepted_peppers) <= 2 and all(
+        len(pepper) >= 32 for pepper in runtime_view.accepted_peppers.values()
     )
     record = runtime_view.key_index.get(parsed.key_id)
     verifiers = record.credential_verifiers if record is not None else ()

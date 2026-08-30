@@ -300,9 +300,7 @@ def test_affected_projection_replaces_leg_triggers_with_policy_intersection() ->
         {
             **base.model_dump(mode="python"),
             "generation": base.generation + 1,
-            "route_groups": (
-                base.route_groups[0].model_copy(update={"legs": (expanded,)}),
-            ),
+            "route_groups": (base.route_groups[0].model_copy(update={"legs": (expanded,)}),),
         }
     )
 
@@ -428,9 +426,7 @@ def test_signing_revalidates_key_lifecycle_against_exact_bundles() -> None:
     invalid_target = target.model_copy(
         update={
             "keys": (
-                target.keys[0].model_copy(
-                    update={"expires_at_s": target.keys[0].expires_at_s + 1}
-                ),
+                target.keys[0].model_copy(update={"expires_at_s": target.keys[0].expires_at_s + 1}),
                 target.keys[1],
             )
         }

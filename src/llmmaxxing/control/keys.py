@@ -270,9 +270,7 @@ def rotate_key(
     retiring = current.model_copy(
         update={
             "status": (
-                CredentialVerifierStatus.RETIRING
-                if overlap_s
-                else CredentialVerifierStatus.RETIRED
+                CredentialVerifierStatus.RETIRING if overlap_s else CredentialVerifierStatus.RETIRED
             ),
             "not_after_s": min(record.expires_at_s, now_s + overlap_s),
         }

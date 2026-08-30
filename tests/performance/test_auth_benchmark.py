@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Mapping, Set
 from dataclasses import dataclass
-from typing import AbstractSet, Mapping
 
 from llmmaxxing.control.keys import issue_key
 from llmmaxxing.core.ids import BundleHash, PolicyRevisionId, RouteGroupId
@@ -25,7 +25,7 @@ class Runtime:
     key_index: Mapping[str, ClientKeyRecord]
     applied_bundle_generation: int
     applied_bundle_hash: BundleHash
-    denied_key_ids: AbstractSet[str]
+    denied_key_ids: Set[str]
     accepted_peppers: Mapping[str, bytes]
     trusted_now_s: int
 

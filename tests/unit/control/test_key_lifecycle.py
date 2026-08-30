@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Mapping, Set
 from dataclasses import dataclass, replace
-from typing import AbstractSet, Mapping
 
 import pytest
 
@@ -172,13 +172,14 @@ def test_suspend_resume_revoke_and_expiry_are_fail_closed_and_terminal() -> None
         key_index: Mapping[str, ClientKeyRecord]
         applied_bundle_generation: int = 1
         applied_bundle_hash: BundleHash = BUNDLE_HASH
-        denied_key_ids: AbstractSet[str] = frozenset()
+        denied_key_ids: Set[str] = frozenset()
         accepted_peppers: Mapping[str, bytes] = None  # type: ignore[assignment]
         trusted_now_s: int = NOW
 
         def __post_init__(self) -> None:
             if self.accepted_peppers is None:
                 object.__setattr__(self, "accepted_peppers", {"p1": PEPPER})
+
     expired_record = expire_key(issued.record, now_s=NOW + 10)
     assert expired_record.time_high_water_s == NOW + 10
     assert all(
@@ -204,7 +205,9 @@ def test_suspend_resume_revoke_and_expiry_are_fail_closed_and_terminal() -> None
         )
 
 
-def test_lifecycle_delta_rejects_generation_rollback_reuse_resurrection_and_expiry_extension() -> None:
+def test_lifecycle_delta_rejects_generation_rollback_reuse_resurrection_and_expiry_extension() -> (
+    None
+):
     issued = issue()
     rotated = rotate_key(
         issued.record,
@@ -227,7 +230,14 @@ def test_lifecycle_delta_rejects_generation_rollback_reuse_resurrection_and_expi
     with pytest.raises(ValueError, match="terminal credential|active newest"):
         validate_key_record_delta(
             rotated,
-            rotated.model_copy(update={"credential_verifiers": (resurrected, rotated.credential_verifiers[1])}),
+            rotated.model_copy(
+                update={
+                    "credential_verifiers": (
+                        resurrected,
+                        rotated.credential_verifiers[1],
+                    )
+                }
+            ),
         )
 
     third = rotate_key(

@@ -198,9 +198,7 @@ class ClientKeyRecord(_Frozen):
     expires_at_s: int = Field(gt=0)
     time_high_water_s: int = Field(gt=0)
     generation_high_water: int = Field(ge=1)
-    credential_verifiers: tuple[ClientCredentialVerifier, ...] = Field(
-        min_length=1, max_length=2
-    )
+    credential_verifiers: tuple[ClientCredentialVerifier, ...] = Field(min_length=1, max_length=2)
 
     @model_validator(mode="after")
     def _valid_lifetime_and_generations(self) -> Self:
@@ -225,8 +223,7 @@ class ClientKeyRecord(_Frozen):
         accepted = tuple(
             item
             for item in self.credential_verifiers
-            if item.status
-            in (CredentialVerifierStatus.ACTIVE, CredentialVerifierStatus.RETIRING)
+            if item.status in (CredentialVerifierStatus.ACTIVE, CredentialVerifierStatus.RETIRING)
         )
         active = tuple(
             item
@@ -235,10 +232,7 @@ class ClientKeyRecord(_Frozen):
         )
         if len(accepted) > 2:
             raise ValueError("at most two credential generations may be accepted")
-        if (
-            self.state is KeyLifecycleState.REVOKED
-            or self.time_high_water_s >= self.expires_at_s
-        ):
+        if self.state is KeyLifecycleState.REVOKED or self.time_high_water_s >= self.expires_at_s:
             if accepted:
                 raise ValueError("terminal key cannot retain accepted credential generations")
         elif len(active) != 1 or active[0].generation != self.generation_high_water:

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import hmac
+from collections.abc import Mapping, Set
 from dataclasses import dataclass, replace
-from typing import AbstractSet, Mapping
 
 import pytest
 
@@ -44,7 +44,7 @@ class Runtime:
     key_index: Mapping[str, ClientKeyRecord]
     applied_bundle_generation: int = 7
     applied_bundle_hash: BundleHash = BUNDLE_HASH
-    denied_key_ids: AbstractSet[str] = frozenset()
+    denied_key_ids: Set[str] = frozenset()
     accepted_peppers: Mapping[str, bytes] = None  # type: ignore[assignment]
     trusted_now_s: int = NOW
 
@@ -115,7 +115,9 @@ def test_verify_returns_only_pre_body_identity_from_applied_runtime() -> None:
         assert not hasattr(client, forbidden)
 
 
-def test_unknown_id_runs_dummy_hmac_and_errors_are_non_enumerating(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_unknown_id_runs_dummy_hmac_and_errors_are_non_enumerating(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     issued, runtime = issued_runtime()
     value = issued.reveal_once().value
     unknown_id = "A" * 22
@@ -173,17 +175,26 @@ def test_current_and_prior_peppers_are_accepted_only_during_credential_overlap()
         trusted_now_s=NOW + 120,
     )
 
-    assert verify_client_key(parse_client_key(first_value), overlap).accepted_credential_generation == 1
-    assert verify_client_key(parse_client_key(second_value), overlap).accepted_credential_generation == 2
+    assert (
+        verify_client_key(parse_client_key(first_value), overlap).accepted_credential_generation
+        == 1
+    )
+    assert (
+        verify_client_key(parse_client_key(second_value), overlap).accepted_credential_generation
+        == 2
+    )
     without_prior = replace(
         overlap,
         accepted_peppers={"pepper-current": PEPPERS["pepper-current"]},
     )
     with pytest.raises(ClientAuthenticationError):
         verify_client_key(parse_client_key(first_value), without_prior)
-    assert verify_client_key(
-        parse_client_key(second_value), without_prior
-    ).accepted_credential_generation == 2
+    assert (
+        verify_client_key(
+            parse_client_key(second_value), without_prior
+        ).accepted_credential_generation
+        == 2
+    )
     too_many_peppers = replace(
         overlap,
         accepted_peppers={**PEPPERS, "pepper-ancient": b"a" * 32},
@@ -191,14 +202,15 @@ def test_current_and_prior_peppers_are_accepted_only_during_credential_overlap()
     with pytest.raises(ClientAuthenticationError):
         verify_client_key(parse_client_key(second_value), too_many_peppers)
 
-
-
     after_overlap = replace(overlap, trusted_now_s=NOW + 60 + 86_400)
     with pytest.raises(ClientAuthenticationError):
         verify_client_key(parse_client_key(first_value), after_overlap)
-    assert verify_client_key(
-        parse_client_key(second_value), after_overlap
-    ).accepted_credential_generation == 2
+    assert (
+        verify_client_key(
+            parse_client_key(second_value), after_overlap
+        ).accepted_credential_generation
+        == 2
+    )
 
 
 def test_expiry_has_no_grace_and_suspend_revoke_stop_queued_not_active() -> None:
@@ -224,7 +236,6 @@ def test_expiry_has_no_grace_and_suspend_revoke_stop_queued_not_active() -> None
         client,
         replace(live, key_index={issued.record.key_id: resumed_record}),
     )
-
 
     expired = replace(live, trusted_now_s=NOW + 1)
     assert not queued_identity_is_authorized(client, expired)
