@@ -252,6 +252,57 @@ def response_headers(response: httpx.Response) -> tuple[tuple[bytes, bytes], ...
     )
 
 
+class ResponseAlreadyStarted(RuntimeError):
+    pass
+
+
+class ResponseStart:
+    """Serialize and record the one actual shielded ASGI response-start send."""
+
+    __slots__ = ("started", "_lock")
+
+    def __init__(self) -> None:
+        self.started = False
+        self._lock = asyncio.Lock()
+
+    async def send(
+        self,
+        send: ASGISend,
+        *,
+        status: int,
+        headers: list[tuple[bytes, bytes]],
+    ) -> None:
+        async with self._lock:
+            if self.started:
+                raise ResponseAlreadyStarted("ASGI response already started")
+            operation = asyncio.create_task(
+                send(
+                    {
+                        "type": "http.response.start",
+                        "status": status,
+                        "headers": headers,
+                    }
+                )
+            )
+            cancelled = False
+            while True:
+                try:
+                    await asyncio.shield(operation)
+                except asyncio.CancelledError:
+                    cancelled = True
+                    if operation.done() and operation.cancelled():
+                        raise
+                    continue
+                except BaseException:
+                    if cancelled:
+                        raise asyncio.CancelledError from None
+                    raise
+                self.started = True
+                if cancelled:
+                    raise asyncio.CancelledError
+                return
+
+
 class UpstreamStreamError(RuntimeError):
     pass
 
@@ -308,7 +359,7 @@ async def relay_raw_response(
     response: httpx.Response,
     receive: Any,
     send: ASGISend,
-    *,
+    response_start: ResponseStart,
     read_inactivity_timeout_s: float,
 ) -> int:
     """Start once and relay bounded raw bytes while observing ASGI disconnects."""
@@ -316,17 +367,13 @@ async def relay_raw_response(
     try:
         try:
             await _await_or_disconnect(
-                send(
-                    {
-                        "type": "http.response.start",
-                        "status": response.status_code,
-                        "headers": list(response_headers(response)),
-                    }
+                response_start.send(
+                    send,
+                    status=response.status_code,
+                    headers=list(response_headers(response)),
                 ),
                 disconnect,
             )
-        except asyncio.CancelledError:
-            raise
         except DownstreamDisconnected:
             raise
         except Exception as error:
@@ -412,14 +459,13 @@ async def relay_buffered_response(
     response: httpx.Response,
     body: bytes,
     send: ASGISend,
+    response_start: ResponseStart,
 ) -> None:
     try:
-        await send(
-            {
-                "type": "http.response.start",
-                "status": response.status_code,
-                "headers": list(response_headers(response)),
-            }
+        await response_start.send(
+            send,
+            status=response.status_code,
+            headers=list(response_headers(response)),
         )
         for offset in range(0, len(body), RAW_CHUNK_BYTES):
             await send(

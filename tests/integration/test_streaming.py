@@ -536,3 +536,90 @@ def test_authorized_shadow_uses_only_immediate_spare_and_records_receipt_lifecyc
             await blocked.close()
 
     run(scenario())
+
+
+def test_deadline_during_upstream_response_start_never_suppresses_or_double_starts(
+    tmp_path,
+) -> None:  # type: ignore[no-untyped-def]
+    async def scenario() -> None:
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        blocked = False
+
+        async def block_first_start(message) -> None:  # type: ignore[no-untyped-def]
+            nonlocal blocked
+            if message["type"] == "http.response.start" and not blocked:
+                blocked = True
+                entered.set()
+                await release.wait()
+
+        stack = await make_stack(
+            tmp_path,
+            FaultPlan(FaultMode.JSON),
+            deadline_ms=1_000,
+            read_timeout_s=2,
+        )
+        task = asyncio.create_task(
+            call_app(stack.app, stack.token, send_hook=block_first_start)
+        )
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=2)
+            await asyncio.sleep(1.05)
+            release.set()
+            response = await task
+            starts = [
+                message
+                for message in response.messages
+                if message["type"] == "http.response.start"
+            ]
+            assert len(starts) == 1
+            assert response.status == 200
+            lifecycle = stack.lifecycle_capacity.lifecycles[0]
+            assert [value for name, value in lifecycle.events if name == "finished"] == [
+                TerminalOutcome.DEADLINE_EXCEEDED
+            ]
+        finally:
+            release.set()
+            if not task.done():
+                task.cancel()
+            await stack.close()
+
+    run(scenario())
+
+
+def test_deadline_during_local_error_start_keeps_the_actual_first_status(tmp_path) -> None:
+    async def scenario() -> None:
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        blocked = False
+
+        async def block_first_start(message) -> None:  # type: ignore[no-untyped-def]
+            nonlocal blocked
+            if message["type"] == "http.response.start" and not blocked:
+                blocked = True
+                entered.set()
+                await release.wait()
+
+        stack = await make_stack(tmp_path, deadline_ms=1_000)
+        task = asyncio.create_task(
+            call_app(stack.app, stack.token, body=b"{", send_hook=block_first_start)
+        )
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=2)
+            await asyncio.sleep(1.05)
+            release.set()
+            response = await task
+            starts = [
+                message
+                for message in response.messages
+                if message["type"] == "http.response.start"
+            ]
+            assert len(starts) == 1
+            assert response.status == 422
+        finally:
+            release.set()
+            if not task.done():
+                task.cancel()
+            await stack.close()
+
+    run(scenario())

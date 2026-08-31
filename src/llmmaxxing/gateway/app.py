@@ -69,6 +69,7 @@ from llmmaxxing.gateway.streaming import (
     DownstreamStreamError,
     PermitClass,
     ProcessHTTPClient,
+    ResponseStart,
     UpstreamStreamError,
     drain_raw_response,
     read_prestart_error,
@@ -152,8 +153,12 @@ class _AttemptResult:
 class _DeadlineState:
     monotonic_at: float
     wall_at_ms: int
+    response_start: ResponseStart
     expired: bool = False
-    response_started: bool = False
+
+    @property
+    def response_started(self) -> bool:
+        return self.response_start.started
 
 
 @dataclass(slots=True)
@@ -195,22 +200,26 @@ async def _shielded(awaitable: Any) -> Any:
         raise
 
 
-async def _send_error(send: ASGISend, status: int, code: str) -> None:
+async def _send_error(
+    send: ASGISend,
+    status: int,
+    code: str,
+    response_start: ResponseStart | None = None,
+) -> None:
     body = json.dumps(
         {"error": {"type": "llmmaxxing_error", "code": code}},
         separators=(",", ":"),
     ).encode()
+    start = response_start or ResponseStart()
     try:
-        await send(
-            {
-                "type": "http.response.start",
-                "status": status,
-                "headers": [
-                    (b"content-type", b"application/json"),
-                    (b"content-length", str(len(body)).encode()),
-                    (b"cache-control", b"no-store"),
-                ],
-            }
+        await start.send(
+            send,
+            status=status,
+            headers=[
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(body)).encode()),
+                (b"cache-control", b"no-store"),
+            ],
         )
         await send({"type": "http.response.body", "body": body, "more_body": False})
     except asyncio.CancelledError:
@@ -384,17 +393,22 @@ class GatewayApp:
         receive: ASGIReceive,
         send: ASGISend,
     ) -> None:
+        response_start = ResponseStart()
+
+        async def send_error(status: int, code: str) -> None:
+            await _send_error(send, status, code, response_start)
+
         if self._closed:
-            await _send_error(send, 503, "gateway_closed")
+            await send_error(503, "gateway_closed")
             return
         try:
             ingress_request = validate_http_request(scope, self.contract, self.ingress.limits)
         except IngressError as error:
-            await _send_error(send, error.status, error.code)
+            await send_error(error.status, error.code)
             return
         preauth = await self.ingress.try_preauth()
         if preauth is None:
-            await _send_error(send, 503, "preauth_limit")
+            await send_error(503, "preauth_limit")
             return
         lifecycle: RequestLifecycle | None = None
         body: RetainedBody | None = None
@@ -408,15 +422,16 @@ class GatewayApp:
                 client = verify_client_key(parsed, self.auth_view_provider.current_auth_view())
             except Exception as error:
                 if not isinstance(error, ClientAuthenticationError):
-                    await _send_error(send, 503, "auth_state_unavailable")
+                    await send_error(503, "auth_state_unavailable")
                 else:
-                    await _send_error(send, 401, "invalid_client_key")
+                    await send_error(401, "invalid_client_key")
                 return
             deadline_ms = self.route_engine.policy_deadline_ms(client)
             loop = asyncio.get_running_loop()
             deadline = _DeadlineState(
                 monotonic_at=loop.time() + deadline_ms / 1000,
                 wall_at_ms=self.clock.now_ms() + deadline_ms,
+                response_start=response_start,
             )
             request_task = asyncio.current_task()
             assert request_task is not None
@@ -435,7 +450,7 @@ class GatewayApp:
                 lifecycle_events,
             )
             if lifecycle is None:
-                await _send_error(send, 503, "lifecycle_capacity")
+                await send_error(503, "lifecycle_capacity")
                 return
             await preauth.release()
             preauth = None
@@ -462,19 +477,19 @@ class GatewayApp:
                     else TerminalOutcome.BACKPRESSURE_REJECTED
                 )
                 final_recorded = True
-                await _send_error(send, error.status, error.code)
+                await send_error(error.status, error.code)
                 return
             except ProfileError as error:
                 await lifecycle.finished(TerminalOutcome.UNSUPPORTED_REQUEST)
                 final_recorded = True
-                await _send_error(send, error.status, error.code)
+                await send_error(error.status, error.code)
                 return
             await lifecycle.profile_accepted(profile)
             authorization = self.route_engine.authorize(client, profile)
             if not authorization.authorized_legs:
                 await lifecycle.finished(TerminalOutcome.AUTHZ_DENIED)
                 final_recorded = True
-                await _send_error(send, 403, "model_not_authorized")
+                await send_error(403, "model_not_authorized")
                 return
             identity = self.runtime_identity_provider.current_runtime_identity()
             if (
@@ -483,7 +498,7 @@ class GatewayApp:
             ):
                 await lifecycle.finished(TerminalOutcome.AUTH_STATE_UNAVAILABLE)
                 final_recorded = True
-                await _send_error(send, 503, "runtime_identity_mismatch")
+                await send_error(503, "runtime_identity_mismatch")
                 return
             attempt_budget = AttemptBudget(request_id)
             cause = DispatchCause.PRIMARY
@@ -504,7 +519,7 @@ class GatewayApp:
                 except AdmissionUnavailable:
                     await lifecycle.finished(TerminalOutcome.ROUTE_UNAVAILABLE)
                     final_recorded = True
-                    await _send_error(send, 503, "route_unavailable")
+                    await send_error(503, "route_unavailable")
                     return
                 result = await self._attempt(
                     ingress_request,
@@ -545,7 +560,7 @@ class GatewayApp:
                 final_recorded = True
             if deadline is not None and deadline.expired:
                 if not deadline.response_started:
-                    await _send_error(send, 504, "deadline_exceeded")
+                    await send_error(504, "deadline_exceeded")
                 return
             raise
         except Exception:
@@ -554,7 +569,7 @@ class GatewayApp:
                     await lifecycle.finished(TerminalOutcome.UPSTREAM_FAILED)
                 final_recorded = True
             if deadline is None or not deadline.response_started:
-                await _send_error(send, 500, "gateway_failure")
+                await send_error(500, "gateway_failure")
         finally:
             if deadline_handle is not None:
                 deadline_handle.cancel()
@@ -658,7 +673,9 @@ class GatewayApp:
                 fallback_cause = DispatchCause.FAILURE
                 if self._authorization_has_alternate(dispatch, fallback_cause, authorization):
                     return _AttemptResult(False, TerminalOutcome.UPSTREAM_FAILED, fallback_cause)
-                await _send_error(send, 502, "upstream_connect_failure")
+                await _send_error(
+                    send, 502, "upstream_connect_failure", deadline.response_start
+                )
                 return _AttemptResult(True, TerminalOutcome.UPSTREAM_FAILED)
             except (httpx.HTTPError, OSError):
                 pending_outcome = TerminalOutcome.UPSTREAM_FAILED
@@ -673,7 +690,9 @@ class GatewayApp:
                     TerminalOutcome.UPSTREAM_FAILED,
                     uncertain=True,
                 )
-                await _send_error(send, 502, "upstream_transport_failure")
+                await _send_error(
+                    send, 502, "upstream_transport_failure", deadline.response_start
+                )
                 return _AttemptResult(True, TerminalOutcome.UPSTREAM_FAILED)
             except (DispatchError, ProfileError, ValueError, RuntimeError):
                 pending_outcome = TerminalOutcome.UPSTREAM_FAILED
@@ -682,7 +701,9 @@ class GatewayApp:
                     TerminalOutcome.UPSTREAM_FAILED,
                     uncertain=False,
                 )
-                await _send_error(send, 502, "dispatch_preparation_failed")
+                await _send_error(
+                    send, 502, "dispatch_preparation_failed", deadline.response_start
+                )
                 return _AttemptResult(True, TerminalOutcome.UPSTREAM_FAILED)
 
             if not 200 <= response.status_code < 300:
@@ -705,7 +726,9 @@ class GatewayApp:
                         TerminalOutcome.UPSTREAM_FAILED,
                         uncertain=True,
                     )
-                    await _send_error(send, 502, "upstream_error_read_failed")
+                    await _send_error(
+                        send, 502, "upstream_error_read_failed", deadline.response_start
+                    )
                     return _AttemptResult(True, TerminalOutcome.UPSTREAM_FAILED)
                 observation = _failure_observation(response.status_code, error_body)
                 classification = self.failure_classifier.classify(observation)
@@ -736,9 +759,13 @@ class GatewayApp:
                 alternate = classification.dispatch_cause
                 if self._authorization_has_alternate(dispatch, alternate, authorization):
                     return _AttemptResult(False, TerminalOutcome.UPSTREAM_FAILED, alternate)
-                deadline.response_started = True
                 try:
-                    await relay_buffered_response(response, error_body, send)
+                    await relay_buffered_response(
+                        response,
+                        error_body,
+                        send,
+                        deadline.response_start,
+                    )
                 except DownstreamStreamError:
                     return _AttemptResult(True, TerminalOutcome.CLIENT_CANCELLED)
                 return _AttemptResult(True, TerminalOutcome.UPSTREAM_FAILED)
@@ -765,7 +792,9 @@ class GatewayApp:
                     TerminalOutcome.UPSTREAM_FAILED,
                     uncertain=False,
                 )
-                await _send_error(send, 502, "deployment_receipt_mismatch")
+                await _send_error(
+                    send, 502, "deployment_receipt_mismatch", deadline.response_start
+                )
                 return _AttemptResult(True, TerminalOutcome.UPSTREAM_FAILED)
 
             if not shadow.decided:
@@ -786,12 +815,12 @@ class GatewayApp:
                     )
 
             dispatch.mark_response_started()
-            deadline.response_started = True
             try:
                 await relay_raw_response(
                     response,
                     receive,
                     send,
+                    deadline.response_start,
                     read_inactivity_timeout_s=self.http.config.read_inactivity_timeout_s,
                 )
             except DownstreamDisconnected:

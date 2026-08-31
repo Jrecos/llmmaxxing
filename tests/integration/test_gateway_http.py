@@ -741,3 +741,56 @@ def test_chat_profiler_derives_image_and_audio_and_rejects_mixed_nontext(tmp_pat
             await stack.close()
 
     run(scenario())
+
+
+def test_cancelled_profile_offloads_hold_both_slots_until_work_really_finishes(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        original = RetainedBody._read_sync
+        release = threading.Event()
+        two_entered = threading.Event()
+        state_lock = threading.Lock()
+        active = 0
+        peak = 0
+
+        def blocked_read(body: RetainedBody) -> bytes:
+            nonlocal active, peak
+            with state_lock:
+                active += 1
+                peak = max(peak, active)
+                if active == 2:
+                    two_entered.set()
+            release.wait(timeout=2)
+            try:
+                return original(body)
+            finally:
+                with state_lock:
+                    active -= 1
+
+        monkeypatch.setattr(RetainedBody, "_read_sync", blocked_read)
+        stack = await make_stack(tmp_path, deadline_ms=30)
+        tasks = [
+            asyncio.create_task(call_app(stack.app, stack.token))
+            for _ in range(2)
+        ]
+        try:
+            assert await asyncio.to_thread(two_entered.wait, 1)
+            await asyncio.sleep(0.05)
+            tasks.append(asyncio.create_task(call_app(stack.app, stack.token)))
+            await asyncio.sleep(0.06)
+            with state_lock:
+                assert peak == 2
+                assert active == 2
+            release.set()
+            responses = await asyncio.gather(*tasks)
+            assert [response.status for response in responses] == [504, 504, 504]
+        finally:
+            release.set()
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await stack.close()
+
+    run(scenario())

@@ -9,6 +9,7 @@ import multiprocessing
 import re
 import resource
 from collections.abc import Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any, NoReturn, cast
 
@@ -540,6 +541,27 @@ class _ScratchReservation:
         await self._owner._release_scratch(self.key_id, self.amount)
 
 
+async def _await_completion(awaitable: Any) -> Any:
+    """Preserve caller cancellation only after the bounded offload really stops."""
+    task = asyncio.ensure_future(awaitable)
+    cancelled = False
+    while True:
+        try:
+            result = await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+            if task.done() and task.cancelled():
+                raise
+            continue
+        except BaseException:
+            if cancelled:
+                raise asyncio.CancelledError from None
+            raise
+        if cancelled:
+            raise asyncio.CancelledError
+        return result
+
+
 class ProfileExecutor:
     """Exactly two fresh resource-limited workers; parse trees never return."""
 
@@ -586,12 +608,18 @@ class ProfileExecutor:
         if self._closed:
             raise ProfileError(503, "profile_workers_closed")
         loop = asyncio.get_running_loop()
+        future = loop.run_in_executor(self._executor, function, *arguments)
         try:
-            future = loop.run_in_executor(self._executor, function, *arguments)
-            return await asyncio.wait_for(future, PROFILE_WALL_SECONDS)
+            try:
+                async with asyncio.timeout(PROFILE_WALL_SECONDS):
+                    return await asyncio.shield(future)
+            except TimeoutError:
+                with suppress(BaseException):
+                    await asyncio.shield(future)
+                raise ProfileError(503, "profile_worker_unavailable") from None
         except ValueError as error:
             raise ProfileError(422, str(error)) from None
-        except (TimeoutError, concurrent.futures.process.BrokenProcessPool):
+        except concurrent.futures.process.BrokenProcessPool:
             raise ProfileError(503, "profile_worker_unavailable") from None
 
     async def profile(
@@ -606,13 +634,17 @@ class ProfileExecutor:
         scratch = await self._reserve_scratch(key_id, body.size)
         try:
             async with self._worker_slots:
-                raw = await body.read()
+                raw = await _await_completion(body.read())
                 if endpoint.model_locator == "json.model":
                     try:
-                        await asyncio.to_thread(_prescan_json_limits, raw)
+                        await _await_completion(
+                            asyncio.to_thread(_prescan_json_limits, raw)
+                        )
                     except ValueError as error:
                         raise ProfileError(422, str(error)) from None
-                result = await self._run(_profile_worker, endpoint.name, raw, content_type)
+                result = await _await_completion(
+                    self._run(_profile_worker, endpoint.name, raw, content_type)
+                )
                 assert isinstance(result, _ProfileResult)
         finally:
             await scratch.release()
@@ -646,13 +678,15 @@ class ProfileExecutor:
         scratch = await self._reserve_scratch(key_id, min(body.size * 2, DEFAULT_BODY_BYTES * 2))
         try:
             async with self._worker_slots:
-                raw = await body.read()
-                rewritten = await self._run(
-                    _rewrite_worker,
-                    raw,
-                    content_type,
-                    prepared.model_dump(mode="python"),
-                    known_litellm_params,
+                raw = await _await_completion(body.read())
+                rewritten = await _await_completion(
+                    self._run(
+                        _rewrite_worker,
+                        raw,
+                        content_type,
+                        prepared.model_dump(mode="python"),
+                        known_litellm_params,
+                    )
                 )
                 assert isinstance(rewritten, bytes)
                 return rewritten
