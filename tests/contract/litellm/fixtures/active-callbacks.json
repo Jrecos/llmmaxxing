@@ -1,0 +1,27 @@
+{
+  "_provenance": {
+    "source_commit": "d8f71d7bdbd7c9873d98293f83d64c6db72847e6",
+    "source_path": "litellm/proxy/health_endpoints/_health_endpoints.py",
+    "pinned_container_verified": false
+  },
+  "response": {
+    "alerting": "None",
+    "litellm.callbacks": [
+      "jsonl",
+      "llmmaxxing_guard@sha256:__GUARD_DIGEST__"
+    ],
+    "litellm.input_callback": [],
+    "litellm.failure_callback": [],
+    "litellm.success_callback": [],
+    "litellm._async_success_callback": [],
+    "litellm._async_failure_callback": [],
+    "litellm._async_input_callback": [],
+    "all_litellm_callbacks": [
+      "jsonl",
+      "llmmaxxing_guard@sha256:__GUARD_DIGEST__"
+    ],
+    "num_callbacks": 2,
+    "num_alerting": 0,
+    "litellm.request_timeout": 600
+  }
+}

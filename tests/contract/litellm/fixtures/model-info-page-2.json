@@ -1,0 +1,71 @@
+{
+  "_provenance": {
+    "source_commit": "d8f71d7bdbd7c9873d98293f83d64c6db72847e6",
+    "source_path": "litellm/proxy/proxy_server.py:model_info_v2",
+    "pinned_container_verified": false
+  },
+  "response": {
+    "data": [
+      {
+        "model_name": "lmx/electron-v1",
+        "litellm_params": {
+          "model": "electron/electron-v1",
+          "custom_llm_provider": "electron",
+          "num_retries": 0
+        },
+        "model_info": {
+          "id": "runtime-electron-001",
+          "mode": "chat",
+          "llmmaxxing": {
+            "hidden_alias": true,
+            "execution": {
+              "custom_llm_provider": "electron",
+              "model": "electron/electron-v1",
+              "api_base": "https://electron.invalid/v1",
+              "api_version": "2026-08-01",
+              "region_name": "test-region-1",
+              "project": "redacted-project"
+            },
+            "capabilities": {
+              "modalities": ["text"],
+              "tools": true,
+              "response_schema": true
+            },
+            "context": {
+              "max_input_tokens": 131072,
+              "max_output_tokens": 8192
+            },
+            "defaults": {
+              "temperature": 0
+            },
+            "pricing": {
+              "input_per_token": "0.000003",
+              "output_per_token": "0.000006"
+            },
+            "account": {
+              "id": "acc_22222222-2222-4222-8222-222222222222",
+              "binding": "electron-pro"
+            },
+            "credential": {
+              "field": "api_key",
+              "fingerprint": "hcf1_2222222222222222222222222222222222222222222222222222222222222222",
+              "epoch": 7,
+              "dynamic_list": false
+            },
+            "routing": {
+              "num_retries": 0,
+              "fallbacks": [],
+              "context_window_fallbacks": [],
+              "content_policy_fallbacks": [],
+              "cooldown_selection": false
+            }
+          }
+        }
+      }
+    ],
+    "total_count": 2,
+    "current_page": 2,
+    "total_pages": 2,
+    "size": 1
+  }
+}

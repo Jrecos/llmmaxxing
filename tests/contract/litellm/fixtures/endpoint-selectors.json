@@ -1,0 +1,45 @@
+{
+  "_provenance": {
+    "kind": "pinned-container-harness-input",
+    "pinned_container_verified": false
+  },
+  "fixtures": {
+    "chat": {
+      "content_type": "application/json",
+      "body": {"model": "__HIDDEN_ALIAS__", "messages": [{"role": "user", "content": "fixture"}], "max_tokens": 1}
+    },
+    "text": {
+      "content_type": "application/json",
+      "body": {"model": "__HIDDEN_ALIAS__", "prompt": "fixture", "max_tokens": 1}
+    },
+    "responses": {
+      "content_type": "application/json",
+      "body": {"model": "__HIDDEN_ALIAS__", "input": "fixture", "max_output_tokens": 1}
+    },
+    "messages": {
+      "content_type": "application/json",
+      "body": {"model": "__HIDDEN_ALIAS__", "messages": [{"role": "user", "content": "fixture"}], "max_tokens": 1}
+    },
+    "embeddings": {
+      "content_type": "application/json",
+      "body": {"model": "__HIDDEN_ALIAS__", "input": "fixture"}
+    },
+    "rerank": {
+      "content_type": "application/json",
+      "body": {"model": "__HIDDEN_ALIAS__", "query": "fixture", "documents": ["fixture document"]}
+    },
+    "audio_speech": {
+      "content_type": "application/json",
+      "body": {"model": "__HIDDEN_ALIAS__", "input": "fixture", "voice": "alloy", "response_format": "wav"}
+    },
+    "audio_transcription": {
+      "content_type": "multipart/form-data",
+      "fields": {"model": "__HIDDEN_ALIAS__"},
+      "file": {"name": "fixture.wav", "content_type": "audio/wav", "base64": "UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA="}
+    },
+    "image": {
+      "content_type": "application/json",
+      "body": {"model": "__HIDDEN_ALIAS__", "prompt": "fixture", "n": 1}
+    }
+  }
+}

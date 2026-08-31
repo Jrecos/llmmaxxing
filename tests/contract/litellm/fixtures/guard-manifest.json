@@ -1,0 +1,22 @@
+{
+  "contract_id": "litellm-1.98.0",
+  "backend_manifest": "bm1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "guard_digest": "sha256:__GUARD_DIGEST__",
+  "deployments": {
+    "lmx/electron-v1": {
+      "runtime_id": "runtime-electron-001",
+      "generation_id": "dg1_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "account_id": "acc_22222222-2222-4222-8222-222222222222",
+      "account_binding": "electron-pro",
+      "credential_field": "api_key",
+      "credential_fingerprint": "__CREDENTIAL_FINGERPRINT__",
+      "credential_epoch": 7,
+      "execution": {
+        "custom_llm_provider": "electron",
+        "model": "electron/electron-v1",
+        "api_base": "https://electron.invalid/v1",
+        "api_version": "2026-08-01"
+      }
+    }
+  }
+}

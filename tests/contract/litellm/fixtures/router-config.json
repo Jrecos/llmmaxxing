@@ -1,0 +1,17 @@
+{
+  "_provenance": {
+    "kind": "required-container-input",
+    "pinned_container_verified": false
+  },
+  "router_settings": {
+    "disable_cooldowns": true,
+    "num_retries": 0,
+    "fallbacks": [],
+    "context_window_fallbacks": [],
+    "content_policy_fallbacks": []
+  },
+  "hidden_alias_deployment_counts": {
+    "lmx/local-fixture": 1,
+    "lmx/electron-v1": 1
+  }
+}

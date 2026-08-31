@@ -1,0 +1,18 @@
+{
+  "_provenance": {
+    "source_commit": "d8f71d7bdbd7c9873d98293f83d64c6db72847e6",
+    "source_path": "litellm/proxy/health_endpoints/_health_endpoints.py",
+    "pinned_container_verified": false
+  },
+  "response": {
+    "status": "healthy",
+    "db": "connected",
+    "cache": null,
+    "litellm_version": "1.98.0",
+    "success_callbacks": ["jsonl"],
+    "use_aiohttp_transport": false,
+    "log_level": "INFO",
+    "is_detailed_debug": false,
+    "show_no_redis_warning": false
+  }
+}

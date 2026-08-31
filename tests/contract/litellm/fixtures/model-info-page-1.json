@@ -1,0 +1,66 @@
+{
+  "_provenance": {
+    "source_commit": "d8f71d7bdbd7c9873d98293f83d64c6db72847e6",
+    "source_path": "litellm/proxy/proxy_server.py:model_info_v2",
+    "pinned_container_verified": false
+  },
+  "response": {
+    "data": [
+      {
+        "model_name": "lmx/local-fixture",
+        "litellm_params": {
+          "model": "openai/local-fixture",
+          "custom_llm_provider": "openai",
+          "num_retries": 0
+        },
+        "model_info": {
+          "id": "runtime-local-001",
+          "mode": "chat",
+          "llmmaxxing": {
+            "hidden_alias": true,
+            "execution": {
+              "custom_llm_provider": "openai",
+              "model": "openai/local-fixture",
+              "api_base": "https://provider.invalid/v1"
+            },
+            "capabilities": {
+              "modalities": ["text"],
+              "tools": true,
+              "response_schema": true
+            },
+            "context": {
+              "max_input_tokens": 32768,
+              "max_output_tokens": 4096
+            },
+            "defaults": {},
+            "pricing": {
+              "input_per_token": "0.000001",
+              "output_per_token": "0.000002"
+            },
+            "account": {
+              "id": "acc_11111111-1111-4111-8111-111111111111",
+              "binding": "fixture-primary"
+            },
+            "credential": {
+              "field": "api_key",
+              "fingerprint": "hcf1_1111111111111111111111111111111111111111111111111111111111111111",
+              "epoch": 1,
+              "dynamic_list": false
+            },
+            "routing": {
+              "num_retries": 0,
+              "fallbacks": [],
+              "context_window_fallbacks": [],
+              "content_policy_fallbacks": [],
+              "cooldown_selection": false
+            }
+          }
+        }
+      }
+    ],
+    "total_count": 2,
+    "current_page": 1,
+    "total_pages": 2,
+    "size": 1
+  }
+}

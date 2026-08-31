@@ -1,0 +1,24 @@
+{
+  "_provenance": {
+    "source_commit": "d8f71d7bdbd7c9873d98293f83d64c6db72847e6",
+    "source_path": "litellm/proxy/proxy_server.py:model_list",
+    "pinned_container_verified": false
+  },
+  "response": {
+    "object": "list",
+    "data": [
+      {
+        "id": "lmx/local-fixture",
+        "object": "model",
+        "created": 0,
+        "owned_by": "openai"
+      },
+      {
+        "id": "lmx/electron-v1",
+        "object": "model",
+        "created": 0,
+        "owned_by": "electron"
+      }
+    ]
+  }
+}

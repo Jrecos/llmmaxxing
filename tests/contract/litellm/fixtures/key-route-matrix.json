@@ -1,0 +1,38 @@
+{
+  "_provenance": {
+    "kind": "required-container-observation",
+    "pinned_container_verified": false
+  },
+  "observations": [
+    {
+      "key": "inference",
+      "method": "POST",
+      "path": "/v1/chat/completions",
+      "status": 200
+    },
+    {
+      "key": "inference",
+      "method": "GET",
+      "path": "/v2/model/info",
+      "status": 403
+    },
+    {
+      "key": "discovery",
+      "method": "GET",
+      "path": "/v2/model/info",
+      "status": 200
+    },
+    {
+      "key": "discovery",
+      "method": "POST",
+      "path": "/v1/chat/completions",
+      "status": 403
+    },
+    {
+      "key": "discovery",
+      "method": "POST",
+      "path": "/model/update",
+      "status": 403
+    }
+  ]
+}
