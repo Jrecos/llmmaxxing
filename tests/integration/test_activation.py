@@ -1408,3 +1408,272 @@ def test_commit_failpoints_survive_actual_child_process_death(
     if expected_generation == 2:
         ack = asyncio.run(restarted.service.execute(commit))
         assert ack.status.value == "applied"
+
+
+@async_test
+async def test_v1_deny_rows_backfill_highwater_before_clear(tmp_path: Path) -> None:
+    harness = make_harness(tmp_path)
+    bundle, _ = make_bundle()
+    await activate(harness, bundle, None)
+    policy = signed_policy(harness.policy_key, bundle, bundle)
+    await harness.execute(
+        harness.command(
+            WireCommandKind.DENY,
+            DenyCommandPayload(
+                subject_type=DenySubjectType.ACCOUNT,
+                subject_id=str(ACCOUNT_ID),
+                deny_epoch=5,
+                reason=DenyReason.COMPROMISE,
+                deny_floor_generation=5,
+            ),
+            policy=policy,
+        )
+    )
+    sequence = harness.sequence
+    previous_digest = harness.previous_digest
+    harness.state.close()
+    connection = sqlite3.connect(tmp_path / "gateway-state.sqlite3")
+    connection.execute("DROP TABLE deny_highwater")
+    connection.commit()
+    connection.close()
+
+    restarted = make_harness(
+        tmp_path,
+        installation_id=harness.installation_id,
+        boot_id=GatewayBootId.new(),
+    )
+    restarted.channel_key = harness.channel_key
+    restarted.service.policy_keys = {7: {"policy-primary": harness.policy_key.public_key()}}
+    restarted.service.channel_trust = ChannelTrustSet(
+        installation_id=harness.installation_id,
+        security_epoch=3,
+        channel_epochs={
+            1: {
+                5: {"control-channel": harness.channel_key.public_key()},
+                6: {"gateway-channel": harness.channel_key.public_key()},
+            }
+        },
+    )
+    restarted.service.ack_signer = ChannelSigner("gateway-channel", 6, harness.channel_key)
+    restarted.sequence = sequence
+    restarted.previous_digest = previous_digest
+    await restarted.execute(
+        restarted.command(
+            WireCommandKind.CLEAR_DENY,
+            ClearDenyCommandPayload(
+                subject_type=DenySubjectType.ACCOUNT,
+                subject_id=str(ACCOUNT_ID),
+                deny_epoch=5,
+            ),
+            policy=policy,
+        )
+    )
+    stale = restarted.command(
+        WireCommandKind.DENY,
+        DenyCommandPayload(
+            subject_type=DenySubjectType.ACCOUNT,
+            subject_id=str(ACCOUNT_ID),
+            deny_epoch=4,
+            reason=DenyReason.EMERGENCY,
+            deny_floor_generation=5,
+        ),
+        policy=policy,
+    )
+    with pytest.raises(ValueError, match="epoch"):
+        await restarted.service.execute(stale)
+
+
+def _hard_crash_command(
+    path: Path,
+    source: Harness,
+    command: GatewayCommandV1,
+    *,
+    sequence: int,
+    previous_digest: str,
+    failpoint: str,
+) -> None:
+    child = os.fork()
+    if child == 0:
+        child_harness = make_harness(
+            path,
+            installation_id=source.installation_id,
+            boot_id=source.boot_id,
+        )
+        child_harness.service.policy_keys = {7: {"policy-primary": source.policy_key.public_key()}}
+        child_harness.service.channel_trust = ChannelTrustSet(
+            installation_id=source.installation_id,
+            security_epoch=3,
+            channel_epochs={
+                1: {
+                    5: {"control-channel": source.channel_key.public_key()},
+                    6: {"gateway-channel": source.channel_key.public_key()},
+                }
+            },
+        )
+        child_harness.service.ack_signer = ChannelSigner("gateway-channel", 6, source.channel_key)
+        child_harness.sequence = sequence
+        child_harness.previous_digest = previous_digest
+        child_harness.state._crash = lambda point: os._exit(91) if point == failpoint else None
+        asyncio.run(child_harness.service.execute(command))
+        os._exit(92)
+    _pid, status = os.waitpid(child, 0)
+    assert os.waitstatus_to_exitcode(status) == 91
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX hard process death")
+@pytest.mark.parametrize(
+    ("failpoint", "staged"),
+    [
+        ("bundle_after_write", False),
+        ("bundle_after_fsync", False),
+        ("bundle_after_rename", False),
+        ("bundle_after_dir_fsync", False),
+        ("staged_before_commit", False),
+        ("staged_after_commit", True),
+    ],
+)
+def test_prepare_failpoints_use_actual_child_death(
+    tmp_path: Path,
+    failpoint: str,
+    staged: bool,
+) -> None:
+    harness = make_harness(tmp_path)
+    bundle, _ = make_bundle()
+    command = harness.command(
+        WireCommandKind.PREPARE,
+        prepare_payload(bundle, None),
+        policy=signed_policy(harness.policy_key, bundle, None),
+    )
+    harness.state.close()
+    _hard_crash_command(
+        tmp_path,
+        harness,
+        command,
+        sequence=0,
+        previous_digest=ZERO_DIGEST,
+        failpoint=failpoint,
+    )
+    reopened = GatewayLocalState(
+        tmp_path,
+        installation_id=harness.installation_id,
+        boot_id=GatewayBootId.new(),
+        channel_epoch=1,
+        security_epoch=3,
+        accepted_peppers={PEPPER_VERSION: PEPPER},
+        clock=harness.clock,
+    ).open()
+    assert reopened.active_reference is None
+    assert (reopened.staged_reference is not None) is staged
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX hard process death")
+@pytest.mark.parametrize(
+    ("failpoint", "applied"),
+    [
+        ("active_pointer_after_write", False),
+        ("active_pointer_after_fsync", False),
+        ("active_pointer_after_rename", False),
+        ("active_pointer_after_dir_fsync", False),
+        ("active_after_commit", True),
+        ("memory_after_swap", True),
+        ("ack_after_commit", True),
+    ],
+)
+def test_genesis_failpoints_use_actual_child_death(
+    tmp_path: Path,
+    failpoint: str,
+    applied: bool,
+) -> None:
+    harness = make_harness(tmp_path)
+    bundle, _ = make_bundle()
+    policy = signed_policy(harness.policy_key, bundle, None)
+    asyncio.run(
+        harness.execute(
+            harness.command(
+                WireCommandKind.PREPARE,
+                prepare_payload(bundle, None),
+                policy=policy,
+            )
+        )
+    )
+    commit = harness.command(
+        WireCommandKind.COMMIT,
+        BundleReference(
+            generation=1,
+            bundle_hash=bundle_hash(canonical_bundle_bytes(bundle)),
+        ),
+        policy=policy,
+    )
+    sequence = harness.sequence
+    previous_digest = harness.previous_digest
+    harness.state.close()
+    _hard_crash_command(
+        tmp_path,
+        harness,
+        commit,
+        sequence=sequence,
+        previous_digest=previous_digest,
+        failpoint=failpoint,
+    )
+    reopened = GatewayLocalState(
+        tmp_path,
+        installation_id=harness.installation_id,
+        boot_id=GatewayBootId.new(),
+        channel_epoch=1,
+        security_epoch=3,
+        accepted_peppers={PEPPER_VERSION: PEPPER},
+        clock=harness.clock,
+    ).open()
+    assert (reopened.active_reference is not None) is applied
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX hard process death")
+@pytest.mark.parametrize(
+    ("failpoint", "denied"),
+    [("deny_before_commit", False), ("deny_after_commit", True)],
+)
+def test_deny_failpoints_use_actual_child_death(
+    tmp_path: Path,
+    failpoint: str,
+    denied: bool,
+) -> None:
+    harness = make_harness(tmp_path)
+    bundle, _ = make_bundle()
+    asyncio.run(activate(harness, bundle, None))
+    command = harness.command(
+        WireCommandKind.DENY,
+        DenyCommandPayload(
+            subject_type=DenySubjectType.ACCOUNT,
+            subject_id=str(ACCOUNT_ID),
+            deny_epoch=1,
+            reason=DenyReason.EMERGENCY,
+        ),
+        policy=signed_policy(harness.policy_key, bundle, bundle),
+    )
+    sequence = harness.sequence
+    previous_digest = harness.previous_digest
+    harness.state.close()
+    _hard_crash_command(
+        tmp_path,
+        harness,
+        command,
+        sequence=sequence,
+        previous_digest=previous_digest,
+        failpoint=failpoint,
+    )
+    reopened = GatewayLocalState(
+        tmp_path,
+        installation_id=harness.installation_id,
+        boot_id=GatewayBootId.new(),
+        channel_epoch=1,
+        security_epoch=3,
+        accepted_peppers={PEPPER_VERSION: PEPPER},
+        clock=harness.clock,
+    ).open()
+    status = reopened.status(
+        singleton_held=True,
+        backend_ready=True,
+        capacities_ready=True,
+        now_ms=harness.clock.now_ms(),
+    )
+    assert bool(status.deny_overlay) is denied

@@ -244,6 +244,24 @@ async def test_emergency_server_accepts_privileged_socket_activation(
     await server.start()
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     await server.stop()
+    assert path.exists()
+    path.unlink()
+
+    invalid_path = tmp_path / "activated-invalid.sock"
+    invalid = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    invalid.bind(str(invalid_path))
+    invalid.listen(16)
+    os.chmod(invalid_path, 0o660)
+    with pytest.raises(PermissionError, match="0600"):
+        await EmergencyServer(
+            invalid_path,
+            harness.service,
+            required_uid=os.geteuid(),
+            socket_owner_uid=os.geteuid(),
+            listen_socket=invalid,
+        ).start()
+    assert invalid_path.exists()
+    invalid_path.unlink()
 
 
 @async_test

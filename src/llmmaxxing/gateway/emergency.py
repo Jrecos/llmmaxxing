@@ -253,7 +253,7 @@ class EmergencyServer:
             self._server.close()
             await self._server.wait_closed()
             self._server = None
-        if self._inode is not None:
+        if self.listen_socket is None and self._inode is not None:
             try:
                 metadata = os.lstat(self.path)
             except FileNotFoundError:

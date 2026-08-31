@@ -563,6 +563,8 @@ class GatewayLocalState:
                     self._staged = None
                     self._base = None
             self._load_denies()
+            with self.transaction():
+                self._backfill_deny_highwater()
             self._load_deny_highwater()
             self._quarantine_corrupt_commands()
             self._reconcile_pointer()
@@ -607,6 +609,19 @@ class GatewayLocalState:
             )
             loaded[(overlay.subject_type, overlay.subject_id)] = overlay
         self._denies = loaded
+
+    def _backfill_deny_highwater(self) -> None:
+        for overlay in self._denies.values():
+            record = {
+                "subject_type": overlay.subject_type.value,
+                "subject_id": overlay.subject_id,
+                "deny_epoch": overlay.deny_epoch,
+                "floor_generation": overlay.deny_floor_generation,
+            }
+            self.db.execute(
+                "INSERT OR IGNORE INTO deny_highwater VALUES(?,?,?,?,?)",
+                (*record.values(), _checksum("deny_highwater", record)),
+            )
 
     def _load_deny_highwater(self) -> None:
         loaded: dict[tuple[DenySubjectType, str], tuple[int, int | None]] = {}
