@@ -6,6 +6,7 @@ import asyncio
 from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 from pydantic import ValidationError
@@ -59,11 +60,14 @@ def account(
     *,
     account_id: AccountId | None = None,
     parallel: int = 2,
+    local_parallel_ceiling: int = 128,
     rpm: int = 60,
     rpm_window_seconds: int = 60,
     tpm: int = 10_000,
     tpm_window_seconds: int = 60,
     monthly: int = 100_000,
+    quota_units_per_attempt: int = 1,
+    monthly_reset_at_ms: int = 2_000_000_000_000,
     state: AccountState = AccountState.ACTIVE,
     connection: str = "litellm:nan",
     provider_token: str = "nan-builders",
@@ -79,13 +83,14 @@ def account(
         credential_fingerprint="hcf1_" + "a" * 64,
         credential_epoch=credential_epoch,
         parallel_limit=limit(value=parallel),
+        local_parallel_ceiling=local_parallel_ceiling,
         rpm_limit=limit(value=rpm),
         rpm_window_seconds=rpm_window_seconds,
         tpm_limit=limit(value=tpm),
         tpm_window_seconds=tpm_window_seconds,
         monthly_quota_units=limit(value=monthly),
-        monthly_reset_day_utc=1,
-        monthly_reset_hour_utc=0,
+        quota_units_per_attempt=quota_units_per_attempt,
+        monthly_reset_at_ms=monthly_reset_at_ms,
         state=state,
     )
 
@@ -173,7 +178,7 @@ def test_provider_account_declares_every_dimension_and_credential_attestation() 
     assert measured.parallel_limit.value == 2
     assert measured.rpm_window_seconds == 17
     assert measured.tpm_window_seconds == 43
-    assert measured.monthly_reset_day_utc == 1
+    assert measured.monthly_reset_at_ms == 2_000_000_000_000
     assert measured.credential_fingerprint.startswith("hcf1_")
     assert measured.enforced_max_in_flight == 2
 
@@ -198,7 +203,7 @@ def test_provider_account_declares_every_dimension_and_credential_attestation() 
         )
     with pytest.raises(ValidationError, match="monthly reset"):
         ProviderAccount.model_validate(
-            measured.model_copy(update={"monthly_reset_day_utc": None}).model_dump(mode="python")
+            measured.model_copy(update={"monthly_reset_at_ms": None}).model_dump(mode="python")
         )
     with pytest.raises(ValidationError, match="credential attestation"):
         ProviderAccount.model_validate(
@@ -296,7 +301,8 @@ def test_rpm_and_tpm_have_independent_rolling_windows(tmp_path: Path, clock: Fak
 
 
 def test_monthly_reset_is_explicit_and_deterministic(tmp_path: Path, clock: FakeClock) -> None:
-    provider_account = account(parallel=3, monthly=50)
+    reset_at = int(datetime(2026, 9, 1, tzinfo=UTC).timestamp() * 1000)
+    provider_account = account(parallel=3, monthly=50, monthly_reset_at_ms=reset_at)
     journal, view = open_view(tmp_path, provider_account, clock)
     try:
         granted = view.try_reserve(request(provider_account, clock, tokens=1, quota_units=30))
@@ -306,10 +312,10 @@ def test_monthly_reset_is_explicit_and_deterministic(tmp_path: Path, clock: Fake
             request(provider_account, clock, tokens=1, quota_units=30)
         ) == ReservationDenied(
             ReservationDenialReason.MONTHLY_QUOTA_EXHAUSTED,
-            retry_at_ms=int(datetime(2026, 9, 1, tzinfo=UTC).timestamp() * 1000),
+            retry_at_ms=reset_at,
         )
 
-        clock.value = int(datetime(2026, 9, 1, tzinfo=UTC).timestamp() * 1000)
+        clock.value = reset_at
         assert isinstance(
             view.try_reserve(request(provider_account, clock, tokens=1, quota_units=30)),
             ReservationGranted,
@@ -469,5 +475,232 @@ def test_circuit_cas_is_operational_state_not_publication_authority(
         assert runtime.circuit_value(generation) == opened
         assert not hasattr(view, "authorize")
         assert runtime.account_circuit_value() == opened
+    finally:
+        journal.close()
+
+def test_local_parallel_ceiling_is_independent_of_provider_limit(
+    tmp_path: Path, clock: FakeClock
+) -> None:
+    provider_account = account(parallel=5, local_parallel_ceiling=2)
+    journal, state = open_view(tmp_path, provider_account, clock)
+    try:
+        assert isinstance(state.try_reserve(request(provider_account, clock)), ReservationGranted)
+        assert isinstance(state.try_reserve(request(provider_account, clock)), ReservationGranted)
+        assert state.try_reserve(request(provider_account, clock)) == ReservationDenied(
+            ReservationDenialReason.PARALLEL_EXHAUSTED
+        )
+    finally:
+        journal.close()
+
+
+def test_oversized_tpm_and_undercharged_quota_are_typed_denials(
+    tmp_path: Path, clock: FakeClock
+) -> None:
+    provider_account = account(tpm=10, quota_units_per_attempt=3)
+    journal, state = open_view(tmp_path, provider_account, clock)
+    try:
+        oversized = state.try_reserve(request(provider_account, clock, tokens=11, quota_units=3))
+        assert oversized == ReservationDenied(ReservationDenialReason.TPM_EXHAUSTED)
+        undercharged = state.try_reserve(
+            request(provider_account, clock, tokens=1, quota_units=2)
+        )
+        assert undercharged == ReservationDenied(
+            ReservationDenialReason.INVALID_QUOTA_CHARGE
+        )
+    finally:
+        journal.close()
+
+
+def test_publication_is_atomic_and_omissions_become_non_serving(
+    tmp_path: Path, clock: FakeClock
+) -> None:
+    first = account(parallel=2)
+    second = account(
+        connection="litellm:arli",
+        provider_token="arli",
+        binding_ref="arli-primary",
+    )
+    journal = AttemptJournal.create(tmp_path / "journal", clock=clock, group_commit_delay_ms=0)
+    state = RuntimeState((first, second), journal=journal, clock=clock)
+    try:
+        enlarged = first.model_copy(
+            update={"parallel_limit": limit(value=5), "local_parallel_ceiling": 5}
+        )
+        conflicting = second.model_copy(
+            update={
+                "connection": first.connection,
+                "provider_token": first.provider_token,
+                "binding_ref": first.binding_ref,
+            }
+        )
+        with pytest.raises(AccountBindingConflict):
+            state.apply_publication((enlarged, conflicting))
+        assert state.account_capacity(first.account_id).parallel_limit == 2
+
+        state.apply_publication((first,))
+        assert state.try_reserve(request(second, clock)) == ReservationDenied(
+            ReservationDenialReason.ACCOUNT_NOT_ACTIVE
+        )
+    finally:
+        journal.close()
+
+
+def test_window_increase_retains_previously_expired_start(
+    tmp_path: Path, clock: FakeClock
+) -> None:
+    provider_account = account(tpm=10, tpm_window_seconds=10)
+    journal, state = open_view(tmp_path, provider_account, clock)
+    try:
+        granted = state.try_reserve(request(provider_account, clock, tokens=8))
+        assert isinstance(granted, ReservationGranted)
+        finish_actual(granted.lease, tokens=8, quota_units=8)
+        clock.advance(20_000)
+        assert isinstance(
+            state.try_reserve(request(provider_account, clock, tokens=3)),
+            ReservationGranted,
+        )
+
+        enlarged = provider_account.model_copy(update={"tpm_window_seconds": 60})
+        state.apply_publication((enlarged,))
+        assert state.try_reserve(request(enlarged, clock, tokens=3)) == ReservationDenied(
+            ReservationDenialReason.TPM_EXHAUSTED,
+            retry_at_ms=clock.now_ms() + 40_000,
+        )
+    finally:
+        journal.close()
+
+
+def test_binding_digest_is_unambiguous_for_embedded_nuls(
+    tmp_path: Path, clock: FakeClock
+) -> None:
+    first = account(connection="a\0b", provider_token="c", binding_ref="d")
+    second = account(connection="a", provider_token="b\0c", binding_ref="d")
+    journal = AttemptJournal.create(tmp_path / "journal", clock=clock, group_commit_delay_ms=0)
+    try:
+        RuntimeState((first, second), journal=journal, clock=clock)
+    finally:
+        journal.close()
+
+
+def test_authoritative_active_count_keeps_oldest_attempt(
+    tmp_path: Path, clock: FakeClock
+) -> None:
+    provider_account = account(parallel=2)
+    journal, state = open_view(tmp_path, provider_account, clock)
+    older_id = AttemptId("att_ffffffff-ffff-4fff-8fff-ffffffffffff")
+    newer_id = AttemptId("att_00000000-0000-4000-8000-000000000000")
+    try:
+        older = state.try_reserve(
+            request(provider_account, clock, attempt_id=older_id)
+        )
+        assert isinstance(older, ReservationGranted)
+        older.lease.finish(
+            AttemptResolution(
+                outcome=TerminalOutcome.UPSTREAM_FAILED,
+                release_capacity=False,
+                actual_starts=None,
+                actual_token_units=None,
+                actual_quota_units=None,
+            )
+        )
+        clock.advance(1)
+        newer = state.try_reserve(
+            request(provider_account, clock, attempt_id=newer_id)
+        )
+        assert isinstance(newer, ReservationGranted)
+        newer.lease.finish(
+            AttemptResolution(
+                outcome=TerminalOutcome.UPSTREAM_FAILED,
+                release_capacity=False,
+                actual_starts=None,
+                actual_token_units=None,
+                actual_quota_units=None,
+            )
+        )
+        state.account_runtime(provider_account.account_id).apply_authoritative_active_count(1)
+        assert state.operational_view().attempts[0].attempt_id == older_id
+    finally:
+        journal.close()
+
+
+def test_monthly_refund_never_changes_a_new_reset_epoch(
+    tmp_path: Path, clock: FakeClock
+) -> None:
+    reset_at = clock.now_ms() + 1_000
+    provider_account = account(monthly=100, monthly_reset_at_ms=reset_at)
+    journal, state = open_view(tmp_path, provider_account, clock)
+    try:
+        old = state.try_reserve(request(provider_account, clock, tokens=1, quota_units=50))
+        assert isinstance(old, ReservationGranted)
+        clock.advance(1_000)
+        new = state.try_reserve(request(provider_account, clock, tokens=1, quota_units=40))
+        assert isinstance(new, ReservationGranted)
+        old.lease.finish(
+            AttemptResolution(
+                outcome=TerminalOutcome.COMPLETED,
+                release_capacity=True,
+                actual_starts=1,
+                actual_token_units=1,
+                actual_quota_units=20,
+            )
+        )
+        assert state.account_capacity(provider_account.account_id).monthly_quota_units == 40
+    finally:
+        journal.close()
+
+
+def test_half_open_probe_token_is_consumed_once(
+    tmp_path: Path, clock: FakeClock
+) -> None:
+    provider_account = account(parallel=3)
+    journal, state = open_view(tmp_path, provider_account, clock)
+    runtime = state.account_runtime(provider_account.account_id)
+    probe_id = f"probe_{uuid4()}"
+    half_open = CircuitValue(
+        state=CircuitState.HALF_OPEN,
+        cause=CircuitCause.CAPACITY,
+        epoch=1,
+        opened_at_ms=clock.now_ms(),
+        retry_at_ms=0,
+        backoff_step=1,
+        evidence_digest="sha256:" + "a" * 64,
+        probe_id=probe_id,
+    )
+    try:
+        assert runtime.compare_and_swap_account_circuit(CircuitValue.closed(), half_open)
+        first = state.try_reserve(
+            request(provider_account, clock).model_copy(
+                update={"account_circuit": half_open}
+            )
+        )
+        assert isinstance(first, ReservationGranted)
+        second = state.try_reserve(
+            request(provider_account, clock).model_copy(
+                update={"account_circuit": half_open}
+            )
+        )
+        assert second == ReservationDenied(ReservationDenialReason.CIRCUIT_UNAVAILABLE)
+    finally:
+        journal.close()
+
+
+def test_terminal_ledger_stops_before_snapshot_bound(
+    tmp_path: Path, clock: FakeClock
+) -> None:
+    provider_account = account(parallel=2)
+    journal = AttemptJournal.create(tmp_path / "journal", clock=clock, group_commit_delay_ms=0)
+    state = RuntimeState(
+        (provider_account,),
+        journal=journal,
+        clock=clock,
+        resolution_ledger_limit=1,
+    )
+    try:
+        granted = state.try_reserve(request(provider_account, clock))
+        assert isinstance(granted, ReservationGranted)
+        finish_actual(granted.lease, tokens=10, quota_units=10)
+        assert state.try_reserve(request(provider_account, clock)) == ReservationDenied(
+            ReservationDenialReason.JOURNAL_CAPACITY_STOP
+        )
     finally:
         journal.close()

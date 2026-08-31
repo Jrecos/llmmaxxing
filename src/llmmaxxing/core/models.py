@@ -74,13 +74,14 @@ class ProviderAccount(_Frozen):
     credential_fingerprint: _CREDENTIAL_FINGERPRINT | None = None
     credential_epoch: int | None = Field(default=None, ge=1)
     parallel_limit: QuotaDimension
+    local_parallel_ceiling: int = Field(ge=1, le=128)
     rpm_limit: QuotaDimension
     rpm_window_seconds: int = Field(gt=0, le=3600)
     tpm_limit: QuotaDimension
     tpm_window_seconds: int = Field(gt=0, le=86_400)
     monthly_quota_units: QuotaDimension
-    monthly_reset_day_utc: int | None = Field(default=None, ge=1, le=31)
-    monthly_reset_hour_utc: int | None = Field(default=None, ge=0, le=23)
+    quota_units_per_attempt: int = Field(ge=0)
+    monthly_reset_at_ms: int | None = Field(default=None, ge=1)
     state: AccountState | None = None
 
     @property
@@ -100,20 +101,21 @@ class ProviderAccount(_Frozen):
         if not self.fully_attested:
             return 1
         assert self.parallel_limit.value is not None
-        return self.parallel_limit.value
+        return min(self.parallel_limit.value, self.local_parallel_ceiling)
 
     @model_validator(mode="after")
     def _derive_and_guard_state(self) -> Self:
         if self.parallel_limit.status is QuotaDimensionStatus.ATTESTED_ABSENT:
             raise ValueError("parallel capacity must be known or unknown, never unbounded")
 
-        reset = (self.monthly_reset_day_utc, self.monthly_reset_hour_utc)
-        if self.monthly_quota_units.status is QuotaDimensionStatus.KNOWN and not all(
-            value is not None for value in reset
+        if (
+            self.monthly_quota_units.status is QuotaDimensionStatus.KNOWN
+            and self.monthly_reset_at_ms is None
         ):
-            raise ValueError("a known monthly quota requires explicit UTC monthly reset semantics")
-        if self.monthly_quota_units.status is not QuotaDimensionStatus.KNOWN and any(
-            value is not None for value in reset
+            raise ValueError("a known monthly quota requires an absolute UTC monthly reset")
+        if (
+            self.monthly_quota_units.status is not QuotaDimensionStatus.KNOWN
+            and self.monthly_reset_at_ms is not None
         ):
             raise ValueError("monthly reset semantics apply only to a known monthly quota")
 

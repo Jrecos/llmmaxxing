@@ -92,6 +92,7 @@ _RECORD_FIELDS: dict[str, frozenset[str]] = {
             "monthly_reset_at_ms",
             "circuit_epoch",
             "circuit_probe_id",
+            "account_circuit_probe_id",
         }
     ),
     "attempt_uncertain": frozenset({"attempt_id", "reason"}),
@@ -220,6 +221,7 @@ class DurableReservation:
     monthly_reset_at_ms: int
     circuit_epoch: int
     circuit_probe_id: str | None
+    account_circuit_probe_id: str | None
 
 
 @dataclass(slots=True)
@@ -408,6 +410,7 @@ class AttemptJournal:
         self._sync_samples_ms: list[float] = []
         self._queue: queue.Queue[_Command] = queue.Queue(maxsize=self.writer_limits.queue_capacity)
         self._thread: threading.Thread | None = None
+        self._lifecycle_lock = threading.Lock()
         self._closed = False
         self._segment_fd: int | None = None
         self._segment_size = 0
@@ -453,6 +456,9 @@ class AttemptJournal:
         self._last_digest = self.recovery.last_digest
         self._checkpoint_sequence = self.recovery.checkpoint_sequence
         self._verified_checkpoints = self.recovery.verified_checkpoints
+        self._records_since_checkpoint = (
+            self.recovery.last_sequence - self.recovery.checkpoint_sequence
+        )
         if self._base_status is JournalStatus.HEALTHY:
             self._thread = threading.Thread(
                 target=self._writer_loop,
@@ -462,9 +468,18 @@ class AttemptJournal:
             self._thread.start()
 
     def enter_recovery_required(self, reason: str) -> None:
-        """Fail closed after a semantically invalid recovered runtime image."""
-        self._base_status = JournalStatus.RECOVERY_REQUIRED
-        self._reason = reason
+        """Fail closed and stop a still-healthy writer after invalid recovery state."""
+        command: _StopCommand | None = None
+        thread = self._thread
+        with self._lifecycle_lock:
+            if self._base_status is JournalStatus.HEALTHY and thread is not None:
+                command = _StopCommand()
+                self._queue.put(command)
+            self._base_status = JournalStatus.RECOVERY_REQUIRED
+            self._reason = reason
+        if command is not None and thread is not None:
+            command.done.wait()
+            thread.join()
 
     @classmethod
     def create(cls, root: Path, **kwargs: Any) -> Self:
@@ -477,6 +492,18 @@ class AttemptJournal:
     @property
     def status(self) -> JournalStatus:
         return self.health.status
+
+    @property
+    def checkpoint_due(self) -> bool:
+        return (
+            self._records_since_checkpoint >= self._checkpoint_every_records
+            or self._clock.now_ms() - self._last_checkpoint_ms >= self._checkpoint_every_ms
+        )
+
+    @property
+    def records_until_checkpoint(self) -> int:
+        return max(0, self._checkpoint_every_records - self._records_since_checkpoint)
+
 
     @property
     def health(self) -> JournalHealth:
@@ -653,19 +680,24 @@ class AttemptJournal:
         return p99 is not None and p99 <= 2.0
 
     def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        thread = self._thread
-        if thread is not None and thread.is_alive():
-            command = _StopCommand()
-            try:
-                self._queue.put_nowait(command)
-            except queue.Full:
+        with self._lifecycle_lock:
+            if self._closed:
+                return
+            self._closed = True
+            thread = self._thread
+            command: _StopCommand | None = None
+            if (
+                thread is not None
+                and thread.is_alive()
+                and self._base_status is JournalStatus.HEALTHY
+            ):
+                command = _StopCommand()
                 self._queue.put(command)
-            command.done.wait(timeout=5)
-            thread.join(timeout=5)
-        if self._segment_fd is not None:
+        if thread is not None:
+            if command is not None:
+                command.done.wait()
+            thread.join()
+        if self._segment_fd is not None and (thread is None or not thread.is_alive()):
             os.close(self._segment_fd)
             self._segment_fd = None
 
@@ -711,13 +743,33 @@ class AttemptJournal:
             expected_sequence = checkpoint_sequence + 1
             previous_digest = checkpoint_digest
             records: list[JournalRecord] = []
-            for path in sorted(self.root.glob("segment-*.jsonl")):
+            segments = sorted(self.root.glob("segment-*.jsonl"))
+            for path in segments:
                 self._check_recovery_deadline(started)
+                valid_offset = 0
                 with path.open("rb") as stream:
-                    for raw in stream:
+                    while raw := stream.readline():
                         self._check_recovery_deadline(started)
-                        value = json.loads(raw)
+                        try:
+                            value = json.loads(raw)
+                        except json.JSONDecodeError:
+                            newest_incomplete_tail = (
+                                path == segments[-1]
+                                and not raw.endswith(b"\n")
+                                and stream.tell() == path.stat().st_size
+                            )
+                            if not newest_incomplete_tail:
+                                raise
+                            fd = os.open(path, os.O_WRONLY)
+                            try:
+                                os.ftruncate(fd, valid_offset)
+                                self._timed_fdatasync(fd)
+                            finally:
+                                os.close(fd)
+                            _fsync_directory(self.root)
+                            break
                         record = self._decode_record(value)
+                        valid_offset = stream.tell()
                         if record.sequence <= checkpoint_sequence:
                             continue
                         if (
@@ -831,31 +883,37 @@ class AttemptJournal:
         *,
         boundary: str | None = None,
     ) -> JournalRecord:
-        if self._closed or self._base_status is not JournalStatus.HEALTHY:
-            raise JournalUnavailable(self._reason or self._base_status.value)
         command = _AppendCommand(kind, _validate_payload(kind, payload), boundary)
-        try:
-            self._queue.put_nowait(command)
-        except queue.Full:
-            raise JournalUnavailable("writer_queue_full") from None
+        with self._lifecycle_lock:
+            if self._closed or self._base_status is not JournalStatus.HEALTHY:
+                raise JournalUnavailable(self._reason or self._base_status.value)
+            try:
+                self._queue.put_nowait(command)
+            except queue.Full:
+                raise JournalUnavailable("writer_queue_full") from None
         command.done.wait()
         if command.error is not None:
+            if isinstance(command.error, OSError):
+                raise JournalUnavailable("writer_failed") from command.error
             raise command.error
         if command.result is None:
             raise JournalUnavailable("writer_stopped")
         return command.result
 
     def _checkpoint(self, snapshot: dict[str, JsonValue], *, force: bool) -> None:
-        if self._closed or self._base_status is not JournalStatus.HEALTHY:
-            raise JournalUnavailable(self._reason or self._base_status.value)
         _validate_safe_value(snapshot)
         command = _CheckpointCommand(snapshot, force)
-        try:
-            self._queue.put_nowait(command)
-        except queue.Full:
-            raise JournalUnavailable("writer_queue_full") from None
+        with self._lifecycle_lock:
+            if self._closed or self._base_status is not JournalStatus.HEALTHY:
+                raise JournalUnavailable(self._reason or self._base_status.value)
+            try:
+                self._queue.put_nowait(command)
+            except queue.Full:
+                raise JournalUnavailable("writer_queue_full") from None
         command.done.wait()
         if command.error is not None:
+            if isinstance(command.error, OSError):
+                raise JournalUnavailable("writer_failed") from command.error
             raise command.error
 
     def _writer_loop(self) -> None:
@@ -893,17 +951,37 @@ class AttemptJournal:
                 for item in batch:
                     item.done.set()
             except BaseException as error:
+                normalized: BaseException = (
+                    JournalUnavailable("writer_failed") if isinstance(error, OSError) else error
+                )
+                self._base_status = JournalStatus.RECOVERY_REQUIRED
+                self._reason = "writer_failed"
                 if isinstance(command, _CheckpointCommand):
-                    command.error = error
+                    command.error = normalized
                     command.done.set()
                 else:
                     for item in batch:
-                        item.error = error
+                        item.error = normalized
                         item.done.set()
-                self._base_status = JournalStatus.RECOVERY_REQUIRED
-                self._reason = "writer_failed"
+                if pending is not None:
+                    self._fail_command(pending, normalized)
+                    pending = None
+                while True:
+                    try:
+                        queued = self._queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    self._fail_command(queued, normalized)
                 self._flush_and_close_segment(sync=False)
                 return
+
+    @staticmethod
+    def _fail_command(command: _Command, error: BaseException) -> None:
+        if isinstance(command, _StopCommand):
+            command.done.set()
+            return
+        command.error = error
+        command.done.set()
 
     def _write_append_batch(self, batch: list[_AppendCommand]) -> None:
         boundaries = tuple(

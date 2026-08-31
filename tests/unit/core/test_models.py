@@ -56,13 +56,14 @@ def account(name: str = "nan", **overrides: object) -> ProviderAccount:
         "credential_fingerprint": "hcf1_" + "a" * 64,
         "credential_epoch": 1,
         "parallel_limit": quota(value=5),
+        "local_parallel_ceiling": 128,
         "rpm_limit": quota(value=1800),
         "rpm_window_seconds": 60,
         "tpm_limit": quota(value=6_000_000),
         "tpm_window_seconds": 60,
         "monthly_quota_units": quota(value=1_000),
-        "monthly_reset_day_utc": 1,
-        "monthly_reset_hour_utc": 0,
+        "quota_units_per_attempt": 1,
+        "monthly_reset_at_ms": 2_000_000_000_000,
     }
     fields.update(overrides)
     return ProviderAccount.model_validate(fields)
@@ -546,8 +547,7 @@ def test_quota_dimensions_distinguish_known_unknown_and_attested_absent():
         rpm_limit=quota("attested_absent", None),
         tpm_limit=quota("attested_absent", None),
         monthly_quota_units=quota("attested_absent", None),
-        monthly_reset_day_utc=None,
-        monthly_reset_hour_utc=None,
+        monthly_reset_at_ms=None,
     )
     assert unlimited.state.value == "active"
     assert unlimited.enforced_max_in_flight == unlimited.parallel_limit.value

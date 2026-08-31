@@ -61,13 +61,14 @@ def _account() -> ProviderAccount:
         credential_fingerprint="hcf1_" + "a" * 64,
         credential_epoch=1,
         parallel_limit=QuotaDimension(status="known", value=2),
+        local_parallel_ceiling=128,
         rpm_limit=quota,
         rpm_window_seconds=60,
         tpm_limit=quota,
         tpm_window_seconds=60,
         monthly_quota_units=quota,
-        monthly_reset_day_utc=1,
-        monthly_reset_hour_utc=0,
+        quota_units_per_attempt=1,
+        monthly_reset_at_ms=2_000_000_000_000,
         state=AccountState.ACTIVE,
     )
 

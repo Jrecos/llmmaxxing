@@ -3,12 +3,10 @@
 from __future__ import annotations
 
 import asyncio
-import calendar
 import hashlib
 import threading
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Annotated, Self, cast
 
@@ -41,6 +39,8 @@ from llmmaxxing.gateway.journal import (
 
 _PROBE_ID = Annotated[str, Field(pattern=r"^probe_[0-9a-f-]{36}$")]
 _MAX_INT = 2**63 - 1
+_MAX_ROLLING_WINDOW_SECONDS = 86_400
+_DEFAULT_RESOLUTION_LEDGER_LIMIT = 100_000
 
 
 def _require_int(value: object) -> int:
@@ -72,6 +72,7 @@ class ReservationDenialReason(StrEnum):
     CIRCUIT_CHANGED = "circuit_changed"
     CIRCUIT_UNAVAILABLE = "circuit_unavailable"
     DEADLINE_EXCEEDED = "deadline_exceeded"
+    INVALID_QUOTA_CHARGE = "invalid_quota_charge"
     JOURNAL_CAPACITY_STOP = "journal_capacity_stop"
     JOURNAL_UNAVAILABLE = "journal_unavailable"
     MONTHLY_QUOTA_EXHAUSTED = "monthly_quota_exhausted"
@@ -266,6 +267,8 @@ class _Attempt:
     profile_digest: str
     circuit_epoch: int
     circuit_probe_id: str | None
+    account_circuit_probe_id: str | None
+    monthly_reset_at_ms: int
     started_at_ms: int
     reserved_tokens: int
     quota_units: int
@@ -336,17 +339,20 @@ class AccountRuntime:
         clock: Clock,
         lock: threading.RLock,
         snapshot: Callable[[], dict[str, JsonValue]],
+        resolution_ledger_limit: int,
     ) -> None:
         self.account = account
         self._journal = journal
         self._clock = clock
         self._lock = lock
         self._snapshot = snapshot
+        self._resolution_ledger_limit = resolution_ledger_limit
         self._starts: dict[str, _Start] = {}
         self._attempts: dict[str, _Attempt] = {}
         self._resolutions: dict[str, _ResolvedAttempt] = {}
         self._circuits: dict[DeploymentGenerationId, CircuitValue] = {}
         self._account_circuit = CircuitValue.closed()
+        self._consumed_circuit_probes: dict[str, str] = {}
         self._monthly_used = 0
         self._time_high_water_ms = clock.now_ms()
         self._monthly_reset_at_ms = self._next_monthly_reset(self._time_high_water_ms)
@@ -356,9 +362,11 @@ class AccountRuntime:
     def update_account(self, account: ProviderAccount) -> None:
         if account.account_id != self.account.account_id:
             raise ValueError("cannot replace an AccountRuntime identity")
+        previous_reset = self._monthly_reset_at_ms
         self.account = account
-        if self._monthly_reset_at_ms == 0:
-            self._monthly_reset_at_ms = self._next_monthly_reset(self._now_ms())
+        candidate_reset = self._next_monthly_reset(self._now_ms())
+        if previous_reset == 0 or candidate_reset > previous_reset:
+            self._monthly_reset_at_ms = candidate_reset
 
     def try_reserve(self, request: ReservationRequest) -> ReservationGranted | ReservationDenied:
         with self._lock:
@@ -370,6 +378,13 @@ class AccountRuntime:
                 return ReservationDenied(ReservationDenialReason.ACCOUNT_NOT_FOUND)
             if self.account.state is not AccountState.ACTIVE:
                 return ReservationDenied(ReservationDenialReason.ACCOUNT_NOT_ACTIVE)
+            unresolved = sum(
+                attempt_id not in self._resolutions for attempt_id in self._attempts
+            )
+            if len(self._resolutions) + unresolved >= self._resolution_ledger_limit:
+                return ReservationDenied(ReservationDenialReason.JOURNAL_CAPACITY_STOP)
+            if request.quota_units < self.account.quota_units_per_attempt:
+                return ReservationDenied(ReservationDenialReason.INVALID_QUOTA_CHARGE)
             now_ms = self._now_ms()
             if request.deadline_at_ms <= now_ms:
                 return ReservationDenied(ReservationDenialReason.DEADLINE_EXCEEDED)
@@ -394,6 +409,24 @@ class AccountRuntime:
                     ReservationDenialReason.CIRCUIT_UNAVAILABLE,
                     retry_at_ms=current_circuit.retry_at_ms,
                 )
+            probe_ids = tuple(
+                probe_id
+                for probe_id in (
+                    (
+                        self._account_circuit.probe_id
+                        if self._account_circuit.state is CircuitState.HALF_OPEN
+                        else None
+                    ),
+                    (
+                        current_circuit.probe_id
+                        if current_circuit.state is CircuitState.HALF_OPEN
+                        else None
+                    ),
+                )
+                if probe_id is not None
+            )
+            if any(probe_id in self._consumed_circuit_probes for probe_id in probe_ids):
+                return ReservationDenied(ReservationDenialReason.CIRCUIT_UNAVAILABLE)
             self._purge_windows(now_ms)
             self._roll_monthly(now_ms)
             if self._active_count >= self.account.enforced_max_in_flight:
@@ -415,6 +448,8 @@ class AccountRuntime:
             tpm = self.account.tpm_limit
             if tpm.status is QuotaDimensionStatus.KNOWN:
                 assert tpm.value is not None
+                if request.total_token_upper_bound > tpm.value:
+                    return ReservationDenied(ReservationDenialReason.TPM_EXHAUSTED)
                 tpm_starts = self._tpm_starts(now_ms)
                 projected_tokens = (
                     sum(start.tokens for start in tpm_starts) + request.total_token_upper_bound
@@ -454,6 +489,11 @@ class AccountRuntime:
                 monthly_reset_at_ms=self._monthly_reset_at_ms,
                 circuit_epoch=request.circuit.epoch,
                 circuit_probe_id=request.circuit.probe_id,
+                account_circuit_probe_id=(
+                    self._account_circuit.probe_id
+                    if self._account_circuit.state is CircuitState.HALF_OPEN
+                    else None
+                ),
             )
             try:
                 receipt = self._journal.reserve_before_send(durable)
@@ -461,6 +501,8 @@ class AccountRuntime:
                 if str(error) == JournalStatus.ADMISSION_STOP.value:
                     return ReservationDenied(ReservationDenialReason.JOURNAL_CAPACITY_STOP)
                 return ReservationDenied(ReservationDenialReason.JOURNAL_UNAVAILABLE)
+            for probe_id in probe_ids:
+                self._consumed_circuit_probes[probe_id] = str(request.attempt_id)
 
             self._starts[request.attempt_id] = _Start(
                 request.attempt_id, now_ms, request.total_token_upper_bound
@@ -478,6 +520,12 @@ class AccountRuntime:
                 profile_digest=request.profile_digest,
                 circuit_epoch=request.circuit.epoch,
                 circuit_probe_id=request.circuit.probe_id,
+                account_circuit_probe_id=(
+                    self._account_circuit.probe_id
+                    if self._account_circuit.state is CircuitState.HALF_OPEN
+                    else None
+                ),
+                monthly_reset_at_ms=self._monthly_reset_at_ms,
                 started_at_ms=now_ms,
                 reserved_tokens=request.total_token_upper_bound,
                 quota_units=request.quota_units,
@@ -493,8 +541,23 @@ class AccountRuntime:
     async def try_reserve_async(
         self, request: ReservationRequest
     ) -> ReservationGranted | ReservationDenied:
-        """Run the blocking reserve-before-send commit off the event loop."""
-        return await asyncio.to_thread(self.try_reserve, request)
+        """Run durable reservation off-loop and reconcile cancellation as no-send."""
+        worker = asyncio.create_task(asyncio.to_thread(self.try_reserve, request))
+        try:
+            return await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            result = await asyncio.shield(worker)
+            if isinstance(result, ReservationGranted):
+                await result.lease.finish_async(
+                    AttemptResolution(
+                        outcome=TerminalOutcome.CLIENT_CANCELLED,
+                        release_capacity=True,
+                        actual_starts=0,
+                        actual_token_units=0,
+                        actual_quota_units=0,
+                    )
+                )
+            raise
 
     def compare_and_swap_circuit(
         self,
@@ -664,7 +727,10 @@ class AccountRuntime:
                 start.counted_start = False
             if resolution.actual_token_units is not None:
                 start.tokens = resolution.actual_token_units
-            if resolution.actual_quota_units is not None:
+            if (
+                resolution.actual_quota_units is not None
+                and attempt.monthly_reset_at_ms == self._monthly_reset_at_ms
+            ):
                 self._monthly_used += resolution.actual_quota_units - attempt.quota_units
                 self._monthly_used = max(0, self._monthly_used)
             if resolution.release_capacity:
@@ -703,13 +769,7 @@ class AccountRuntime:
         return self._time_high_water_ms
 
     def _purge_windows(self, now_ms: int) -> None:
-        keep_ms = (
-            max(
-                self.account.rpm_window_seconds,
-                self.account.tpm_window_seconds,
-            )
-            * 1000
-        )
+        keep_ms = _MAX_ROLLING_WINDOW_SECONDS * 1000
         expired = [
             attempt_id
             for attempt_id, start in self._starts.items()
@@ -729,36 +789,22 @@ class AccountRuntime:
     def _next_monthly_reset(self, now_ms: int) -> int:
         if self.account.monthly_quota_units.status is not QuotaDimensionStatus.KNOWN:
             return 0
-        reset_day = self.account.monthly_reset_day_utc
-        reset_hour = self.account.monthly_reset_hour_utc
-        assert reset_day is not None
-        assert reset_hour is not None
-        now = datetime.fromtimestamp(now_ms / 1000, tz=UTC)
-
-        def candidate(year: int, month: int) -> datetime:
-            day = min(reset_day, calendar.monthrange(year, month)[1])
-            return datetime(
-                year,
-                month,
-                day,
-                reset_hour,
-                tzinfo=UTC,
-            )
-
-        reset = candidate(now.year, now.month)
-        if reset.timestamp() * 1000 <= now_ms:
-            year = now.year + (1 if now.month == 12 else 0)
-            month = 1 if now.month == 12 else now.month + 1
-            reset = candidate(year, month)
-        return int(reset.timestamp() * 1000)
+        reset_at_ms = self.account.monthly_reset_at_ms or 0
+        return reset_at_ms if reset_at_ms > now_ms else 0
 
     def _roll_monthly(self, now_ms: int) -> None:
-        while self._monthly_reset_at_ms and now_ms >= self._monthly_reset_at_ms:
+        if self._monthly_reset_at_ms and now_ms >= self._monthly_reset_at_ms:
             self._monthly_used = 0
-            self._monthly_reset_at_ms = self._next_monthly_reset(self._monthly_reset_at_ms + 1)
+            self._monthly_reset_at_ms = 0
 
     def _apply_authoritative_active_count(self, active_count: int) -> None:
-        ordered = sorted(self._attempts)
+        ordered = sorted(
+            self._attempts,
+            key=lambda attempt_id: (
+                self._attempts[attempt_id].started_at_ms,
+                attempt_id,
+            ),
+        )
         keep = min(active_count, len(ordered))
         for attempt_id in ordered[keep:]:
             del self._attempts[attempt_id]
@@ -769,11 +815,18 @@ class AccountRuntime:
             if self._external_uncertain_holds:
                 self._external_uncertain_holds -= 1
             elif self._attempts:
-                del self._attempts[sorted(self._attempts)[0]]
+                oldest = min(
+                    self._attempts.values(),
+                    key=lambda attempt: (attempt.started_at_ms, attempt.attempt_id),
+                )
+                del self._attempts[oldest.attempt_id]
         self._recovery_probe_id = None
 
     def _maybe_checkpoint_locked(self) -> None:
-        self._journal.maybe_checkpoint(self._snapshot())
+        if self.account.state is not AccountState.ACTIVE:
+            self._journal.force_checkpoint(self._snapshot())
+        elif self._journal.checkpoint_due:
+            self._journal.maybe_checkpoint(self._snapshot())
 
     def _snapshot_state(self) -> dict[str, JsonValue]:
         return {
@@ -798,6 +851,8 @@ class AccountRuntime:
                     "profile_digest": attempt.profile_digest,
                     "circuit_epoch": attempt.circuit_epoch,
                     "circuit_probe_id": attempt.circuit_probe_id,
+                    "account_circuit_probe_id": attempt.account_circuit_probe_id,
+                    "monthly_reset_at_ms": attempt.monthly_reset_at_ms,
                     "started_at_ms": attempt.started_at_ms,
                     "reserved_tokens": attempt.reserved_tokens,
                     "quota_units": attempt.quota_units,
@@ -813,6 +868,7 @@ class AccountRuntime:
                 }
                 for attempt_id, resolved in sorted(self._resolutions.items())
             },
+            "consumed_circuit_probes": dict(sorted(self._consumed_circuit_probes.items())),
             "time_high_water_ms": self._time_high_water_ms,
             "monthly_used": self._monthly_used,
             "monthly_reset_at_ms": self._monthly_reset_at_ms,
@@ -853,7 +909,10 @@ class AccountRuntime:
         starts = cast(Mapping[str, Mapping[str, int]], value["starts"])
         attempts = cast(Mapping[str, Mapping[str, object]], value["attempts"])
         resolutions = cast(Mapping[str, Mapping[str, object]], value["resolutions"])
+        if len(resolutions) > self._resolution_ledger_limit:
+            raise ValueError("recovered resolution ledger exceeds configured bound")
         circuits = cast(Mapping[str, Mapping[str, object]], value["circuits"])
+        consumed_probes = cast(Mapping[str, object], value["consumed_circuit_probes"])
         account_circuit = cast(Mapping[str, object], value["account_circuit"])
         self._starts = {
             attempt_id: _Start(
@@ -882,6 +941,12 @@ class AccountRuntime:
                     if item["circuit_probe_id"] is None
                     else _require_str(item["circuit_probe_id"])
                 ),
+                account_circuit_probe_id=(
+                    None
+                    if item["account_circuit_probe_id"] is None
+                    else _require_str(item["account_circuit_probe_id"])
+                ),
+                monthly_reset_at_ms=_require_int(item["monthly_reset_at_ms"]),
                 started_at_ms=_require_int(item["started_at_ms"]),
                 reserved_tokens=_require_int(item["reserved_tokens"]),
                 quota_units=_require_int(item["quota_units"]),
@@ -899,6 +964,10 @@ class AccountRuntime:
                 ),
             )
             for attempt_id, item in resolutions.items()
+        }
+        self._consumed_circuit_probes = {
+            _require_str(probe_id): _require_str(attempt_id)
+            for probe_id, attempt_id in consumed_probes.items()
         }
         self._monthly_used = _require_int(value["monthly_used"])
         self._monthly_reset_at_ms = _require_int(value["monthly_reset_at_ms"])
@@ -993,13 +1062,18 @@ class RuntimeState:
         *,
         journal: AttemptJournal,
         clock: Clock,
+        resolution_ledger_limit: int = _DEFAULT_RESOLUTION_LEDGER_LIMIT,
     ) -> None:
+        if resolution_ledger_limit < 1 or resolution_ledger_limit > 100_000:
+            raise ValueError("resolution ledger limit must be in [1, 100000]")
         self._journal = journal
         self._clock = clock
+        self._resolution_ledger_limit = resolution_ledger_limit
         # ponytail: one lock preserves record/state/checkpoint order; shard only if measured.
         self._lock = threading.RLock()
         self._runtimes: dict[AccountId, AccountRuntime] = {}
         self._binding_history: dict[str, AccountId] = {}
+        self._dormant_account_states: dict[AccountId, Mapping[str, object]] = {}
         self._account_binding: dict[AccountId, str] = {}
         self._credential_epoch_highwater: dict[AccountId, int] = {}
         self._credential_attestation_digest: dict[AccountId, str] = {}
@@ -1011,6 +1085,7 @@ class RuntimeState:
                 clock=clock,
                 lock=self._lock,
                 snapshot=self._snapshot_locked,
+                resolution_ledger_limit=resolution_ledger_limit,
             )
 
         if journal.recovery.status is JournalStatus.HEALTHY:
@@ -1109,23 +1184,33 @@ class RuntimeState:
 
     def apply_publication(self, accounts: Iterable[ProviderAccount]) -> None:
         with self._lock:
-            for raw_account in accounts:
-                account = ProviderAccount.model_validate(raw_account)
+            validated = tuple(ProviderAccount.model_validate(account) for account in accounts)
+            account_ids = tuple(account.account_id for account in validated)
+            if len(set(account_ids)) != len(account_ids):
+                raise AccountBindingConflict("publication contains duplicate Account IDs")
+
+            binding_history = dict(self._binding_history)
+            account_binding = dict(self._account_binding)
+            epoch_highwater = dict(self._credential_epoch_highwater)
+            attestation_history = dict(self._credential_attestation_digest)
+            staged: list[tuple[ProviderAccount, str, str, int, bool]] = []
+
+            for account in validated:
                 binding_digest = self._binding_digest(account)
                 attestation_digest = self._attestation_digest(account)
-                previous_binding = self._account_binding.get(account.account_id)
+                previous_binding = account_binding.get(account.account_id)
                 if previous_binding is not None and previous_binding != binding_digest:
                     raise AccountBindingConflict("Account ID cannot change its provider binding")
                 if binding_digest:
-                    owner = self._binding_history.get(binding_digest)
+                    owner = binding_history.get(binding_digest)
                     if owner is not None and owner != account.account_id:
                         raise AccountBindingConflict(
                             "provider binding is globally unique across live and "
                             "tombstoned accounts"
                         )
                 epoch = account.credential_epoch or 0
-                highwater = self._credential_epoch_highwater.get(account.account_id, 0)
-                previous_attestation = self._credential_attestation_digest.get(account.account_id)
+                highwater = epoch_highwater.get(account.account_id, 0)
+                previous_attestation = attestation_history.get(account.account_id)
                 if epoch < highwater or (
                     epoch == highwater
                     and previous_attestation is not None
@@ -1134,38 +1219,79 @@ class RuntimeState:
                     raise CredentialAttestationRollback(
                         "credential attestation cannot rewind or change within one epoch"
                     )
-
+                runtime = self._runtimes.get(account.account_id)
                 changed = (
                     previous_binding is None
                     or epoch > highwater
-                    or self._runtimes.get(account.account_id, None) is None
-                    or self._runtimes[account.account_id].account.state != account.state
+                    or runtime is None
+                    or runtime.account.state != account.state
                 )
+                staged.append((account, binding_digest, attestation_digest, epoch, changed))
+                if binding_digest:
+                    binding_history[binding_digest] = account.account_id
+                    account_binding[account.account_id] = binding_digest
+                epoch_highwater[account.account_id] = epoch
+                attestation_history[account.account_id] = attestation_digest
+
+            omitted: list[ProviderAccount] = []
+            selected = set(account_ids)
+            for account_id, runtime in self._runtimes.items():
+                if account_id not in selected and runtime.account.state is AccountState.ACTIVE:
+                    omitted.append(
+                        ProviderAccount.model_validate(
+                            runtime.account.model_copy(
+                                update={"state": AccountState.DISABLED}
+                            ).model_dump(mode="python")
+                        )
+                    )
+
+            for account, binding_digest, attestation_digest, epoch, changed in staged:
                 if changed and binding_digest:
+                    assert account.state is not None
                     self._journal.register_account(
                         account_id=str(account.account_id),
                         binding_digest=binding_digest,
                         credential_attestation_digest=attestation_digest,
                         credential_epoch=epoch,
-                        state=cast(AccountState, account.state).value,
+                        state=account.state.value,
                     )
-                if binding_digest:
-                    self._binding_history[binding_digest] = account.account_id
-                    self._account_binding[account.account_id] = binding_digest
-                self._credential_epoch_highwater[account.account_id] = epoch
-                self._credential_attestation_digest[account.account_id] = attestation_digest
+            for account in omitted:
+                binding_digest = account_binding[account.account_id]
+                self._journal.register_account(
+                    account_id=str(account.account_id),
+                    binding_digest=binding_digest,
+                    credential_attestation_digest=attestation_history[account.account_id],
+                    credential_epoch=epoch_highwater[account.account_id],
+                    state=AccountState.DISABLED.value,
+                )
+
+            self._binding_history = binding_history
+            self._account_binding = account_binding
+            self._credential_epoch_highwater = epoch_highwater
+            self._credential_attestation_digest = attestation_history
+            for account, _, _, _, _ in staged:
                 runtime = self._runtimes.get(account.account_id)
                 if runtime is None:
-                    self._runtimes[account.account_id] = AccountRuntime(
+                    runtime = AccountRuntime(
                         account,
                         journal=self._journal,
                         clock=self._clock,
                         lock=self._lock,
                         snapshot=self._snapshot_locked,
+                        resolution_ledger_limit=self._resolution_ledger_limit,
                     )
+                    dormant = self._dormant_account_states.pop(account.account_id, None)
+                    if dormant is not None:
+                        runtime._restore_snapshot_state(dormant)
+                    self._runtimes[account.account_id] = runtime
                 else:
                     runtime.update_account(account)
-            self._journal.maybe_checkpoint(self._snapshot_locked())
+            for account in omitted:
+                self._runtimes[account.account_id].update_account(account)
+            if omitted:
+                self._journal.force_checkpoint(self._snapshot_locked())
+            elif self._journal.checkpoint_due:
+                self._journal.maybe_checkpoint(self._snapshot_locked())
 
     def checkpoint(self) -> None:
         with self._lock:
@@ -1182,21 +1308,28 @@ class RuntimeState:
     def _binding_digest(self, account: ProviderAccount) -> str:
         if not all((account.connection, account.provider_token, account.binding_ref)):
             return ""
-        material = "\x00".join((account.connection, account.provider_token, account.binding_ref))
-        return "sha256:" + hashlib.sha256(material.encode()).hexdigest()
+        material = canonical_json_bytes(
+            [account.connection, account.provider_token, account.binding_ref]
+        )
+        return "sha256:" + hashlib.sha256(material).hexdigest()
 
     def _attestation_digest(self, account: ProviderAccount) -> str:
         material = account.credential_fingerprint or ""
         return "sha256:" + hashlib.sha256(material.encode()).hexdigest()
 
     def _snapshot_locked(self) -> dict[str, JsonValue]:
-        return {
-            "accounts": {
+        account_states: dict[str, JsonValue] = {
+            str(account_id): cast(JsonValue, dict(state))
+            for account_id, state in self._dormant_account_states.items()
+        }
+        account_states.update(
+            {
                 str(account_id): runtime._snapshot_state()
-                for account_id, runtime in sorted(
-                    self._runtimes.items(), key=lambda item: str(item[0])
-                )
-            },
+                for account_id, runtime in self._runtimes.items()
+            }
+        )
+        return {
+            "accounts": dict(sorted(account_states.items())),
             "binding_history": {
                 digest: str(account_id)
                 for digest, account_id in sorted(self._binding_history.items())
@@ -1227,8 +1360,9 @@ class RuntimeState:
             account_id = AccountId(account_id_text)
             runtime = self._runtimes.get(account_id)
             if runtime is None:
-                raise ValueError("checkpoint references account absent from signed policy")
-            runtime._restore_snapshot_state(state)
+                self._dormant_account_states[account_id] = state
+            else:
+                runtime._restore_snapshot_state(state)
         self._binding_history = {
             str(digest): AccountId(str(account_id))
             for digest, account_id in cast(
@@ -1301,11 +1435,21 @@ class RuntimeState:
                 profile_digest=cast(str, payload["profile_digest"]),
                 circuit_epoch=cast(int, payload["circuit_epoch"]),
                 circuit_probe_id=cast(str | None, payload["circuit_probe_id"]),
+                account_circuit_probe_id=cast(
+                    str | None, payload["account_circuit_probe_id"]
+                ),
+                monthly_reset_at_ms=reset_at,
                 started_at_ms=cast(int, payload["started_at_ms"]),
                 reserved_tokens=cast(int, payload["reserved_tokens"]),
                 quota_units=cast(int, payload["quota_units"]),
                 state="active",
             )
+            for probe_id in (
+                cast(str | None, payload["account_circuit_probe_id"]),
+                cast(str | None, payload["circuit_probe_id"]),
+            ):
+                if probe_id is not None:
+                    runtime._consumed_circuit_probes[probe_id] = attempt_id
             runtime._monthly_used += cast(int, payload["quota_units"])
         elif record.kind == "attempt_resolved":
             attempt_id = cast(str, payload["attempt_id"])
@@ -1395,6 +1539,29 @@ class RuntimeState:
                     reason=AmbiguousReason.CRASH_RECOVERY.value,
                 )
                 attempt.state = "uncertain"
+            if runtime._recovery_probe_id is not None:
+                probe_id = runtime._recovery_probe_id
+                self._journal.record_recovery_probe_finished(
+                    account_id=str(runtime.account.account_id),
+                    probe_id=probe_id,
+                    classification=ProbeClassification.INCONCLUSIVE.value,
+                )
+                runtime._apply_recovery_probe_finished(ProbeClassification.INCONCLUSIVE)
+            account_circuit = runtime._account_circuit
+            if account_circuit.state is CircuitState.HALF_OPEN:
+                runtime.compare_and_swap_account_circuit(
+                    account_circuit,
+                    CircuitValue(
+                        state=CircuitState.OPEN,
+                        cause=account_circuit.cause,
+                        epoch=account_circuit.epoch + 1,
+                        opened_at_ms=account_circuit.opened_at_ms,
+                        retry_at_ms=runtime._now_ms(),
+                        backoff_step=min(64, account_circuit.backoff_step + 1),
+                        evidence_digest=account_circuit.evidence_digest,
+                        probe_id=None,
+                    ),
+                )
             for generation, value in tuple(runtime._circuits.items()):
                 if value.state is not CircuitState.HALF_OPEN:
                     continue
@@ -1412,4 +1579,5 @@ class RuntimeState:
                         probe_id=None,
                     ),
                 )
-        self._journal.maybe_checkpoint(self._snapshot_locked())
+        if self._journal.checkpoint_due:
+            self._journal.maybe_checkpoint(self._snapshot_locked())

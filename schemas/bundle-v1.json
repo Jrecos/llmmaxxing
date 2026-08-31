@@ -276,13 +276,18 @@
           "title": "Display Name",
           "type": "string"
         },
+        "local_parallel_ceiling": {
+          "maximum": 128,
+          "minimum": 1,
+          "title": "Local Parallel Ceiling",
+          "type": "integer"
+        },
         "monthly_quota_units": {
           "$ref": "#/$defs/QuotaDimension"
         },
-        "monthly_reset_day_utc": {
+        "monthly_reset_at_ms": {
           "anyOf": [
             {
-              "maximum": 31,
               "minimum": 1,
               "type": "integer"
             },
@@ -291,21 +296,7 @@
             }
           ],
           "default": null,
-          "title": "Monthly Reset Day Utc"
-        },
-        "monthly_reset_hour_utc": {
-          "anyOf": [
-            {
-              "maximum": 23,
-              "minimum": 0,
-              "type": "integer"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Monthly Reset Hour Utc"
+          "title": "Monthly Reset At Ms"
         },
         "parallel_limit": {
           "$ref": "#/$defs/QuotaDimension"
@@ -315,6 +306,11 @@
           "maxLength": 256,
           "title": "Provider Token",
           "type": "string"
+        },
+        "quota_units_per_attempt": {
+          "minimum": 0,
+          "title": "Quota Units Per Attempt",
+          "type": "integer"
         },
         "rpm_limit": {
           "$ref": "#/$defs/QuotaDimension"
@@ -350,11 +346,13 @@
         "account_id",
         "display_name",
         "parallel_limit",
+        "local_parallel_ceiling",
         "rpm_limit",
         "rpm_window_seconds",
         "tpm_limit",
         "tpm_window_seconds",
-        "monthly_quota_units"
+        "monthly_quota_units",
+        "quota_units_per_attempt"
       ],
       "title": "ProviderAccount",
       "type": "object"

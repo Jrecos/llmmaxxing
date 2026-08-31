@@ -1,6 +1,8 @@
 """Durable reservation, segmented journal, checkpoint, and recovery contract."""
 
 from __future__ import annotations
+import asyncio
+import threading
 
 from pathlib import Path
 from uuid import uuid4
@@ -22,8 +24,10 @@ from llmmaxxing.core.reasons import Modality, TerminalOutcome
 from llmmaxxing.core.state_machines import AccountState
 from llmmaxxing.gateway.journal import (
     AttemptJournal,
+    DurableReservation,
     InjectedCrash,
     JournalStatus,
+    JournalUnavailable,
 )
 from llmmaxxing.gateway.runtime_state import (
     AccountBindingConflict,
@@ -70,13 +74,14 @@ def account(
         credential_fingerprint="hcf1_" + "a" * 64,
         credential_epoch=1,
         parallel_limit=limit(2),
+        local_parallel_ceiling=128,
         rpm_limit=limit(60),
         rpm_window_seconds=60,
         tpm_limit=limit(10_000),
         tpm_window_seconds=60,
         monthly_quota_units=limit(100_000),
-        monthly_reset_day_utc=1,
-        monthly_reset_hour_utc=0,
+        quota_units_per_attempt=1,
+        monthly_reset_at_ms=2_000_000_000_000,
         state=AccountState.ACTIVE,
     )
 
@@ -627,3 +632,209 @@ def test_journal_and_checkpoints_never_store_provider_or_request_secrets(tmp_pat
         b"client_secret",
     ):
         assert forbidden not in durable
+
+def test_writer_failure_rejects_every_queued_waiter(tmp_path: Path) -> None:
+    clock = FakeClock(1_800_000_000_000)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def fail_sync(boundary: str) -> None:
+        if boundary == "before_reservation_fsync":
+            entered.set()
+            assert release.wait(1)
+            raise OSError("synthetic EIO")
+
+    journal = AttemptJournal.create(
+        tmp_path / "writer-failure",
+        clock=clock,
+        crash_injector=fail_sync,
+        group_commit_delay_ms=0,
+    )
+
+    def durable(attempt: AttemptId) -> DurableReservation:
+        return DurableReservation(
+            request_id=str(RequestId.new()),
+            attempt_id=str(attempt),
+            account_id=str(AccountId.new()),
+            deployment_generation_id=str(DeploymentGenerationId.from_digest("d" * 64)),
+            installation_id=str(InstallationId.new()),
+            bundle_generation=1,
+            bundle_hash=str(BundleHash.from_digest("e" * 64)),
+            fence_token=1,
+            boot_id=str(GatewayBootId.new()),
+            deadline_at_ms=clock.now_ms() + 1_000,
+            profile_digest="sha256:" + "f" * 64,
+            started_at_ms=clock.now_ms(),
+            reserved_tokens=1,
+            quota_units=1,
+            monthly_reset_at_ms=2_000_000_000_000,
+            circuit_epoch=0,
+            circuit_probe_id=None,
+            account_circuit_probe_id=None,
+        )
+
+    errors: list[BaseException] = []
+
+    def submit(entry: DurableReservation) -> None:
+        try:
+            journal.reserve_before_send(entry)
+        except BaseException as error:
+            errors.append(error)
+
+    first = threading.Thread(target=submit, args=(durable(AttemptId.new()),))
+    second = threading.Thread(target=submit, args=(durable(AttemptId.new()),))
+    first.start()
+    assert entered.wait(1)
+    second.start()
+    release.set()
+    first.join(1)
+    second.join(1)
+    try:
+        assert not first.is_alive()
+        assert not second.is_alive()
+        assert len(errors) == 2
+        assert all(isinstance(error, JournalUnavailable) for error in errors)
+    finally:
+        journal.close()
+
+
+def test_async_cancel_reconciles_a_durable_no_send(tmp_path: Path) -> None:
+    clock = FakeClock(1_800_000_000_000)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def block_sync(boundary: str) -> None:
+        if boundary == "before_reservation_fsync":
+            entered.set()
+            assert release.wait(1)
+
+    provider_account = account()
+    journal = AttemptJournal.create(
+        tmp_path / "async-cancel",
+        clock=clock,
+        crash_injector=block_sync,
+        group_commit_delay_ms=0,
+    )
+    state = RuntimeState((provider_account,), journal=journal, clock=clock)
+
+    async def exercise() -> None:
+        task = asyncio.create_task(
+            state.try_reserve_async(request(provider_account, clock))
+        )
+        assert await asyncio.to_thread(entered.wait, 1)
+        task.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    try:
+        asyncio.run(exercise())
+        capacity = state.account_capacity(provider_account.account_id)
+        assert (
+            capacity.active_attempts,
+            capacity.rpm_starts,
+            capacity.tpm_tokens,
+            capacity.monthly_quota_units,
+        ) == (0, 0, 0, 0)
+    finally:
+        journal.close()
+
+
+def test_recovery_seeds_checkpoint_cadence_from_existing_tail(tmp_path: Path) -> None:
+    clock = FakeClock(1_800_000_000_000)
+    root = tmp_path / "cadence"
+    journal = AttemptJournal.create(
+        root,
+        clock=clock,
+        group_commit_delay_ms=0,
+        checkpoint_every_records=3,
+    )
+    journal.register_account(
+        account_id=str(AccountId.new()),
+        binding_digest="sha256:" + "1" * 64,
+        credential_attestation_digest="sha256:" + "2" * 64,
+        credential_epoch=1,
+        state="active",
+    )
+    journal.force_checkpoint({"marker": "closed"})
+    for digit in ("3", "4"):
+        journal.register_account(
+            account_id=str(AccountId.new()),
+            binding_digest="sha256:" + digit * 64,
+            credential_attestation_digest="sha256:" + "5" * 64,
+            credential_epoch=1,
+            state="active",
+        )
+    journal.close()
+
+    reopened = AttemptJournal.open(
+        root,
+        clock=clock,
+        group_commit_delay_ms=0,
+        checkpoint_every_records=3,
+    )
+    try:
+        assert reopened.records_until_checkpoint == 1
+    finally:
+        reopened.close()
+
+
+def test_recovery_truncates_only_incomplete_newest_tail(tmp_path: Path) -> None:
+    clock = FakeClock(1_800_000_000_000)
+    root = tmp_path / "tail"
+    journal, view, provider_account = create_runtime(root, clock)
+    assert isinstance(view.try_reserve(request(provider_account, clock)), ReservationGranted)
+    journal.close()
+    segment = sorted(root.glob("segment-*.jsonl"))[-1]
+    valid_size = segment.stat().st_size
+    with segment.open("ab") as stream:
+        stream.write(b'{"incomplete"')
+
+    reopened = AttemptJournal.open(root, clock=clock, group_commit_delay_ms=0)
+    try:
+        assert reopened.status is JournalStatus.HEALTHY
+        assert segment.stat().st_size == valid_size
+    finally:
+        reopened.close()
+
+
+def test_crash_invalidates_account_half_open_and_recovery_probe(tmp_path: Path) -> None:
+    clock = FakeClock(1_800_000_000_000)
+    root = tmp_path / "crashed-probes"
+    journal, view, provider_account = create_runtime(root, clock)
+    granted = view.try_reserve(request(provider_account, clock))
+    assert isinstance(granted, ReservationGranted)
+    granted.lease.finish(
+        AttemptResolution(
+            outcome=TerminalOutcome.UPSTREAM_FAILED,
+            release_capacity=False,
+            actual_starts=None,
+            actual_token_units=None,
+            actual_quota_units=None,
+        )
+    )
+    runtime = view.account_runtime(provider_account.account_id)
+    half_open = CircuitValue(
+        state=CircuitState.HALF_OPEN,
+        cause=CircuitCause.CAPACITY,
+        epoch=2,
+        opened_at_ms=clock.now_ms(),
+        retry_at_ms=0,
+        backoff_step=2,
+        evidence_digest="sha256:" + "a" * 64,
+        probe_id=f"probe_{uuid4()}",
+    )
+    assert runtime.compare_and_swap_account_circuit(CircuitValue.closed(), half_open)
+    recovery_probe = f"probe_{uuid4()}"
+    assert runtime.begin_recovery_probe(recovery_probe)
+    journal.close()
+
+    reopened, recovered = reopen_runtime(root, provider_account, clock)
+    try:
+        recovered_runtime = recovered.account_runtime(provider_account.account_id)
+        account_circuit = recovered_runtime.account_circuit_value()
+        assert account_circuit.state is CircuitState.OPEN
+        assert account_circuit.epoch == 3
+        assert recovered_runtime.begin_recovery_probe(f"probe_{uuid4()}")
+    finally:
+        reopened.close()
