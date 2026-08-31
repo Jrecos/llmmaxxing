@@ -43,6 +43,7 @@ _MAX_ROLLING_WINDOW_SECONDS = 86_400
 _DEFAULT_RESOLUTION_LEDGER_LIMIT = 100_000
 
 
+_DEFAULT_RESOLUTION_RETENTION_MS = 86_400_000
 def _require_int(value: object) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or value < 0:
         raise ValueError("recovered runtime integer is invalid")
@@ -76,6 +77,7 @@ class ReservationDenialReason(StrEnum):
     JOURNAL_CAPACITY_STOP = "journal_capacity_stop"
     JOURNAL_UNAVAILABLE = "journal_unavailable"
     MONTHLY_QUOTA_EXHAUSTED = "monthly_quota_exhausted"
+    MONTHLY_RESET_UNAVAILABLE = "monthly_reset_unavailable"
     PARALLEL_EXHAUSTED = "parallel_exhausted"
     RECOVERY_REQUIRED = "recovery_required"
     RPM_EXHAUSTED = "rpm_exhausted"
@@ -243,6 +245,7 @@ class AccountCapacity:
     account_circuit: CircuitValue
     monthly_reset_at_ms: int
     recovery_probe_in_flight: bool
+    consumed_probe_tokens: int
 
 
 @dataclass(slots=True)
@@ -279,6 +282,7 @@ class _Attempt:
 class _ResolvedAttempt:
     resolution_digest: str
     receipt: JournalReceipt
+    resolved_at_ms: int
 
 
 class AccountBindingConflict(ValueError):
@@ -340,6 +344,7 @@ class AccountRuntime:
         lock: threading.RLock,
         snapshot: Callable[[], dict[str, JsonValue]],
         resolution_ledger_limit: int,
+        resolution_retention_ms: int,
     ) -> None:
         self.account = account
         self._journal = journal
@@ -347,6 +352,7 @@ class AccountRuntime:
         self._lock = lock
         self._snapshot = snapshot
         self._resolution_ledger_limit = resolution_ledger_limit
+        self._resolution_retention_ms = resolution_retention_ms
         self._starts: dict[str, _Start] = {}
         self._attempts: dict[str, _Attempt] = {}
         self._resolutions: dict[str, _ResolvedAttempt] = {}
@@ -362,9 +368,11 @@ class AccountRuntime:
     def update_account(self, account: ProviderAccount) -> None:
         if account.account_id != self.account.account_id:
             raise ValueError("cannot replace an AccountRuntime identity")
+        now_ms = self._now_ms()
+        self._roll_monthly(now_ms)
         previous_reset = self._monthly_reset_at_ms
         self.account = account
-        candidate_reset = self._next_monthly_reset(self._now_ms())
+        candidate_reset = self._next_monthly_reset(now_ms)
         if previous_reset == 0 or candidate_reset > previous_reset:
             self._monthly_reset_at_ms = candidate_reset
 
@@ -378,12 +386,15 @@ class AccountRuntime:
                 return ReservationDenied(ReservationDenialReason.ACCOUNT_NOT_FOUND)
             if self.account.state is not AccountState.ACTIVE:
                 return ReservationDenied(ReservationDenialReason.ACCOUNT_NOT_ACTIVE)
-            unresolved = sum(attempt_id not in self._resolutions for attempt_id in self._attempts)
+            now_ms = self._now_ms()
+            self._prune_resolutions(now_ms)
+            unresolved = sum(
+                attempt_id not in self._resolutions for attempt_id in self._attempts
+            )
             if len(self._resolutions) + unresolved >= self._resolution_ledger_limit:
                 return ReservationDenied(ReservationDenialReason.JOURNAL_CAPACITY_STOP)
             if request.quota_units < self.account.quota_units_per_attempt:
                 return ReservationDenied(ReservationDenialReason.INVALID_QUOTA_CHARGE)
-            now_ms = self._now_ms()
             if request.deadline_at_ms <= now_ms:
                 return ReservationDenied(ReservationDenialReason.DEADLINE_EXCEEDED)
             if (
@@ -427,6 +438,12 @@ class AccountRuntime:
                 return ReservationDenied(ReservationDenialReason.CIRCUIT_UNAVAILABLE)
             self._purge_windows(now_ms)
             self._roll_monthly(now_ms)
+            if (
+                self.account.monthly_quota_units.status is QuotaDimensionStatus.KNOWN
+                and request.quota_units > 0
+                and self._monthly_reset_at_ms == 0
+            ):
+                return ReservationDenied(ReservationDenialReason.MONTHLY_RESET_UNAVAILABLE)
             if self._active_count >= self.account.enforced_max_in_flight:
                 return ReservationDenied(ReservationDenialReason.PARALLEL_EXHAUSTED)
 
@@ -584,6 +601,8 @@ class AccountRuntime:
                 retry_at_ms=replacement.retry_at_ms,
                 probe_id=replacement.probe_id,
             )
+            if expected.probe_id is not None:
+                self._consumed_circuit_probes.pop(expected.probe_id, None)
             self._circuits[generation] = replacement
             self._maybe_checkpoint_locked()
             return True
@@ -623,6 +642,8 @@ class AccountRuntime:
                 retry_at_ms=replacement.retry_at_ms,
                 probe_id=replacement.probe_id,
             )
+            if expected.probe_id is not None:
+                self._consumed_circuit_probes.pop(expected.probe_id, None)
             self._account_circuit = replacement
             self._maybe_checkpoint_locked()
             return True
@@ -643,12 +664,15 @@ class AccountRuntime:
                 monthly_reset_at_ms=self._monthly_reset_at_ms,
                 recovery_probe_in_flight=self._recovery_probe_id is not None,
                 account_circuit=self._account_circuit,
+                consumed_probe_tokens=len(self._consumed_circuit_probes),
             )
 
     def apply_authoritative_active_count(self, active_count: int) -> None:
         if active_count < 0:
             raise ValueError("authoritative active count cannot be negative")
         with self._lock:
+            if any(attempt.state == "active" for attempt in self._attempts.values()):
+                raise ValueError("authoritative count cannot evict live active attempts")
             self._journal.record_authoritative_active_count(
                 account_id=str(self.account.account_id), active_count=active_count
             )
@@ -711,6 +735,7 @@ class AccountRuntime:
             ):
                 raise InvalidLeaseTransition("actual quota usage exceeds reservation")
 
+            resolved_at_ms = self._now_ms()
             receipt = self._journal.record_resolution(
                 attempt_id=attempt_id,
                 outcome=resolution.outcome.value,
@@ -719,6 +744,7 @@ class AccountRuntime:
                 actual_token_units=resolution.actual_token_units,
                 actual_quota_units=resolution.actual_quota_units,
                 resolution_digest=resolution.digest,
+                resolved_at_ms=resolved_at_ms,
             )
             start = self._starts[attempt_id]
             if resolution.actual_starts == 0:
@@ -735,7 +761,9 @@ class AccountRuntime:
                 del self._attempts[attempt_id]
             else:
                 attempt.state = "uncertain"
-            self._resolutions[attempt_id] = _ResolvedAttempt(resolution.digest, receipt)
+            self._resolutions[attempt_id] = _ResolvedAttempt(
+                resolution.digest, receipt, resolved_at_ms
+            )
             self._maybe_checkpoint_locked()
             return receipt
 
@@ -757,6 +785,16 @@ class AccountRuntime:
             for start in self._starts.values()
             if start.counted_start and start.started_at_ms > floor
         ]
+
+    def _prune_resolutions(self, now_ms: int) -> None:
+        cutoff = now_ms - self._resolution_retention_ms
+        expired = [
+            attempt_id
+            for attempt_id, resolved in self._resolutions.items()
+            if resolved.resolved_at_ms <= cutoff and attempt_id not in self._attempts
+        ]
+        for attempt_id in expired:
+            del self._resolutions[attempt_id]
 
     def _tpm_starts(self, now_ms: int) -> list[_Start]:
         floor = now_ms - self.account.tpm_window_seconds * 1000
@@ -796,6 +834,8 @@ class AccountRuntime:
             self._monthly_reset_at_ms = 0
 
     def _apply_authoritative_active_count(self, active_count: int) -> None:
+        if any(attempt.state == "active" for attempt in self._attempts.values()):
+            raise ValueError("authoritative count cannot evict live active attempts")
         ordered = sorted(
             self._attempts,
             key=lambda attempt_id: (
@@ -863,6 +903,7 @@ class AccountRuntime:
                     "resolution_digest": resolved.resolution_digest,
                     "durable_lsn": resolved.receipt.durable_lsn,
                     "record_digest": resolved.receipt.record_digest,
+                    "resolved_at_ms": resolved.resolved_at_ms,
                 }
                 for attempt_id, resolved in sorted(self._resolutions.items())
             },
@@ -960,6 +1001,7 @@ class AccountRuntime:
                     _require_int(item["durable_lsn"]),
                     _require_str(item["record_digest"]),
                 ),
+                _require_int(item["resolved_at_ms"]),
             )
             for attempt_id, item in resolutions.items()
         }
@@ -1061,12 +1103,16 @@ class RuntimeState:
         journal: AttemptJournal,
         clock: Clock,
         resolution_ledger_limit: int = _DEFAULT_RESOLUTION_LEDGER_LIMIT,
+        resolution_retention_ms: int = _DEFAULT_RESOLUTION_RETENTION_MS,
     ) -> None:
         if resolution_ledger_limit < 1 or resolution_ledger_limit > 100_000:
             raise ValueError("resolution ledger limit must be in [1, 100000]")
+        if resolution_retention_ms < 1:
+            raise ValueError("resolution retention must be positive")
         self._journal = journal
         self._clock = clock
         self._resolution_ledger_limit = resolution_ledger_limit
+        self._resolution_retention_ms = resolution_retention_ms
         # ponytail: one lock preserves record/state/checkpoint order; shard only if measured.
         self._lock = threading.RLock()
         self._runtimes: dict[AccountId, AccountRuntime] = {}
@@ -1084,6 +1130,7 @@ class RuntimeState:
                 lock=self._lock,
                 snapshot=self._snapshot_locked,
                 resolution_ledger_limit=resolution_ledger_limit,
+                resolution_retention_ms=resolution_retention_ms,
             )
 
         if journal.recovery.status is JournalStatus.HEALTHY:
@@ -1277,6 +1324,7 @@ class RuntimeState:
                         lock=self._lock,
                         snapshot=self._snapshot_locked,
                         resolution_ledger_limit=self._resolution_ledger_limit,
+                        resolution_retention_ms=self._resolution_retention_ms,
                     )
                     dormant = self._dormant_account_states.pop(account.account_id, None)
                     if dormant is not None:
@@ -1480,6 +1528,7 @@ class RuntimeState:
             runtime._resolutions[attempt_id] = _ResolvedAttempt(
                 resolution_digest,
                 JournalReceipt(record.sequence, record.digest),
+                cast(int, payload["resolved_at_ms"]),
             )
         elif record.kind == "attempt_uncertain":
             attempt = runtime._attempts.get(cast(str, payload["attempt_id"]))
@@ -1499,11 +1548,25 @@ class RuntimeState:
                 probe_id=cast(str | None, payload["probe_id"]),
             )
             if payload["scope"] == CircuitScope.ACCOUNT.value:
+                account_previous = runtime._account_circuit
+                if account_previous.probe_id is not None:
+                    runtime._consumed_circuit_probes.pop(
+                        account_previous.probe_id, None
+                    )
                 runtime._account_circuit = value
             else:
-                runtime._circuits[
-                    DeploymentGenerationId(cast(str, payload["deployment_generation_id"]))
-                ] = value
+                generation = DeploymentGenerationId(
+                    cast(str, payload["deployment_generation_id"])
+                )
+                deployment_previous = runtime._circuits.get(generation)
+                if (
+                    deployment_previous is not None
+                    and deployment_previous.probe_id is not None
+                ):
+                    runtime._consumed_circuit_probes.pop(
+                        deployment_previous.probe_id, None
+                    )
+                runtime._circuits[generation] = value
         elif record.kind == "authoritative_active_count":
             runtime._apply_authoritative_active_count(cast(int, payload["active_count"]))
         elif record.kind == "recovery_probe_started":

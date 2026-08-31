@@ -316,8 +316,15 @@ def test_monthly_reset_is_explicit_and_deterministic(tmp_path: Path, clock: Fake
         )
 
         clock.value = reset_at
+        assert view.try_reserve(
+            request(provider_account, clock, tokens=1, quota_units=30)
+        ) == ReservationDenied(ReservationDenialReason.MONTHLY_RESET_UNAVAILABLE)
+        next_epoch = provider_account.model_copy(
+            update={"monthly_reset_at_ms": reset_at + 2_592_000_000}
+        )
+        view.apply_publication((next_epoch,))
         assert isinstance(
-            view.try_reserve(request(provider_account, clock, tokens=1, quota_units=30)),
+            view.try_reserve(request(next_epoch, clock, tokens=1, quota_units=30)),
             ReservationGranted,
         )
     finally:
@@ -618,7 +625,11 @@ def test_monthly_refund_never_changes_a_new_reset_epoch(tmp_path: Path, clock: F
         old = state.try_reserve(request(provider_account, clock, tokens=1, quota_units=50))
         assert isinstance(old, ReservationGranted)
         clock.advance(1_000)
-        new = state.try_reserve(request(provider_account, clock, tokens=1, quota_units=40))
+        next_epoch = provider_account.model_copy(
+            update={"monthly_reset_at_ms": reset_at + 2_592_000_000}
+        )
+        state.apply_publication((next_epoch,))
+        new = state.try_reserve(request(next_epoch, clock, tokens=1, quota_units=40))
         assert isinstance(new, ReservationGranted)
         old.lease.finish(
             AttemptResolution(
@@ -659,6 +670,18 @@ def test_half_open_probe_token_is_consumed_once(tmp_path: Path, clock: FakeClock
             request(provider_account, clock).model_copy(update={"account_circuit": half_open})
         )
         assert second == ReservationDenied(ReservationDenialReason.CIRCUIT_UNAVAILABLE)
+        opened = CircuitValue(
+            state=CircuitState.OPEN,
+            cause=CircuitCause.CAPACITY,
+            epoch=2,
+            opened_at_ms=clock.now_ms(),
+            retry_at_ms=clock.now_ms() + 1_000,
+            backoff_step=2,
+            evidence_digest="sha256:" + "b" * 64,
+            probe_id=None,
+        )
+        assert runtime.compare_and_swap_account_circuit(half_open, opened)
+        assert state.account_capacity(provider_account.account_id).consumed_probe_tokens == 0
     finally:
         journal.close()
 
@@ -671,6 +694,7 @@ def test_terminal_ledger_stops_before_snapshot_bound(tmp_path: Path, clock: Fake
         journal=journal,
         clock=clock,
         resolution_ledger_limit=1,
+        resolution_retention_ms=10,
     )
     try:
         granted = state.try_reserve(request(provider_account, clock))
@@ -679,5 +703,34 @@ def test_terminal_ledger_stops_before_snapshot_bound(tmp_path: Path, clock: Fake
         assert state.try_reserve(request(provider_account, clock)) == ReservationDenied(
             ReservationDenialReason.JOURNAL_CAPACITY_STOP
         )
+        clock.advance(11)
+        assert isinstance(
+            state.try_reserve(request(provider_account, clock)), ReservationGranted
+        )
+    finally:
+        journal.close()
+
+def test_authoritative_count_rejects_while_live_attempt_exists(
+    tmp_path: Path, clock: FakeClock
+) -> None:
+    provider_account = account(parallel=2)
+    journal, state = open_view(tmp_path, provider_account, clock)
+    try:
+        uncertain = state.try_reserve(request(provider_account, clock))
+        assert isinstance(uncertain, ReservationGranted)
+        uncertain.lease.finish(
+            AttemptResolution(
+                outcome=TerminalOutcome.UPSTREAM_FAILED,
+                release_capacity=False,
+                actual_starts=None,
+                actual_token_units=None,
+                actual_quota_units=None,
+            )
+        )
+        live = state.try_reserve(request(provider_account, clock))
+        assert isinstance(live, ReservationGranted)
+        with pytest.raises(ValueError, match="live active"):
+            state.account_runtime(provider_account.account_id).apply_authoritative_active_count(1)
+        finish_actual(live.lease, tokens=10, quota_units=10)
     finally:
         journal.close()

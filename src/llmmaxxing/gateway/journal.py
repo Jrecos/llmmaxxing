@@ -105,6 +105,7 @@ _RECORD_FIELDS: dict[str, frozenset[str]] = {
             "actual_token_units",
             "actual_quota_units",
             "resolution_digest",
+            "resolved_at_ms",
         }
     ),
     "circuit_updated": frozenset(
@@ -578,6 +579,7 @@ class AttemptJournal:
         actual_token_units: int | None,
         actual_quota_units: int | None,
         resolution_digest: str,
+        resolved_at_ms: int,
     ) -> JournalReceipt:
         record = self._append(
             "attempt_resolved",
@@ -589,6 +591,7 @@ class AttemptJournal:
                 "actual_token_units": actual_token_units,
                 "actual_quota_units": actual_quota_units,
                 "resolution_digest": resolution_digest,
+                "resolved_at_ms": resolved_at_ms,
             },
             boundary="terminal_update",
         )
