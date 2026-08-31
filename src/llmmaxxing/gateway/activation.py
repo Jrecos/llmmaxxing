@@ -22,17 +22,24 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError
 
 from llmmaxxing.core.canonical import bundle_hash, canonical_bundle_bytes, canonical_json_bytes
-from llmmaxxing.core.ids import AckId, AuthLeaseId, BundleHash, CommandId, GatewayBootId, InstallationId
+from llmmaxxing.core.ids import (
+    AckId,
+    AuthLeaseId,
+    BundleHash,
+    CommandId,
+    GatewayBootId,
+    InstallationId,
+)
 from llmmaxxing.core.models import AuthorizedLeg, ClientKeyRecord, PolicyBundleV1
 from llmmaxxing.core.wire import (
     ActivationEnvelope,
     AuthLeaseV1,
     BaseReference,
     BundleReference,
+    ChannelSealV1,
     ChannelSigner,
     ChannelTrustSet,
     ClearDenyCommandPayload,
-    ChannelSealV1,
     CommandChainGap,
     DenyCommandPayload,
     DenyOverlayV1,
@@ -49,13 +56,13 @@ from llmmaxxing.core.wire import (
     GatewayStatusV1,
     PrepareCommandPayload,
     ReadinessReason,
-    StatusCommandPayload,
     StaleFenceEpoch,
+    StatusCommandPayload,
     TakeoverState,
     VerifiedGatewayCommand,
     WireCommandKind,
-    seal_gateway_ack,
     seal_fence_receipt,
+    seal_gateway_ack,
     verify_fence_receipt,
     verify_gateway_command,
 )
@@ -297,15 +304,62 @@ class GatewayLocalState:
     def _create_schema(self) -> None:
         self.db.executescript(
             """
-            CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL,checksum TEXT NOT NULL) STRICT;
-            CREATE TABLE IF NOT EXISTS bundles(bundle_hash TEXT PRIMARY KEY,generation INTEGER NOT NULL,size INTEGER NOT NULL,checksum TEXT NOT NULL) STRICT;
-            CREATE TABLE IF NOT EXISTS pointers(name TEXT PRIMARY KEY,generation INTEGER NOT NULL,bundle_hash TEXT NOT NULL,checksum TEXT NOT NULL) STRICT;
-            CREATE TABLE IF NOT EXISTS commands(command_id TEXT PRIMARY KEY,digest TEXT NOT NULL,channel_epoch INTEGER NOT NULL,sequence INTEGER NOT NULL,ack_id TEXT NOT NULL,status TEXT NOT NULL,result_json TEXT NOT NULL,ack_json TEXT,checksum TEXT NOT NULL) STRICT;
-            CREATE UNIQUE INDEX IF NOT EXISTS commands_channel_sequence ON commands(channel_epoch,sequence);
-            CREATE TABLE IF NOT EXISTS channel_state(channel_epoch INTEGER PRIMARY KEY,sequence INTEGER NOT NULL,digest TEXT NOT NULL,checksum TEXT NOT NULL) STRICT;
-            CREATE TABLE IF NOT EXISTS denies(subject_type TEXT NOT NULL,subject_id TEXT NOT NULL,deny_epoch INTEGER NOT NULL,reason TEXT NOT NULL,floor_generation INTEGER,heartbeat_at_ms INTEGER NOT NULL,checksum TEXT NOT NULL,PRIMARY KEY(subject_type,subject_id)) STRICT;
-            CREATE TABLE IF NOT EXISTS auth_leases(lease_id TEXT PRIMARY KEY,lease_json TEXT NOT NULL,checksum TEXT NOT NULL) STRICT;
-            CREATE TABLE IF NOT EXISTS fence_receipts(receipt_digest TEXT PRIMARY KEY,receipt_json TEXT NOT NULL,checksum TEXT NOT NULL) STRICT;
+            CREATE TABLE IF NOT EXISTS meta(
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                checksum TEXT NOT NULL
+            ) STRICT;
+            CREATE TABLE IF NOT EXISTS bundles(
+                bundle_hash TEXT PRIMARY KEY,
+                generation INTEGER NOT NULL,
+                size INTEGER NOT NULL,
+                checksum TEXT NOT NULL
+            ) STRICT;
+            CREATE TABLE IF NOT EXISTS pointers(
+                name TEXT PRIMARY KEY,
+                generation INTEGER NOT NULL,
+                bundle_hash TEXT NOT NULL,
+                checksum TEXT NOT NULL
+            ) STRICT;
+            CREATE TABLE IF NOT EXISTS commands(
+                command_id TEXT PRIMARY KEY,
+                digest TEXT NOT NULL,
+                channel_epoch INTEGER NOT NULL,
+                sequence INTEGER NOT NULL,
+                ack_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                result_json TEXT NOT NULL,
+                ack_json TEXT,
+                checksum TEXT NOT NULL
+            ) STRICT;
+            CREATE UNIQUE INDEX IF NOT EXISTS commands_channel_sequence
+                ON commands(channel_epoch, sequence);
+            CREATE TABLE IF NOT EXISTS channel_state(
+                channel_epoch INTEGER PRIMARY KEY,
+                sequence INTEGER NOT NULL,
+                digest TEXT NOT NULL,
+                checksum TEXT NOT NULL
+            ) STRICT;
+            CREATE TABLE IF NOT EXISTS denies(
+                subject_type TEXT NOT NULL,
+                subject_id TEXT NOT NULL,
+                deny_epoch INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                floor_generation INTEGER,
+                heartbeat_at_ms INTEGER NOT NULL,
+                checksum TEXT NOT NULL,
+                PRIMARY KEY(subject_type, subject_id)
+            ) STRICT;
+            CREATE TABLE IF NOT EXISTS auth_leases(
+                lease_id TEXT PRIMARY KEY,
+                lease_json TEXT NOT NULL,
+                checksum TEXT NOT NULL
+            ) STRICT;
+            CREATE TABLE IF NOT EXISTS fence_receipts(
+                receipt_digest TEXT PRIMARY KEY,
+                receipt_json TEXT NOT NULL,
+                checksum TEXT NOT NULL
+            ) STRICT;
             """
         )
 
@@ -333,7 +387,9 @@ class GatewayLocalState:
     def _set_meta(self, key: str, value: str) -> None:
         checksum = _checksum("meta", {"key": key, "value": value})
         self.db.execute(
-            "INSERT INTO meta VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,checksum=excluded.checksum",
+            "INSERT INTO meta VALUES(?,?,?) "
+            "ON CONFLICT(key) DO UPDATE SET "
+            "value=excluded.value,checksum=excluded.checksum",
             (key, value, checksum),
         )
 
@@ -375,15 +431,24 @@ class GatewayLocalState:
             return
         record = self._pointer_record(name, ref)
         self.db.execute(
-            "INSERT INTO pointers VALUES(?,?,?,?) ON CONFLICT(name) DO UPDATE SET generation=excluded.generation,bundle_hash=excluded.bundle_hash,checksum=excluded.checksum",
+            "INSERT INTO pointers VALUES(?,?,?,?) "
+            "ON CONFLICT(name) DO UPDATE SET "
+            "generation=excluded.generation,bundle_hash=excluded.bundle_hash,"
+            "checksum=excluded.checksum",
             (name, ref.generation, str(ref.bundle_hash), _checksum("pointers", record)),
         )
 
-    def _read_pointer(self, name: str, *, base: bool = False) -> BundleReference | BaseReference | None:
+    def _read_pointer(
+        self, name: str, *, base: bool = False
+    ) -> BundleReference | BaseReference | None:
         row = self.db.execute("SELECT * FROM pointers WHERE name=?", (name,)).fetchone()
         if row is None:
             return None
-        record = {"name": name, "generation": int(row["generation"]), "bundle_hash": str(row["bundle_hash"])}
+        record = {
+            "name": name,
+            "generation": int(row["generation"]),
+            "bundle_hash": str(row["bundle_hash"]),
+        }
         if row["checksum"] != _checksum("pointers", record):
             raise ValueError("corrupt bundle pointer")
         if base:
@@ -449,7 +514,9 @@ class GatewayLocalState:
                 "subject_id": str(row["subject_id"]),
                 "deny_epoch": int(row["deny_epoch"]),
                 "reason": str(row["reason"]),
-                "floor_generation": None if row["floor_generation"] is None else int(row["floor_generation"]),
+                "floor_generation": None
+                if row["floor_generation"] is None
+                else int(row["floor_generation"]),
                 "heartbeat_at_ms": int(row["heartbeat_at_ms"]),
             }
             if row["checksum"] != _checksum("denies", record):
@@ -468,9 +535,12 @@ class GatewayLocalState:
     @staticmethod
     def _command_values(row: sqlite3.Row | Mapping[str, object]) -> dict[str, object]:
         return {
-            "command_id": str(row["command_id"]), "digest": str(row["digest"]),
-            "channel_epoch": int(cast(Any, row["channel_epoch"])), "sequence": int(cast(Any, row["sequence"])),
-            "ack_id": str(row["ack_id"]), "status": str(row["status"]),
+            "command_id": str(row["command_id"]),
+            "digest": str(row["digest"]),
+            "channel_epoch": int(cast(Any, row["channel_epoch"])),
+            "sequence": int(cast(Any, row["sequence"])),
+            "ack_id": str(row["ack_id"]),
+            "status": str(row["status"]),
             "result_json": str(row["result_json"]),
             "ack_json": None if row["ack_json"] is None else str(row["ack_json"]),
         }
@@ -482,10 +552,18 @@ class GatewayLocalState:
         result = json.loads(str(row["result_json"]))
         if not isinstance(result, dict):
             raise ValueError("invalid command result")
-        ack = None if row["ack_json"] is None else GatewayAckV1.model_validate(json.loads(str(row["ack_json"])))
+        ack = (
+            None
+            if row["ack_json"] is None
+            else GatewayAckV1.model_validate(json.loads(str(row["ack_json"])))
+        )
         return _CommandRecord(
-            CommandId(str(row["command_id"])), str(row["digest"]), AckId(str(row["ack_id"])),
-            GatewayAckStatus(str(row["status"])), cast(dict[str, JsonValue], result), ack,
+            CommandId(str(row["command_id"])),
+            str(row["digest"]),
+            AckId(str(row["ack_id"])),
+            GatewayAckStatus(str(row["status"])),
+            cast(dict[str, JsonValue], result),
+            ack,
         )
 
     def _quarantine_corrupt_commands(self) -> None:
@@ -497,7 +575,9 @@ class GatewayLocalState:
                 corrupt.append(str(row["command_id"]))
         if corrupt:
             with self.transaction():
-                self.db.executemany("DELETE FROM commands WHERE command_id=?", ((x,) for x in corrupt))
+                self.db.executemany(
+                    "DELETE FROM commands WHERE command_id=?", ((x,) for x in corrupt)
+                )
 
     def store_bundle(self, payload: bytes, expected: BundleHash) -> Path:
         if len(payload) > self.limits.max_bundle_bytes:
@@ -537,16 +617,24 @@ class GatewayLocalState:
         return bundle
 
     def validate_new_command(self, verified: VerifiedGatewayCommand) -> _CommandRecord | None:
-        row = self.db.execute("SELECT * FROM commands WHERE command_id=?", (str(verified.command.command_id),)).fetchone()
+        row = self.db.execute(
+            "SELECT * FROM commands WHERE command_id=?", (str(verified.command.command_id),)
+        ).fetchone()
         if row is not None:
             record = self._decode_command(row)
             if record.digest != verified.command_digest:
                 raise DuplicateCommand("command ID reused with different bytes")
             return record
-        state = self.db.execute("SELECT * FROM channel_state WHERE channel_epoch=?", (verified.command.channel_epoch,)).fetchone()
+        state = self.db.execute(
+            "SELECT * FROM channel_state WHERE channel_epoch=?", (verified.command.channel_epoch,)
+        ).fetchone()
         sequence, digest = 1, _ZERO_DIGEST
         if state is not None:
-            values = {"channel_epoch": verified.command.channel_epoch, "sequence": int(state["sequence"]), "digest": str(state["digest"])}
+            values = {
+                "channel_epoch": verified.command.channel_epoch,
+                "sequence": int(state["sequence"]),
+                "digest": str(state["digest"]),
+            }
             if state["checksum"] != _checksum("channel_state", values):
                 raise ValueError("corrupt command chain")
             sequence = int(cast(Any, values["sequence"])) + 1
@@ -577,31 +665,67 @@ class GatewayLocalState:
             self._record_pending(verified, ack_id, status, result)
 
     def _record_pending(
-        self, verified: VerifiedGatewayCommand, ack_id: AckId,
-        status: GatewayAckStatus, result: Mapping[str, JsonValue],
+        self,
+        verified: VerifiedGatewayCommand,
+        ack_id: AckId,
+        status: GatewayAckStatus,
+        result: Mapping[str, JsonValue],
     ) -> None:
         if self.validate_new_command(verified) is not None:
             raise DuplicateCommand("command already recorded")
         command = verified.command
         result_json = _canonical(dict(result))
         values = {
-            "command_id": str(command.command_id), "digest": verified.command_digest,
-            "channel_epoch": command.channel_epoch, "sequence": command.sequence,
-            "ack_id": str(ack_id), "status": status.value, "result_json": result_json, "ack_json": None,
+            "command_id": str(command.command_id),
+            "digest": verified.command_digest,
+            "channel_epoch": command.channel_epoch,
+            "sequence": command.sequence,
+            "ack_id": str(ack_id),
+            "status": status.value,
+            "result_json": result_json,
+            "ack_json": None,
         }
         self.db.execute(
             "INSERT INTO commands VALUES(?,?,?,?,?,?,?,NULL,?)",
-            (*tuple(values[key] for key in ("command_id", "digest", "channel_epoch", "sequence", "ack_id", "status", "result_json")), _checksum("commands", values)),
+            (
+                *tuple(
+                    values[key]
+                    for key in (
+                        "command_id",
+                        "digest",
+                        "channel_epoch",
+                        "sequence",
+                        "ack_id",
+                        "status",
+                        "result_json",
+                    )
+                ),
+                _checksum("commands", values),
+            ),
         )
-        chain = {"channel_epoch": command.channel_epoch, "sequence": command.sequence, "digest": verified.command_digest}
+        chain = {
+            "channel_epoch": command.channel_epoch,
+            "sequence": command.sequence,
+            "digest": verified.command_digest,
+        }
         self.db.execute(
-            "INSERT INTO channel_state VALUES(?,?,?,?) ON CONFLICT(channel_epoch) DO UPDATE SET sequence=excluded.sequence,digest=excluded.digest,checksum=excluded.checksum",
-            (command.channel_epoch, command.sequence, verified.command_digest, _checksum("channel_state", chain)),
+            "INSERT INTO channel_state VALUES(?,?,?,?) "
+            "ON CONFLICT(channel_epoch) DO UPDATE SET "
+            "sequence=excluded.sequence,digest=excluded.digest,"
+            "checksum=excluded.checksum",
+            (
+                command.channel_epoch,
+                command.sequence,
+                verified.command_digest,
+                _checksum("channel_state", chain),
+            ),
         )
 
     def push_ack(self, ack: GatewayAckV1) -> None:
         with self.transaction():
-            row = self.db.execute("SELECT * FROM commands WHERE command_id=?", (str(ack.command_id),)).fetchone()
+            row = self.db.execute(
+                "SELECT * FROM commands WHERE command_id=?", (str(ack.command_id),)
+            ).fetchone()
             if row is None:
                 raise ValueError("unknown command acknowledgement")
             record = self._decode_command(row)
@@ -622,7 +746,14 @@ class GatewayLocalState:
 
     @property
     def deny_floor_generation(self) -> int | None:
-        return max((x.deny_floor_generation for x in self._denies.values() if x.deny_floor_generation is not None), default=None)
+        return max(
+            (
+                x.deny_floor_generation
+                for x in self._denies.values()
+                if x.deny_floor_generation is not None
+            ),
+            default=None,
+        )
 
     def validate_prepare_reference(
         self,
@@ -648,15 +779,27 @@ class GatewayLocalState:
             raise ValueError("target generation must increase")
 
     def stage_prepare(
-        self, verified: VerifiedGatewayCommand, bundle: PolicyBundleV1,
-        ref: BundleReference, base: BaseReference | None,
-        *, ack_id: AckId, result: Mapping[str, JsonValue],
+        self,
+        verified: VerifiedGatewayCommand,
+        bundle: PolicyBundleV1,
+        ref: BundleReference,
+        base: BaseReference | None,
+        *,
+        ack_id: AckId,
+        result: Mapping[str, JsonValue],
     ) -> None:
         self.validate_prepare_reference(base, ref)
         self.crash("staged_before_commit")
         with self.transaction():
-            record = {"bundle_hash": str(ref.bundle_hash), "generation": ref.generation, "size": len(canonical_bundle_bytes(bundle))}
-            self.db.execute("INSERT OR IGNORE INTO bundles VALUES(?,?,?,?)", (*record.values(), _checksum("bundles", record)))
+            record = {
+                "bundle_hash": str(ref.bundle_hash),
+                "generation": ref.generation,
+                "size": len(canonical_bundle_bytes(bundle)),
+            }
+            self.db.execute(
+                "INSERT OR IGNORE INTO bundles VALUES(?,?,?,?)",
+                (*record.values(), _checksum("bundles", record)),
+            )
             self._put_pointer("staged", ref)
             self._put_pointer("base", base)
             self._record_pending(verified, ack_id, GatewayAckStatus.PREPARED, result)
@@ -668,19 +811,27 @@ class GatewayLocalState:
         try:
             os.fchmod(fd, 0o600)
             _write_all(fd, payload)
-            if inject: self.crash("active_pointer_after_write")
+            if inject:
+                self.crash("active_pointer_after_write")
             os.fsync(fd)
-            if inject: self.crash("active_pointer_after_fsync")
+            if inject:
+                self.crash("active_pointer_after_fsync")
         finally:
             os.close(fd)
         os.replace(name, self.pointer_path)
-        if inject: self.crash("active_pointer_after_rename")
+        if inject:
+            self.crash("active_pointer_after_rename")
         _fsync_dir(self.path)
-        if inject: self.crash("active_pointer_after_dir_fsync")
+        if inject:
+            self.crash("active_pointer_after_dir_fsync")
 
     def commit_staged(
-        self, verified: VerifiedGatewayCommand, target: BundleReference,
-        *, ack_id: AckId, result: Mapping[str, JsonValue],
+        self,
+        verified: VerifiedGatewayCommand,
+        target: BundleReference,
+        *,
+        ack_id: AckId,
+        result: Mapping[str, JsonValue],
     ) -> PolicyBundleV1:
         if self._staged != target:
             raise ValueError("commit target differs from staged bundle")
@@ -722,8 +873,12 @@ class GatewayLocalState:
             raise
 
     def issue_deny(
-        self, verified: VerifiedGatewayCommand, payload: DenyCommandPayload,
-        *, ack_id: AckId, result: Mapping[str, JsonValue],
+        self,
+        verified: VerifiedGatewayCommand,
+        payload: DenyCommandPayload,
+        *,
+        ack_id: AckId,
+        result: Mapping[str, JsonValue],
     ) -> None:
         key = (payload.subject_type, payload.subject_id)
         self._verify_deny_store()
@@ -733,14 +888,22 @@ class GatewayLocalState:
         now = self.clock.now_ms()
         overlay = DenyOverlayV1(**payload.model_dump(mode="python"), heartbeat_at_ms=now)
         record = {
-            "subject_type": overlay.subject_type.value, "subject_id": overlay.subject_id,
-            "deny_epoch": overlay.deny_epoch, "reason": overlay.reason.value,
-            "floor_generation": overlay.deny_floor_generation, "heartbeat_at_ms": now,
+            "subject_type": overlay.subject_type.value,
+            "subject_id": overlay.subject_id,
+            "deny_epoch": overlay.deny_epoch,
+            "reason": overlay.reason.value,
+            "floor_generation": overlay.deny_floor_generation,
+            "heartbeat_at_ms": now,
         }
         self.crash("deny_before_commit")
         with self.transaction():
             self.db.execute(
-                "INSERT INTO denies VALUES(?,?,?,?,?,?,?) ON CONFLICT(subject_type,subject_id) DO UPDATE SET deny_epoch=excluded.deny_epoch,reason=excluded.reason,floor_generation=excluded.floor_generation,heartbeat_at_ms=excluded.heartbeat_at_ms,checksum=excluded.checksum",
+                "INSERT INTO denies VALUES(?,?,?,?,?,?,?) "
+                "ON CONFLICT(subject_type,subject_id) DO UPDATE SET "
+                "deny_epoch=excluded.deny_epoch,reason=excluded.reason,"
+                "floor_generation=excluded.floor_generation,"
+                "heartbeat_at_ms=excluded.heartbeat_at_ms,"
+                "checksum=excluded.checksum",
                 (*record.values(), _checksum("denies", record)),
             )
             self._set_meta("deny_heartbeat_ms", str(now))
@@ -749,8 +912,12 @@ class GatewayLocalState:
         self.crash("deny_after_commit")
 
     def clear_deny(
-        self, verified: VerifiedGatewayCommand, payload: ClearDenyCommandPayload,
-        *, ack_id: AckId, result: Mapping[str, JsonValue],
+        self,
+        verified: VerifiedGatewayCommand,
+        payload: ClearDenyCommandPayload,
+        *,
+        ack_id: AckId,
+        result: Mapping[str, JsonValue],
     ) -> None:
         key = (payload.subject_type, payload.subject_id)
         self._verify_deny_store()
@@ -759,7 +926,10 @@ class GatewayLocalState:
             raise ValueError("clear-deny requires exact current epoch")
         now = self.clock.now_ms()
         with self.transaction():
-            self.db.execute("DELETE FROM denies WHERE subject_type=? AND subject_id=?", (payload.subject_type.value, payload.subject_id))
+            self.db.execute(
+                "DELETE FROM denies WHERE subject_type=? AND subject_id=?",
+                (payload.subject_type.value, payload.subject_id),
+            )
             self._set_meta("deny_heartbeat_ms", str(now))
             self._record_pending(verified, ack_id, GatewayAckStatus.DENY_CLEARED, result)
         del self._denies[key]
@@ -805,7 +975,11 @@ class GatewayLocalState:
 
     @property
     def deny_all(self) -> bool:
-        return self._recovery_required or self._takeover_state is TakeoverState.FENCED_OLD or not self._heartbeat_fresh(self.clock.now_ms())
+        return (
+            self._recovery_required
+            or self._takeover_state is TakeoverState.FENCED_OLD
+            or not self._heartbeat_fresh(self.clock.now_ms())
+        )
 
     def permits(self, leg: AuthorizedLeg, route_group_id: object | None = None) -> bool:
         if route_group_id is None and self._active_bundle is not None:
@@ -834,12 +1008,18 @@ class GatewayLocalState:
         if self._active is None or self.deny_all:
             raise RuntimeError("healthy active state is required for auth lease")
         lease = AuthLeaseV1(
-            lease_id=AuthLeaseId.new(), installation_id=self.installation_id,
-            security_epoch=self.security_epoch, bundle=self._active,
-            issued_at_ms=now, expires_at_ms=now + _AUTH_LEASE_MS,
+            lease_id=AuthLeaseId.new(),
+            installation_id=self.installation_id,
+            security_epoch=self.security_epoch,
+            bundle=self._active,
+            issued_at_ms=now,
+            expires_at_ms=now + _AUTH_LEASE_MS,
         )
         document = lease.model_dump(mode="json")
-        self.db.execute("INSERT INTO auth_leases VALUES(?,?,?)", (str(lease.lease_id), _canonical(document), _checksum("auth_leases", document)))
+        self.db.execute(
+            "INSERT INTO auth_leases VALUES(?,?,?)",
+            (str(lease.lease_id), _canonical(document), _checksum("auth_leases", document)),
+        )
         return lease
 
     def _current_lease(self, now: int) -> AuthLeaseV1 | None:
@@ -848,17 +1028,26 @@ class GatewayLocalState:
         for row in self.db.execute("SELECT * FROM auth_leases ORDER BY rowid DESC"):
             try:
                 raw = json.loads(str(row["lease_json"]))
-                if row["checksum"] != _checksum("auth_leases", raw): continue
+                if row["checksum"] != _checksum("auth_leases", raw):
+                    continue
                 lease = AuthLeaseV1.model_validate(raw)
             except (ValueError, ValidationError):
                 continue
-            if lease.bundle == self._active and lease.security_epoch == self.security_epoch and lease.issued_at_ms <= now < lease.expires_at_ms:
+            if (
+                lease.bundle == self._active
+                and lease.security_epoch == self.security_epoch
+                and lease.issued_at_ms <= now < lease.expires_at_ms
+            ):
                 return lease
         return None
 
     def record_status(
-        self, verified: VerifiedGatewayCommand, *, ack_id: AckId,
-        issue_lease: bool, result_factory: Callable[[AuthLeaseV1 | None], Mapping[str, JsonValue]],
+        self,
+        verified: VerifiedGatewayCommand,
+        *,
+        ack_id: AckId,
+        issue_lease: bool,
+        result_factory: Callable[[AuthLeaseV1 | None], Mapping[str, JsonValue]],
     ) -> None:
         with self.transaction():
             lease = self.issue_auth_lease(self.clock.now_ms()) if issue_lease else None
@@ -869,9 +1058,13 @@ class GatewayLocalState:
             raise RuntimeError("no verified active auth state")
         keys = {record.key_id: record for record in self._active_bundle.keys}
         return _AuthView(
-            MappingProxyType(keys), self._active.generation, self._active.bundle_hash,
-            frozenset(keys) if self.deny_all else frozenset(), self.accepted_peppers,
-            MappingProxyType(build_legacy_key_index(self._active_bundle.keys)), self.clock.now_ms() // 1000,
+            MappingProxyType(keys),
+            self._active.generation,
+            self._active.bundle_hash,
+            frozenset(keys) if self.deny_all else frozenset(),
+            self.accepted_peppers,
+            MappingProxyType(build_legacy_key_index(self._active_bundle.keys)),
+            self.clock.now_ms() // 1000,
         )
 
     def status(
@@ -891,38 +1084,59 @@ class GatewayLocalState:
             )
 
     def _status_unlocked(
-        self, *, singleton_held: bool, backend_ready: bool, capacities_ready: bool,
+        self,
+        *,
+        singleton_held: bool,
+        backend_ready: bool,
+        capacities_ready: bool,
         now_ms: int | None = None,
     ) -> GatewayStatusV1:
         now = self.clock.now_ms() if now_ms is None else now_ms
         fresh = self._heartbeat_fresh(now) and not self._recovery_required
         lease = self._current_lease(now)
         reasons: list[ReadinessReason] = []
-        if not singleton_held: reasons.append(ReadinessReason.SINGLETON)
-        if self._recovery_required: reasons.append(ReadinessReason.RECOVERY)
-        elif self._takeover_state is TakeoverState.FENCED_OLD: reasons.append(ReadinessReason.FENCED)
-        elif self._active is None: reasons.append(ReadinessReason.NO_ACTIVE)
-        if not fresh: reasons.append(ReadinessReason.DENY_STALE)
-        if lease is None: reasons.append(ReadinessReason.AUTH_LEASE)
-        if not backend_ready: reasons.append(ReadinessReason.BACKEND)
-        if not capacities_ready: reasons.append(ReadinessReason.CAPACITIES)
+        if not singleton_held:
+            reasons.append(ReadinessReason.SINGLETON)
+        if self._recovery_required:
+            reasons.append(ReadinessReason.RECOVERY)
+        elif self._takeover_state is TakeoverState.FENCED_OLD:
+            reasons.append(ReadinessReason.FENCED)
+        elif self._active is None:
+            reasons.append(ReadinessReason.NO_ACTIVE)
+        if not fresh:
+            reasons.append(ReadinessReason.DENY_STALE)
+        if lease is None:
+            reasons.append(ReadinessReason.AUTH_LEASE)
+        if not backend_ready:
+            reasons.append(ReadinessReason.BACKEND)
+        if not capacities_ready:
+            reasons.append(ReadinessReason.CAPACITIES)
         return GatewayStatusV1(
-            installation_id=self.installation_id, channel_epoch=self.channel_epoch,
-            security_epoch=self.security_epoch, boot_id=self.boot_id,
-            singleton_held=singleton_held, lifecycle=self.lifecycle,
-            active=self._active, staged=self._staged, previous=self._previous, base=self._base,
-            deny_overlay=tuple(sorted(self._denies.values(), key=lambda x: (x.subject_type.value, x.subject_id))),
-            deny_floor_generation=self.deny_floor_generation, deny_heartbeat_fresh=fresh,
-            auth_lease=lease, dispatcher_fence=self._fence_epoch, takeover_state=self._takeover_state,
+            installation_id=self.installation_id,
+            channel_epoch=self.channel_epoch,
+            security_epoch=self.security_epoch,
+            boot_id=self.boot_id,
+            singleton_held=singleton_held,
+            lifecycle=self.lifecycle,
+            active=self._active,
+            staged=self._staged,
+            previous=self._previous,
+            base=self._base,
+            deny_overlay=tuple(
+                sorted(self._denies.values(), key=lambda x: (x.subject_type.value, x.subject_id))
+            ),
+            deny_floor_generation=self.deny_floor_generation,
+            deny_heartbeat_fresh=fresh,
+            auth_lease=lease,
+            dispatcher_fence=self._fence_epoch,
+            takeover_state=self._takeover_state,
             readiness=GatewayReadiness.READY if not reasons else GatewayReadiness.UNREADY,
             unready_reasons=tuple(reasons),
         )
 
     @staticmethod
     def _receipt_digest(receipt: FenceReceiptV1) -> str:
-        return hashlib.sha256(
-            canonical_json_bytes(receipt.model_dump(mode="json"))
-        ).hexdigest()
+        return hashlib.sha256(canonical_json_bytes(receipt.model_dump(mode="json"))).hexdigest()
 
     def _store_receipt(self, receipt: FenceReceiptV1) -> None:
         document = receipt.model_dump(mode="json")
@@ -986,14 +1200,21 @@ class GatewayLocalState:
     def _export_state_unlocked(self) -> dict[str, JsonValue]:
         def dump(ref: BaseModel | None) -> JsonValue:
             return None if ref is None else cast(JsonValue, ref.model_dump(mode="json"))
+
         return {
-            "schema_version": _SCHEMA_VERSION, "installation_id": str(self.installation_id),
-            "channel_epoch": self.channel_epoch, "security_epoch": self.security_epoch,
-            "dispatcher_fence": self._fence_epoch, "takeover_state": self._takeover_state.value,
-            "active": dump(self._active), "staged": dump(self._staged),
-            "previous": dump(self._previous), "base": dump(self._base),
+            "schema_version": _SCHEMA_VERSION,
+            "installation_id": str(self.installation_id),
+            "channel_epoch": self.channel_epoch,
+            "security_epoch": self.security_epoch,
+            "dispatcher_fence": self._fence_epoch,
+            "takeover_state": self._takeover_state.value,
+            "active": dump(self._active),
+            "staged": dump(self._staged),
+            "previous": dump(self._previous),
+            "base": dump(self._base),
             "denies": cast(JsonValue, [x.model_dump(mode="json") for x in self._denies.values()]),
-            "deny_heartbeat_ms": self._deny_heartbeat_ms, "command_count": self.command_count,
+            "deny_heartbeat_ms": self._deny_heartbeat_ms,
+            "command_count": self.command_count,
             "recovery_required": self._recovery_required,
         }
 
@@ -1002,24 +1223,32 @@ class GatewayLocalState:
         _fsync_dir(self.path)
 
     def gc_bundles(self) -> None:
-        retained = {x.bundle_hash for x in (self._active, self._staged, self._previous) if x is not None}
+        retained = {
+            x.bundle_hash for x in (self._active, self._staged, self._previous) if x is not None
+        }
         floor = self.deny_floor_generation
         if floor is not None:
-            retained.update(BundleHash(str(x[0])) for x in self.db.execute("SELECT bundle_hash FROM bundles WHERE generation=?", (floor,)))
+            retained.update(
+                BundleHash(str(x[0]))
+                for x in self.db.execute(
+                    "SELECT bundle_hash FROM bundles WHERE generation=?", (floor,)
+                )
+            )
         for path in self.bundles_path.glob("bh_*.json"):
             with contextlib.suppress(ValueError):
-                if BundleHash(path.stem) not in retained: path.unlink()
+                if BundleHash(path.stem) not in retained:
+                    path.unlink()
         _fsync_dir(self.bundles_path)
 
     def close(self) -> None:
-        if self._closed: return
+        if self._closed:
+            return
         self._closed = True
         if self._conn is not None:
-            with contextlib.suppress(sqlite3.DatabaseError): self.checkpoint()
+            with contextlib.suppress(sqlite3.DatabaseError):
+                self.checkpoint()
             self._conn.close()
             self._conn = None
-
-
 
 
 class TakeoverCoordinator:
@@ -1103,16 +1332,24 @@ class ActivationGenerationGate:
             leg,
             backend_manifest_hash,
         )
+
+
 class ActivationService:
     """Auth-first executor; bundle parsing happens only after command authentication."""
 
     def __init__(
-        self, *, state: GatewayLocalState,
+        self,
+        *,
+        state: GatewayLocalState,
         policy_keys: Mapping[int, Mapping[str, Ed25519PublicKey]],
-        channel_trust: ChannelTrustSet, ack_signer: ChannelSigner,
-        generation_gate: GenerationOperationalGate, backend_manifest_hash: str,
-        dispatcher_gate: DispatcherGate, apply_bundle: Callable[[PolicyBundleV1], None],
-        clock: Clock | None = None, limits: BundleLimits | None = None,
+        channel_trust: ChannelTrustSet,
+        ack_signer: ChannelSigner,
+        generation_gate: GenerationOperationalGate,
+        backend_manifest_hash: str,
+        dispatcher_gate: DispatcherGate,
+        apply_bundle: Callable[[PolicyBundleV1], None],
+        clock: Clock | None = None,
+        limits: BundleLimits | None = None,
         readiness_probe: Callable[[], tuple[bool, bool, bool]] | None = None,
     ) -> None:
         if not policy_keys or not channel_trust.channel_epochs:
@@ -1130,8 +1367,11 @@ class ActivationService:
 
     def _verify(self, command: GatewayCommandV1) -> VerifiedGatewayCommand:
         return verify_gateway_command(
-            command, self.policy_keys, self.channel_trust,
-            expected_boot_id=self.state.boot_id, expected_fence_epoch=self.state.fence_epoch,
+            command,
+            self.policy_keys,
+            self.channel_trust,
+            expected_boot_id=self.state.boot_id,
+            expected_fence_epoch=self.state.fence_epoch,
         )
 
     def _assert_current_fence(self, verified: VerifiedGatewayCommand) -> None:
@@ -1139,7 +1379,9 @@ class ActivationService:
             raise StaleFenceEpoch("command dispatcher fence changed while waiting")
 
     @staticmethod
-    def _policy_matches(policy: ActivationEnvelope | None, base: BaseReference | None, target: BundleReference) -> None:
+    def _policy_matches(
+        policy: ActivationEnvelope | None, base: BaseReference | None, target: BundleReference
+    ) -> None:
         if policy is None or policy.base != base or policy.target != target:
             raise ValueError("signed policy does not bind exact base/target")
 
@@ -1148,24 +1390,37 @@ class ActivationService:
             raise ValueError("bundle size exceeds the configured limit")
         if bundle_hash(raw) != target.bundle_hash:
             raise ValueError("bundle hash differs from target")
-        try: bundle = PolicyBundleV1.model_validate(json.loads(raw))
-        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error: raise ValueError("bundle schema is invalid") from error
-        if canonical_bundle_bytes(bundle) != raw: raise ValueError("bundle is not canonical JSON")
-        if bundle.generation != target.generation: raise ValueError("bundle generation differs")
-        if bundle.backend_manifest_hash != self.backend_manifest_hash: raise ValueError("backend manifest differs")
+        try:
+            bundle = PolicyBundleV1.model_validate(json.loads(raw))
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+            raise ValueError("bundle schema is invalid") from error
+        if canonical_bundle_bytes(bundle) != raw:
+            raise ValueError("bundle is not canonical JSON")
+        if bundle.generation != target.generation:
+            raise ValueError("bundle generation differs")
+        if bundle.backend_manifest_hash != self.backend_manifest_hash:
+            raise ValueError("backend manifest differs")
         counts = (
-            (len(bundle.keys), self.limits.max_keys), (len(bundle.policies), self.limits.max_policies),
-            (len(bundle.accounts), self.limits.max_accounts), (len(bundle.route_groups), self.limits.max_route_groups),
+            (len(bundle.keys), self.limits.max_keys),
+            (len(bundle.policies), self.limits.max_policies),
+            (len(bundle.accounts), self.limits.max_accounts),
+            (len(bundle.route_groups), self.limits.max_route_groups),
             (sum(len(x.legs) for x in bundle.route_groups), self.limits.max_legs),
             (sum(len(x.authorized_legs) for x in bundle.policies), self.limits.max_authorized_legs),
         )
-        if any(actual > maximum for actual, maximum in counts): raise ValueError("bundle object count exceeds limit")
-        if any(not self.generation_gate.permits(leg, bundle.backend_manifest_hash) for policy in bundle.policies for leg in policy.authorized_legs):
+        if any(actual > maximum for actual, maximum in counts):
+            raise ValueError("bundle object count exceeds limit")
+        if any(
+            not self.generation_gate.permits(leg, bundle.backend_manifest_hash)
+            for policy in bundle.policies
+            for leg in policy.authorized_legs
+        ):
             raise ValueError("bundle deployment generation is not operational")
         return bundle
 
     def _ack(self, verified: VerifiedGatewayCommand, record: _CommandRecord) -> GatewayAckV1:
-        if record.ack is not None: return record.ack
+        if record.ack is not None:
+            return record.ack
         command = verified.command
         unsigned = GatewayAckV1(
             ack_id=record.ack_id,
@@ -1215,11 +1470,19 @@ class ActivationService:
     async def _prepare(self, verified: VerifiedGatewayCommand) -> None:
         payload = PrepareCommandPayload.model_validate(verified.command.payload)
         raw = payload.bundle_bytes()
-        async with self._validation_slots: bundle = await asyncio.to_thread(self._validate_bundle, raw, payload.target)
+        async with self._validation_slots:
+            bundle = await asyncio.to_thread(self._validate_bundle, raw, payload.target)
         self._policy_matches(verified.policy, payload.base, payload.target)
         self.state.validate_prepare_reference(payload.base, payload.target)
         self.state.store_bundle(raw, payload.target.bundle_hash)
-        self.state.stage_prepare(verified, bundle, payload.target, payload.base, ack_id=AckId.new(), result={"target": payload.target.model_dump(mode="json")})
+        self.state.stage_prepare(
+            verified,
+            bundle,
+            payload.target,
+            payload.base,
+            ack_id=AckId.new(),
+            result={"target": payload.target.model_dump(mode="json")},
+        )
 
     async def _commit(self, verified: VerifiedGatewayCommand) -> GatewayAckV1:
         target = BundleReference.model_validate(verified.command.payload)
@@ -1240,7 +1503,11 @@ class ActivationService:
             return self._ack(verified, recorded)
 
     def _active_policy(self, policy: ActivationEnvelope | None) -> None:
-        if self.state.active_reference is None or policy is None or policy.target != self.state.active_reference:
+        if (
+            self.state.active_reference is None
+            or policy is None
+            or policy.target != self.state.active_reference
+        ):
             raise ValueError("signed policy does not bind active bundle")
 
     async def _deny(self, verified: VerifiedGatewayCommand) -> GatewayAckV1:
@@ -1277,7 +1544,19 @@ class ActivationService:
         payload = StatusCommandPayload.model_validate(verified.command.payload)
         self.state.renew_deny_heartbeats(self.clock.now_ms())
         singleton, backend, capacities = self._readiness()
+
         def result(_lease: AuthLeaseV1 | None) -> Mapping[str, JsonValue]:
-            status = self.state.status(singleton_held=singleton, backend_ready=backend, capacities_ready=capacities, now_ms=self.clock.now_ms())
+            status = self.state.status(
+                singleton_held=singleton,
+                backend_ready=backend,
+                capacities_ready=capacities,
+                now_ms=self.clock.now_ms(),
+            )
             return {"status": status.model_dump(mode="json")}
-        self.state.record_status(verified, ack_id=AckId.new(), issue_lease=payload.issue_auth_lease, result_factory=result)
+
+        self.state.record_status(
+            verified,
+            ack_id=AckId.new(),
+            issue_lease=payload.issue_auth_lease,
+            result_factory=result,
+        )

@@ -8,7 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from opentelemetry.sdk.trace.export import SpanExportResult, SpanExporter
+from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult
 from pydantic import ValidationError
 
 from llmmaxxing.core.ids import (
@@ -394,7 +394,9 @@ def test_replay_is_at_least_once_deduped_and_ack_is_strict(tmp_path: Path) -> No
 
     segments = writer.segment_manifests
     assert len(segments) >= 2
-    first_boundary = next(record.cursor for record in original if record.segment == segments[0].index)
+    first_boundary = next(
+        record.cursor for record in original if record.segment == segments[0].index
+    )
     first_boundary = AckCursor(first_boundary.segment, segments[0].last_sequence)
     first_path = tmp_path / segments[0].name
     writer.ack(first_boundary)
@@ -460,6 +462,7 @@ def test_complete_corruption_fails_closed_instead_of_becoming_a_gap(tmp_path: Pa
     segment.write_bytes(content.replace(b"request_admitted", b"request_admitteX", 1))
     with pytest.raises(SpoolCorruptionError):
         LifecycleSpool.open(tmp_path, max_bytes=512 * 4096)
+
 
 def test_writer_failure_stops_admission_but_records_one_live_terminal(tmp_path: Path) -> None:
     def fail(boundary: str) -> None:
@@ -611,7 +614,8 @@ def test_otel_queue_is_bounded_drop_oldest_and_metadata_only() -> None:
     otel.shutdown()
 
     serialized = " ".join(
-        f"{span.name} {dict(span.attributes or {})}" for span in exported  # type: ignore[attr-defined]
+        f"{span.name} {dict(span.attributes or {})}"
+        for span in exported  # type: ignore[attr-defined]
     ).lower()
     for banned in ("prompt", "body", "tool_argument", "credential", "model_alias", "client_ip"):
         assert banned not in serialized

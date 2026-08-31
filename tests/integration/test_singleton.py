@@ -4,7 +4,6 @@ import asyncio
 import json
 import multiprocessing
 import os
-import socket
 import stat
 from pathlib import Path
 from typing import Any
@@ -20,20 +19,16 @@ from integration.test_activation import (
 from llmmaxxing.core.canonical import canonical_json_bytes
 from llmmaxxing.core.ids import GatewayBootId, InstallationId
 from llmmaxxing.core.wire import (
-    ChannelSealV1,
     ChannelSigner,
     ChannelTrustSet,
     ClearDenyCommandPayload,
     DenyCommandPayload,
     DenyReason,
     DenySubjectType,
-    FenceReceiptPayloadV1,
-    FenceReceiptV1,
     GatewayReadiness,
     StatusCommandPayload,
     TakeoverState,
     WireCommandKind,
-    seal_fence_receipt,
 )
 from llmmaxxing.gateway.activation import GatewayLocalState, TakeoverCoordinator
 from llmmaxxing.gateway.emergency import EmergencyServer, GatewayRuntime, GatewaySingleton
@@ -215,12 +210,15 @@ async def test_takeover_requires_signed_old_backend_fence_and_advances_once(tmp_
         fenced_at_ms=old.clock.now_ms(),
     )
     assert old.state.lifecycle.value == "fenced_old"
-    assert not old.state.status(
-        singleton_held=True,
-        backend_ready=True,
-        capacities_ready=True,
-        now_ms=old.clock.now_ms(),
-    ).readiness is GatewayReadiness.READY
+    assert (
+        old.state.status(
+            singleton_held=True,
+            backend_ready=True,
+            capacities_ready=True,
+            now_ms=old.clock.now_ms(),
+        ).readiness
+        is not GatewayReadiness.READY
+    )
 
     receiver = TakeoverCoordinator(
         new.state,
@@ -260,9 +258,9 @@ async def test_takeover_crash_after_receipt_is_fenced_old_until_same_receipt_res
         network_digest="d" * 64,
         fenced_at_ms=old.clock.now_ms(),
     )
-    new.state._crash = lambda point: (_ for _ in ()).throw(
-        RuntimeError(point)
-    ) if point == "takeover_after_receipt" else None
+    new.state._crash = lambda point: (
+        (_ for _ in ()).throw(RuntimeError(point)) if point == "takeover_after_receipt" else None
+    )
     with pytest.raises(RuntimeError, match="takeover_after_receipt"):
         await TakeoverCoordinator(
             new.state,

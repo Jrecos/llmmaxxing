@@ -234,9 +234,7 @@ class LifecycleReservation:
                     reason=reason,
                     spill_from_account_id=spill_from,
                     uncertain=uncertain,
-                    timings_ms=LifecycleTimingsV1(
-                        duration_ms=max(0, now - attempt.started_at_ms)
-                    ),
+                    timings_ms=LifecycleTimingsV1(duration_ms=max(0, now - attempt.started_at_ms)),
                     final_byte_at_ms=(now if outcome is TerminalOutcome.COMPLETED else None),
                     lease_released_at_ms=now,
                 )
@@ -272,9 +270,7 @@ class LifecycleReservation:
                     route_group_id=route_group_id,
                     outcome=outcome,
                     reason=LifecycleReason.from_outcome(outcome),
-                    timings_ms=LifecycleTimingsV1(
-                        duration_ms=max(0, now - self.admitted_at_ms)
-                    ),
+                    timings_ms=LifecycleTimingsV1(duration_ms=max(0, now - self.admitted_at_ms)),
                     attempts_used=len(self._state.attempts),
                 ),
                 terminal=True,

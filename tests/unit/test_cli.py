@@ -7,9 +7,7 @@ from typing import Any
 import pytest
 
 import llmmaxxing.cli.main as cli
-from llmmaxxing.cli.main import GatewayLaunch
-
-from llmmaxxing.cli.main import build_parser
+from llmmaxxing.cli.main import GatewayLaunch, build_parser
 
 
 def test_cli_has_two_daemons():
@@ -47,17 +45,20 @@ def test_gateway_launches_created_app_with_one_uvicorn_worker(
     monkeypatch.setattr(cli.uvicorn, "Config", Config)
     monkeypatch.setattr(cli.uvicorn, "Server", Server)
 
-    assert cli.main(
-        [
-            "gateway",
-            "--factory",
-            "gateway_fixture:build",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            "4400",
-        ]
-    ) == 0
+    assert (
+        cli.main(
+            [
+                "gateway",
+                "--factory",
+                "gateway_fixture:build",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "4400",
+            ]
+        )
+        == 0
+    )
     assert observed["app"] is runtime
     assert observed["workers"] == 1
     assert observed["reload"] is False

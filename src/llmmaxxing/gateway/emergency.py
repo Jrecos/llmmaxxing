@@ -14,6 +14,8 @@ import struct
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any, Protocol
+
+from llmmaxxing.core.canonical import canonical_json_bytes
 from llmmaxxing.core.wire import (
     GatewayCommandV1,
     GatewayReadiness,
@@ -21,7 +23,6 @@ from llmmaxxing.core.wire import (
     StatusCommandPayload,
     WireCommandKind,
 )
-from llmmaxxing.core.canonical import canonical_json_bytes
 from llmmaxxing.gateway.activation import ActivationService, GatewayLocalState
 
 

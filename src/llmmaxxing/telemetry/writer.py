@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -74,7 +75,9 @@ class SpoolSizing:
                 f"configured spool is {configured_bytes} bytes; requires {self.minimum_bytes}"
             )
         if physical_bytes < self.minimum_bytes:
-            raise ValueError(f"physical spool is {physical_bytes} bytes; requires {self.minimum_bytes}")
+            raise ValueError(
+                f"physical spool is {physical_bytes} bytes; requires {self.minimum_bytes}"
+            )
         if configured_bytes > physical_bytes:
             raise ValueError("configured spool exceeds the physical spool volume")
 
@@ -303,9 +306,10 @@ class LifecycleSpool:
     @property
     def protected_bytes(self) -> int:
         with self._lock:
-            return self._physical_bytes + (
-                self._outstanding_slots + self._queued_slots
-            ) * MAX_EVENT_BYTES
+            return (
+                self._physical_bytes
+                + (self._outstanding_slots + self._queued_slots) * MAX_EVENT_BYTES
+            )
 
     @property
     def backlog_bytes(self) -> int:
@@ -778,10 +782,8 @@ class LifecycleSpool:
         fd = self._segment_fd
         self._segment_fd = None
         if fd is not None:
-            try:
+            with contextlib.suppress(OSError):
                 os.close(fd)
-            except OSError:
-                pass
 
     def _sync(self, *, force: bool) -> None:
         fd = self._segment_fd
@@ -885,9 +887,10 @@ class LifecycleSpool:
         if not isinstance(document, dict):
             raise SpoolCorruptionError("spool record is not an object")
         digest = document.pop("digest", None)
-        if not isinstance(digest, str) or digest != hashlib.sha256(
-            _RECORD_DOMAIN + canonical_json_bytes(document)
-        ).hexdigest():
+        if (
+            not isinstance(digest, str)
+            or digest != hashlib.sha256(_RECORD_DOMAIN + canonical_json_bytes(document)).hexdigest()
+        ):
             raise SpoolCorruptionError("spool digest mismatch")
         previous = document.get("previous_digest")
         sequence = document.get("sequence")
@@ -1026,9 +1029,12 @@ class LifecycleSpool:
 
     def _write_fatal(self, reason: str) -> None:
         try:
-            line = canonical_json_bytes(
-                {"kind": "writer_fatal", "occurred_at_ms": self._clock_ms(), "reason": reason}
-            ) + b"\n"
+            line = (
+                canonical_json_bytes(
+                    {"kind": "writer_fatal", "occurred_at_ms": self._clock_ms(), "reason": reason}
+                )
+                + b"\n"
+            )
             fd = os.open(self.root / _FATAL, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
             try:
                 self._write_all(fd, line)

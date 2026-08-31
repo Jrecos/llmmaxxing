@@ -51,7 +51,9 @@ class TelemetryMetrics:
         self.max_series = max_series
         self.max_scrape_bytes = max_scrape_bytes
         self._accounts = frozenset(sorted({str(value) for value in account_ids})[:MAX_ACCOUNTS])
-        self._routes = frozenset(sorted({str(value) for value in route_group_ids})[:MAX_ROUTE_GROUPS])
+        self._routes = frozenset(
+            sorted({str(value) for value in route_group_ids})[:MAX_ROUTE_GROUPS]
+        )
         self._tiers = frozenset(str(value) for value in tiers)
         self._outcomes = frozenset(value.value for value in TerminalOutcome)
         self._triggers = frozenset(value.value for value in RouteTrigger)
@@ -296,9 +298,13 @@ class TelemetryMetrics:
     def set_reservations(self, value: int) -> None:
         self._reserved_bytes.set(max(0, value))
 
-    def set_spool(self, physical_bytes: int, protected_bytes: int, max_bytes: int, segments: int) -> None:
+    def set_spool(
+        self, physical_bytes: int, protected_bytes: int, max_bytes: int, segments: int
+    ) -> None:
         self._spool_bytes.set(max(0, physical_bytes))
-        self._spool_ratio.set(0 if max_bytes <= 0 else min(1.0, max(0, protected_bytes) / max_bytes))
+        self._spool_ratio.set(
+            0 if max_bytes <= 0 else min(1.0, max(0, protected_bytes) / max_bytes)
+        )
         self._spool_segments.set(max(0, segments))
 
     def writer_batch(self, records: int) -> None:

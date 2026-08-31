@@ -4,8 +4,8 @@ import asyncio
 import base64
 import sqlite3
 from dataclasses import dataclass, field
-from pathlib import Path
 from functools import wraps
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -47,7 +47,7 @@ from llmmaxxing.gateway.activation import (
     GatewayLocalState,
 )
 from llmmaxxing.gateway.journal import InjectedCrash
-from support.gateway_stack import ACCOUNT_ID, GROUP_ID, LEG_ID, PEPPER, PEPPER_VERSION, make_bundle
+from support.gateway_stack import ACCOUNT_ID, GROUP_ID, PEPPER, PEPPER_VERSION, make_bundle
 
 ZERO_DIGEST = "0" * 64
 NOW_MS = 1_800_000_000_000
@@ -148,9 +148,7 @@ def signed_policy(
         signer_key_id="policy-primary",
         base_generation=0 if base is None else base.generation,
         base_bundle_hash=(
-            GENESIS_BASE_BUNDLE_HASH
-            if base is None
-            else bundle_hash(canonical_bundle_bytes(base))
+            GENESIS_BASE_BUNDLE_HASH if base is None else bundle_hash(canonical_bundle_bytes(base))
         ),
         target_generation=target.generation,
         target_content_hash=bundle_hash(canonical_bundle_bytes(target)),
@@ -333,9 +331,7 @@ async def test_command_auth_chain_and_dedupe_fail_before_any_new_durable_write(
         policy=policy,
     )
     invalid = command.model_copy(
-        update={
-            "channel_seal": command.channel_seal.model_copy(update={"signature": "f" * 128})
-        }
+        update={"channel_seal": command.channel_seal.model_copy(update={"signature": "f" * 128})}
     )
     before = harness.state.export_state()
     with pytest.raises(Exception, match="signature"):
@@ -345,19 +341,22 @@ async def test_command_auth_chain_and_dedupe_fail_before_any_new_durable_write(
     first_ack = await harness.execute(command)
     command_count = harness.state.command_count
     assert await harness.service.execute(command) == first_ack
-    assert verify_gateway_ack(
-        first_ack,
-        ChannelTrustSet(
-            installation_id=harness.installation_id,
-            security_epoch=3,
-            channel_epochs={
-                1: {
-                    6: {"gateway-channel": harness.channel_key.public_key()},
-                }
-            },
-        ),
-        command=command,
-    ) == first_ack
+    assert (
+        verify_gateway_ack(
+            first_ack,
+            ChannelTrustSet(
+                installation_id=harness.installation_id,
+                security_epoch=3,
+                channel_epochs={
+                    1: {
+                        6: {"gateway-channel": harness.channel_key.public_key()},
+                    }
+                },
+            ),
+            command=command,
+        )
+        == first_ack
+    )
     assert harness.state.command_count == command_count
 
     reordered = harness.command(
@@ -446,9 +445,7 @@ async def test_prepare_rejects_noncanonical_manifest_gate_and_resource_overflow_
         channel_trust=ChannelTrustSet(
             installation_id=harness.installation_id,
             security_epoch=3,
-            channel_epochs={
-                1: {5: {"control-channel": harness.channel_key.public_key()}}
-            },
+            channel_epochs={1: {5: {"control-channel": harness.channel_key.public_key()}}},
         ),
         ack_signer=ChannelSigner("gateway-channel", 6, harness.channel_key),
         generation_gate=GenerationGate(),
@@ -787,10 +784,8 @@ async def test_genesis_commit_failpoints_are_absent_or_one_real_target(
             policy=policy,
         )
     )
-    harness.state._crash = (
-        lambda point: (_ for _ in ()).throw(InjectedCrash(point))
-        if point == failpoint
-        else None
+    harness.state._crash = lambda point: (
+        (_ for _ in ()).throw(InjectedCrash(point)) if point == failpoint else None
     )
     command = harness.command(
         WireCommandKind.COMMIT,
@@ -832,10 +827,8 @@ async def test_deny_failpoints_are_whole_subject_records(
     bundle, _ = make_bundle()
     await activate(harness, bundle, None)
     harness.state.renew_deny_heartbeats(harness.clock.now_ms())
-    harness.state._crash = (
-        lambda point: (_ for _ in ()).throw(InjectedCrash(point))
-        if point == failpoint
-        else None
+    harness.state._crash = lambda point: (
+        (_ for _ in ()).throw(InjectedCrash(point)) if point == failpoint else None
     )
     command = harness.command(
         WireCommandKind.DENY,
@@ -859,12 +852,17 @@ async def test_deny_failpoints_are_whole_subject_records(
         accepted_peppers={PEPPER_VERSION: PEPPER},
         clock=harness.clock,
     ).open()
-    assert bool(recovered.status(
-        singleton_held=True,
-        backend_ready=True,
-        capacities_ready=True,
-        now_ms=harness.clock.now_ms(),
-    ).deny_overlay) is denied
+    assert (
+        bool(
+            recovered.status(
+                singleton_held=True,
+                backend_ready=True,
+                capacities_ready=True,
+                now_ms=harness.clock.now_ms(),
+            ).deny_overlay
+        )
+        is denied
+    )
     recovered.close()
 
 

@@ -118,6 +118,7 @@ class AttemptId(_UuidId):
     __slots__ = ()
     _prefix = "att_"
 
+
 class EventId(_UuidId):
     """Immutable identity of one deduplicated lifecycle event."""
 

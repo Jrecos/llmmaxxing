@@ -174,7 +174,9 @@ class LifecycleEventV1(_Frozen):
         )
         if is_attempt and any(value is None for value in attempt_identity):
             raise ValueError("attempt event requires complete attempt identity")
-        if not is_attempt and any(value is not None for value in (*attempt_identity, *attempt_observations)):
+        if not is_attempt and any(
+            value is not None for value in (*attempt_identity, *attempt_observations)
+        ):
             raise ValueError("request event forbids attempt fields")
         if self.kind is LifecycleEventKind.ATTEMPT_RESERVED:
             if self.outcome is not None or any(value is not None for value in resolution_fields):

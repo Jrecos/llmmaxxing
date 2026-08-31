@@ -26,8 +26,8 @@ from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError, m
 
 from llmmaxxing.core.canonical import canonical_json_bytes
 from llmmaxxing.core.ids import (
-    AckId,
     AccountId,
+    AckId,
     AuthLeaseId,
     BundleHash,
     CommandId,
@@ -544,9 +544,7 @@ def _channel_key(
         raise UnknownTrustEpoch(f"unknown channel trust epoch {seal.trust_epoch}")
     key = epoch.get(seal.seal_id)
     if key is None:
-        raise UnknownChannelKey(
-            f"unknown channel key {seal.seal_id!r} in epoch {seal.trust_epoch}"
-        )
+        raise UnknownChannelKey(f"unknown channel key {seal.seal_id!r} in epoch {seal.trust_epoch}")
     return key
 
 
@@ -586,9 +584,7 @@ def verify_gateway_command(
     except (InvalidSignature, ValueError) as error:
         raise SignatureVerificationError("invalid channel signature") from error
     policy = (
-        None
-        if command.policy is None
-        else verify_signed_activation(command.policy, policy_keys)
+        None if command.policy is None else verify_signed_activation(command.policy, policy_keys)
     )
     return VerifiedGatewayCommand(command, gateway_command_digest(command), policy)
 

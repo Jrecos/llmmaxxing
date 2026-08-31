@@ -2,12 +2,19 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import threading
 import time
 from collections import deque
 from collections.abc import Sequence
 from typing import Any
+
+from opentelemetry import trace
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import ReadableSpan, Span, SpanProcessor, TracerProvider
+from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult
+from opentelemetry.trace import SpanKind, Status, StatusCode
 
 from llmmaxxing.core.ids import (
     AccountId,
@@ -18,12 +25,6 @@ from llmmaxxing.core.ids import (
 )
 from llmmaxxing.core.reasons import RouteTrigger, TerminalOutcome
 from llmmaxxing.telemetry.metrics import TelemetryMetrics
-
-from opentelemetry import trace
-from opentelemetry.sdk.resources import Resource
-from opentelemetry.sdk.trace import ReadableSpan, Span, SpanProcessor, TracerProvider
-from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult
-from opentelemetry.trace import SpanKind, Status, StatusCode
 
 
 def deterministic_head_sample(request_id: RequestId) -> bool:
@@ -125,7 +126,9 @@ class _BoundedSpanProcessor(SpanProcessor):
                     return
                 if not self._queue:
                     continue
-                batch = tuple(self._queue.popleft() for _ in range(min(self._batch_size, len(self._queue))))
+                batch = tuple(
+                    self._queue.popleft() for _ in range(min(self._batch_size, len(self._queue)))
+                )
                 self._exporting = True
             self._export(batch)
             with self._condition:
@@ -297,9 +300,7 @@ class OptionalOtel:
         with self._lock:
             span = self._requests.pop(request_id, None)
             attempts = [
-                self._attempts.pop(key)
-                for key in tuple(self._attempts)
-                if key[0] == request_id
+                self._attempts.pop(key) for key in tuple(self._attempts) if key[0] == request_id
             ]
         for attempt in attempts:
             self._safe_end(attempt)
@@ -350,17 +351,13 @@ class OptionalOtel:
 
     @staticmethod
     def _safe_set(span: Span, name: str, value: str | bool) -> None:
-        try:
+        with contextlib.suppress(Exception):
             span.set_attribute(name, value)
-        except Exception:
-            pass
 
     @staticmethod
     def _safe_end(span: Span) -> None:
-        try:
+        with contextlib.suppress(Exception):
             span.end()
-        except Exception:
-            pass
 
     @staticmethod
     def _set_status(span: Span, outcome: TerminalOutcome) -> None:

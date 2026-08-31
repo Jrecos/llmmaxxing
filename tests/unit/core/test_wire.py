@@ -20,8 +20,8 @@ from llmmaxxing.core.wire import (
     CommandInstallationMismatch,
     GatewayCommandV1,
     PrepareCommandPayload,
-    SignedActivationV1,
     SignatureVerificationError,
+    SignedActivationV1,
     StatusCommandPayload,
     UnknownChannelEpoch,
     UnknownChannelKey,
@@ -189,9 +189,7 @@ def test_verifier_requires_exact_injected_channel_policy_and_runtime_binding() -
         )
 
     tampered = command.model_copy(
-        update={
-            "channel_seal": command.channel_seal.model_copy(update={"signature": "f" * 128})
-        }
+        update={"channel_seal": command.channel_seal.model_copy(update={"signature": "f" * 128})}
     )
     with pytest.raises(SignatureVerificationError):
         verify_gateway_command(
@@ -218,6 +216,4 @@ def test_status_cannot_smuggle_a_policy_and_mutations_cannot_omit_one() -> None:
             }
         )
     with pytest.raises(ValidationError):
-        GatewayCommandV1.model_validate(
-            {**command.model_dump(mode="json"), "policy": None}
-        )
+        GatewayCommandV1.model_validate({**command.model_dump(mode="json"), "policy": None})

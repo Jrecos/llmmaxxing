@@ -20,18 +20,21 @@ from llmmaxxing.core.canonical import (
     canonical_bundle_bytes,
     canonical_json_bytes,
 )
-from llmmaxxing.core.wire import (
-    GENESIS_BASE_BUNDLE_HASH,
-    ActivationEnvelope as WireActivationEnvelope,
-    SignatureVerificationError,
-    UnknownSigningKey,
-    UnknownTrustEpoch,
-)
 from llmmaxxing.core.key_lifecycle import (
     exact_policy_reassignments,
     validate_key_record_set_delta,
 )
 from llmmaxxing.core.models import PolicyBundleV1
+from llmmaxxing.core.wire import (
+    GENESIS_BASE_BUNDLE_HASH,
+    SignatureVerificationError,
+    UnknownSigningKey,
+    UnknownTrustEpoch,
+)
+from llmmaxxing.core.wire import (
+    ActivationEnvelope as WireActivationEnvelope,
+)
+
 
 class ActivationEnvelope(WireActivationEnvelope):
     """Activation claims plus the Task-3 impact-plan constructor."""
@@ -77,10 +80,7 @@ def sign_activation(
     envelope = ActivationEnvelope.model_validate(envelope.model_dump(mode="python"))
     target_bundle = PolicyBundleV1.model_validate(target_bundle.model_dump(mode="python"))
     if base_bundle is None:
-        if (
-            envelope.base_generation != 0
-            or envelope.base_bundle_hash != GENESIS_BASE_BUNDLE_HASH
-        ):
+        if envelope.base_generation != 0 or envelope.base_bundle_hash != GENESIS_BASE_BUNDLE_HASH:
             raise ValueError("genesis activation requires an explicit absent base")
     else:
         base_bundle = PolicyBundleV1.model_validate(base_bundle.model_dump(mode="python"))
