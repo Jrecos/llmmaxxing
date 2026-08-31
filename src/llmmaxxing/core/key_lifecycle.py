@@ -113,6 +113,11 @@ def validate_key_record_delta(
     for generation in new.keys() - old.keys():
         if generation <= before.generation_high_water:
             raise ValueError("retired credential generation reuse is forbidden")
+        verifier = new[generation]
+        if verifier.not_before_s < before.time_high_water_s:
+            raise ValueError("backdated credential not-before precedes transition high-water")
+        if verifier.not_before_s > after.time_high_water_s:
+            raise ValueError("future credential not-before exceeds transition high-water")
     if after.generation_high_water > before.generation_high_water:
         if after.generation_high_water not in new:
             raise ValueError("generation high-water must name the new verifier")

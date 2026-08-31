@@ -322,8 +322,9 @@ def test_authoring_schema_and_pydantic_share_acceptance_vectors() -> None:
         clone_from_policy_id=BASE_POLICY_ID,
         rebind_shared=True,
     ).model_dump(mode="json", exclude_none=True)
+    tier_zero = {**exact, "queue_tier": 0}
 
-    for policy in (exact, selector, clone_rebind):
+    for policy in (exact, selector, clone_rebind, tier_zero):
         document = {"schema_version": 1, "policies": [policy]}
         AuthoringConfigV1.model_validate_json(json.dumps(document))
         schema_validator.validate(document)

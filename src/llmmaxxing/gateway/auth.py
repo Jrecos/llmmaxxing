@@ -20,7 +20,34 @@ from llmmaxxing.core.state_machines import CredentialVerifierStatus, KeyLifecycl
 _PUBLIC_ERROR = "invalid client key"
 _ACCEPTED_STATUSES = frozenset((CredentialVerifierStatus.ACTIVE, CredentialVerifierStatus.RETIRING))
 _DUMMY_PEPPER = b"\x00" * 32
-_DUMMY_VERIFIER = b"\x00" * 32
+_DUMMY_CREDENTIALS = (
+    ClientCredentialVerifier(
+        generation=1,
+        verifier_hex="0" * 64,
+        pepper_version="dummy-1",
+        not_before_s=1,
+        not_after_s=2,
+        status=CredentialVerifierStatus.RETIRED,
+    ),
+    ClientCredentialVerifier(
+        generation=2,
+        verifier_hex="f" * 64,
+        pepper_version="dummy-2",
+        not_before_s=2,
+        not_after_s=3,
+        status=CredentialVerifierStatus.RETIRED,
+    ),
+)
+_DUMMY_RECORD = ClientKeyRecord(
+    key_id="0" * 32,
+    policy_id=PolicyRevisionId("pol_00000000-0000-4000-8000-000000000000"),
+    state=KeyLifecycleState.REVOKED,
+    issued_at_s=1,
+    expires_at_s=4,
+    time_high_water_s=2,
+    generation_high_water=2,
+    credential_verifiers=_DUMMY_CREDENTIALS,
+)
 
 
 class ClientAuthenticationError(ValueError):
@@ -104,6 +131,29 @@ def _credential_is_accepted(
     )
 
 
+def _prepare_verifier(
+    verifier: ClientCredentialVerifier,
+    record: ClientKeyRecord,
+    runtime_view: AuthRuntimeView,
+    fallback_pepper: bytes,
+) -> tuple[bytes, bytes, bool]:
+    """Perform the same field preparation for real and dummy verifier slots."""
+    status_is_accepted = verifier.status in _ACCEPTED_STATUSES
+    pepper_is_accepted = verifier.pepper_version in runtime_view.accepted_peppers
+    pepper = runtime_view.accepted_peppers.get(verifier.pepper_version, fallback_pepper)
+    expected = bytes.fromhex(verifier.verifier_hex)
+    now_s = runtime_view.trusted_now_s
+    window_is_accepted = verifier.not_before_s <= now_s < verifier.not_after_s
+    record_is_live = now_s < record.expires_at_s
+    eligible = (
+        status_is_accepted
+        and pepper_is_accepted
+        and window_is_accepted
+        and record_is_live
+    )
+    return pepper, expected, eligible
+
+
 def verify_client_key(
     parsed: ParsedClientKey,
     runtime_view: AuthRuntimeView,
@@ -113,25 +163,29 @@ def verify_client_key(
         len(pepper) >= 32 for pepper in runtime_view.accepted_peppers.values()
     )
     record = runtime_view.key_index.get(parsed.key_id)
-    verifiers = record.credential_verifiers if record is not None else ()
+    prepared_record = record if record is not None else _DUMMY_RECORD
+    verifiers = (
+        record.credential_verifiers if record is not None else _DUMMY_CREDENTIALS
+    )
     fallback_pepper = next(iter(runtime_view.accepted_peppers.values()), _DUMMY_PEPPER)
     accepted_generation: int | None = None
 
     for index in range(2):
-        verifier = verifiers[index] if index < len(verifiers) else None
-        pepper = (
-            runtime_view.accepted_peppers.get(verifier.pepper_version, fallback_pepper)
-            if verifier is not None
-            else fallback_pepper
+        verifier = (
+            verifiers[index] if index < len(verifiers) else _DUMMY_CREDENTIALS[index]
         )
-        expected = bytes.fromhex(verifier.verifier_hex) if verifier is not None else _DUMMY_VERIFIER
+        pepper, expected, credential_is_accepted = _prepare_verifier(
+            verifier,
+            prepared_record,
+            runtime_view,
+            fallback_pepper,
+        )
         candidate = compute_client_key_verifier(pepper, parsed.key_id_bytes, parsed.secret)
         matches = hmac.compare_digest(candidate, expected)
         if (
             matches
-            and verifier is not None
             and record is not None
-            and _credential_is_accepted(verifier, record, runtime_view)
+            and credential_is_accepted
         ):
             accepted_generation = verifier.generation
 

@@ -157,7 +157,7 @@ class KeyPolicyRevision(_Frozen):
     route_group_ids: tuple[RouteGroupId, ...] = Field(min_length=1)
     allowed_account_ids: tuple[AccountId, ...] = Field(min_length=1)
     allowed_triggers: tuple[RouteTrigger, ...] = Field(min_length=1)
-    queue_tier: int = Field(ge=1)
+    queue_tier: int = Field(ge=0)
     queue_weight: int = Field(ge=1, le=64)
     max_concurrency: int = Field(ge=1)
     max_waiters: int = Field(ge=0)
@@ -272,7 +272,7 @@ class RequestAuthorizationCeiling(_Frozen):
     allowed_account_ids: tuple[AccountId, ...]
     leg_ids: tuple[RouteLegId, ...]
     allowed_triggers: tuple[RouteTrigger, ...]
-    queue_tier: int = Field(ge=1)
+    queue_tier: int = Field(ge=0)
     queue_weight: int = Field(ge=1, le=64)
     max_concurrency: int = Field(ge=1)
     max_waiters: int = Field(ge=0)

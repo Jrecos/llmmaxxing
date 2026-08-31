@@ -235,7 +235,7 @@
         "queue_tier": {
           "anyOf": [
             {
-              "minimum": 1,
+              "minimum": 0,
               "type": "integer"
             },
             {
@@ -311,7 +311,7 @@
           "type": "integer"
         },
         "queue_tier": {
-          "minimum": 1,
+          "minimum": 0,
           "title": "Queue Tier",
           "type": "integer"
         },

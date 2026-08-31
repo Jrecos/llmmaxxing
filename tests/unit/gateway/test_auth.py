@@ -137,18 +137,36 @@ def test_unknown_id_runs_dummy_hmac_and_errors_are_non_enumerating(
         nonlocal compare_calls
         compare_calls += 1
         return real_compare(left, right)
+    preparation_calls = 0
+    real_prepare = auth._prepare_verifier
+
+    def prepared(*args):
+        nonlocal preparation_calls
+        verifier, record = args[:2]
+        assert len(verifier.verifier_hex) == 64
+        assert verifier.pepper_version
+        assert verifier.status
+        assert record.credential_verifiers
+        preparation_calls += 1
+        return real_prepare(*args)
+
 
     monkeypatch.setattr(auth, "compute_client_key_verifier", counted)
     monkeypatch.setattr(auth.hmac, "compare_digest", compared)
+    monkeypatch.setattr(auth, "_prepare_verifier", prepared)
 
     with pytest.raises(ClientAuthenticationError) as unknown_error:
         verify_client_key(unknown, runtime)
     assert calls == 2
     assert compare_calls == 2
+    assert preparation_calls == 2
 
     wrong_secret = value[:-1] + ("A" if value[-1] != "A" else "B")
     with pytest.raises(ClientAuthenticationError) as known_error:
         verify_client_key(parse_client_key(wrong_secret), runtime)
+    assert calls == 4
+    assert compare_calls == 4
+    assert preparation_calls == 4
     assert str(unknown_error.value) == str(known_error.value) == "invalid client key"
 
 

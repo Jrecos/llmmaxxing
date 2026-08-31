@@ -187,7 +187,7 @@
           "type": "string"
         },
         "queue_tier": {
-          "minimum": 1,
+          "minimum": 0,
           "title": "Queue Tier",
           "type": "integer"
         },

@@ -100,7 +100,7 @@ class _AuthoringModel(BaseModel):
 class PolicyMacro(_AuthoringModel):
     """Reusable queue/deadline authoring defaults; never emitted to a bundle."""
 
-    queue_tier: int = Field(ge=1)
+    queue_tier: int = Field(ge=0)
     queue_weight: int = Field(ge=1, le=64)
     max_concurrency: int = Field(ge=1)
     max_waiters: int = Field(ge=0)
@@ -127,7 +127,7 @@ class AuthoringPolicy(_AuthoringModel):
     allowed_triggers: tuple[RouteTrigger, ...] | None = Field(
         default=None, min_length=1, json_schema_extra={"uniqueItems": True}
     )
-    queue_tier: int | None = Field(default=None, ge=1)
+    queue_tier: int | None = Field(default=None, ge=0)
     queue_weight: int | None = Field(default=None, ge=1, le=64)
     max_concurrency: int | None = Field(default=None, ge=1)
     max_waiters: int | None = Field(default=None, ge=0)

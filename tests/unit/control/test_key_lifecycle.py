@@ -149,6 +149,24 @@ def test_rotation_uses_monotonic_generations_default_overlap_and_maximum() -> No
     assert second_value != first_value
 
 
+def test_logical_expiry_preserves_immediately_retired_generation() -> None:
+    issued = issue(expiry=NOW + 10)
+    immediate = rotate_key(
+        issued.record,
+        pepper=PEPPER,
+        pepper_version="p1",
+        now_s=NOW + 1,
+        overlap_s=0,
+    )
+
+    expired = expire_key(immediate.record, now_s=NOW + 10)
+
+    assert [item.status for item in expired.credential_verifiers] == [
+        CredentialVerifierStatus.RETIRED,
+        CredentialVerifierStatus.EXPIRED,
+    ]
+
+
 def test_suspend_resume_revoke_and_expiry_are_fail_closed_and_terminal() -> None:
     issued = issue(expiry=NOW + 10)
     value = issued.reveal_once().value
@@ -314,7 +332,7 @@ def test_delta_bounds_overlap_requires_exact_reassignment_and_rejects_clock_roll
             update={
                 "generation": 2,
                 "verifier_hex": "1" * 64,
-                "not_before_s": NOW,
+                "not_before_s": NOW + 1,
             }
         ),
     )
@@ -328,6 +346,39 @@ def test_delta_bounds_overlap_requires_exact_reassignment_and_rejects_clock_roll
                 }
             ),
         )
+
+def test_new_verifier_not_before_is_bounded_by_transition_high_waters() -> None:
+    advanced = suspend_key(issue().record, now_s=NOW + 10)
+    current = advanced.credential_verifiers[-1]
+    retiring = current.model_copy(
+        update={
+            "status": CredentialVerifierStatus.RETIRING,
+            "not_after_s": NOW + 20,
+        }
+    )
+
+    def rotated(not_before_s: int) -> ClientKeyRecord:
+        replacement = ClientCredentialVerifier(
+            generation=2,
+            verifier_hex="1" * 64,
+            pepper_version="p1",
+            not_before_s=not_before_s,
+            not_after_s=advanced.expires_at_s,
+            status=CredentialVerifierStatus.ACTIVE,
+        )
+        return advanced.model_copy(
+            update={
+                "time_high_water_s": NOW + 20,
+                "generation_high_water": 2,
+                "credential_verifiers": (retiring, replacement),
+            }
+        )
+
+    with pytest.raises(ValueError, match="backdated.*not-before"):
+        validate_key_record_delta(advanced, rotated(NOW + 5))
+    with pytest.raises(ValueError, match="future.*not-before"):
+        validate_key_record_delta(advanced, rotated(NOW + 21))
+
 
 
 def test_activation_is_draft_only() -> None:

@@ -438,6 +438,15 @@ def test_partial_account_binding_always_rejects(
         )
 
 
+def test_tier_zero_is_a_valid_highest_priority_policy() -> None:
+    original = parts()["policies"][0]
+    assert isinstance(original, KeyPolicyRevision)
+    tier_zero = KeyPolicyRevision.model_validate(
+        {**original.model_dump(mode="python"), "queue_tier": 0}
+    )
+    assert tier_zero.queue_tier == 0
+
+
 def test_active_account_requires_complete_binding():
     with pytest.raises(ValidationError, match="ACTIVE.*complete binding"):
         account(connection="", provider_token="", binding_ref="", state="active")
@@ -589,7 +598,7 @@ def ceiling(**overrides: object) -> RequestAuthorizationCeiling:
         "allowed_account_ids": tuple(a.account_id for a in b.accounts),
         "allowed_triggers": (RouteTrigger.PRIMARY, RouteTrigger.CAPACITY_SPILL),
         "leg_ids": tuple(lg.leg_id for lg in b.route_groups[0].legs),
-        "queue_tier": 1,
+        "queue_tier": 0,
         "queue_weight": 8,
         "max_concurrency": 4,
         "max_waiters": 16,
@@ -616,6 +625,7 @@ def test_ceiling_intersection_only_contracts():
     assert merged.leg_ids == (full.leg_ids[0],)
     assert merged.allowed_triggers == (RouteTrigger.PRIMARY,)
     assert merged.queue_weight == 4
+    assert full.queue_tier == 0
     assert merged.queue_tier == 2  # higher numeric tier is worse and cannot improve
     assert merged.max_concurrency == 2
     assert merged.max_waiters == 8
