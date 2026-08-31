@@ -234,13 +234,41 @@
         },
         "binding_ref": {
           "default": "",
+          "maxLength": 256,
           "title": "Binding Ref",
           "type": "string"
         },
         "connection": {
           "default": "",
+          "maxLength": 256,
           "title": "Connection",
           "type": "string"
+        },
+        "credential_epoch": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Credential Epoch"
+        },
+        "credential_fingerprint": {
+          "anyOf": [
+            {
+              "pattern": "^hcf1_[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Credential Fingerprint"
         },
         "display_name": {
           "maxLength": 120,
@@ -248,22 +276,54 @@
           "title": "Display Name",
           "type": "string"
         },
-        "max_in_flight": {
-          "maximum": 128,
-          "minimum": 1,
-          "title": "Max In Flight",
-          "type": "integer"
-        },
         "monthly_quota_units": {
+          "$ref": "#/$defs/QuotaDimension"
+        },
+        "monthly_reset_day_utc": {
+          "anyOf": [
+            {
+              "maximum": 31,
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Monthly Reset Day Utc"
+        },
+        "monthly_reset_hour_utc": {
+          "anyOf": [
+            {
+              "maximum": 23,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Monthly Reset Hour Utc"
+        },
+        "parallel_limit": {
           "$ref": "#/$defs/QuotaDimension"
         },
         "provider_token": {
           "default": "",
+          "maxLength": 256,
           "title": "Provider Token",
           "type": "string"
         },
         "rpm_limit": {
           "$ref": "#/$defs/QuotaDimension"
+        },
+        "rpm_window_seconds": {
+          "exclusiveMinimum": 0,
+          "maximum": 3600,
+          "title": "Rpm Window Seconds",
+          "type": "integer"
         },
         "state": {
           "anyOf": [
@@ -279,20 +339,21 @@
         "tpm_limit": {
           "$ref": "#/$defs/QuotaDimension"
         },
-        "window_seconds": {
-          "default": 60,
+        "tpm_window_seconds": {
           "exclusiveMinimum": 0,
-          "maximum": 3600,
-          "title": "Window Seconds",
+          "maximum": 86400,
+          "title": "Tpm Window Seconds",
           "type": "integer"
         }
       },
       "required": [
         "account_id",
         "display_name",
-        "max_in_flight",
+        "parallel_limit",
         "rpm_limit",
+        "rpm_window_seconds",
         "tpm_limit",
+        "tpm_window_seconds",
         "monthly_quota_units"
       ],
       "title": "ProviderAccount",
@@ -300,7 +361,7 @@
     },
     "QuotaDimension": {
       "additionalProperties": false,
-      "description": "One RPM, TPM, or monthly quota dimension and its attestation state.",
+      "description": "One independently bounded quota dimension and its attestation state.",
       "properties": {
         "status": {
           "$ref": "#/$defs/QuotaDimensionStatus"

@@ -58,10 +58,16 @@ def _account() -> ProviderAccount:
         connection="secret-connection-marker",
         provider_token="secret-provider-marker",
         binding_ref="secret-binding-marker",
-        max_in_flight=2,
+        credential_fingerprint="hcf1_" + "a" * 64,
+        credential_epoch=1,
+        parallel_limit=QuotaDimension(status="known", value=2),
         rpm_limit=quota,
+        rpm_window_seconds=60,
         tpm_limit=quota,
+        tpm_window_seconds=60,
         monthly_quota_units=quota,
+        monthly_reset_day_utc=1,
+        monthly_reset_hour_utc=0,
         state=AccountState.ACTIVE,
     )
 

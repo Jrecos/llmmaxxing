@@ -103,6 +103,41 @@ class AccountId(_UuidId):
 
     __slots__ = ()
     _prefix = "acc_"
+class RequestId(_UuidId):
+    """Immutable identity of one admitted client request."""
+
+    __slots__ = ()
+    _prefix = "req_"
+
+
+class AttemptId(_UuidId):
+    """Immutable identity of one possible provider send."""
+
+    __slots__ = ()
+    _prefix = "att_"
+
+
+class GatewayBootId(_UuidId):
+    """Identity of one Gateway process boot."""
+
+    __slots__ = ()
+    _prefix = "boot_"
+
+
+class InstallationId(_UuidId):
+    """Stable identity of one commissioned Gateway installation."""
+
+    __slots__ = ()
+    _prefix = "inst_"
+
+
+class ProbeToken(_UuidId):
+    """Unique durable token for one serialized capacity/circuit probe."""
+
+    __slots__ = ()
+    _prefix = "probe_"
+
+
 
 
 class RouteGroupId(_UuidId):

@@ -36,6 +36,7 @@ from llmmaxxing.core.state_machines import (
 
 _HEX32 = Annotated[str, Field(pattern=r"^[0-9a-f]{32}$")]
 _HEX64 = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+_CREDENTIAL_FINGERPRINT = Annotated[str, Field(pattern=r"^hcf1_[0-9a-f]{64}$")]
 
 _MAX_DEADLINE_MS = 9_000_000
 
@@ -47,7 +48,7 @@ class _Frozen(BaseModel):
 
 
 class QuotaDimension(_Frozen):
-    """One RPM, TPM, or monthly quota dimension and its attestation state."""
+    """One independently bounded quota dimension and its attestation state."""
 
     status: QuotaDimensionStatus
     value: int | None = Field(default=None, gt=0)
@@ -67,34 +68,68 @@ class ProviderAccount(_Frozen):
     account_id: AccountId
     display_name: str = Field(min_length=1, max_length=120)
     # Empty until onboarding binds the account; unbound accounts stay DRAFT.
-    connection: str = ""
-    provider_token: str = ""
-    binding_ref: str = ""
-    max_in_flight: int = Field(ge=1, le=128)
+    connection: str = Field(default="", max_length=256)
+    provider_token: str = Field(default="", max_length=256)
+    binding_ref: str = Field(default="", max_length=256)
+    credential_fingerprint: _CREDENTIAL_FINGERPRINT | None = None
+    credential_epoch: int | None = Field(default=None, ge=1)
+    parallel_limit: QuotaDimension
     rpm_limit: QuotaDimension
+    rpm_window_seconds: int = Field(gt=0, le=3600)
     tpm_limit: QuotaDimension
-    window_seconds: int = Field(default=60, gt=0, le=3600)
+    tpm_window_seconds: int = Field(gt=0, le=86_400)
     monthly_quota_units: QuotaDimension
+    monthly_reset_day_utc: int | None = Field(default=None, ge=1, le=31)
+    monthly_reset_hour_utc: int | None = Field(default=None, ge=0, le=23)
     state: AccountState | None = None
 
     @property
     def fully_attested(self) -> bool:
-        return all(
-            dimension.status is not QuotaDimensionStatus.UNKNOWN
-            for dimension in (self.rpm_limit, self.tpm_limit, self.monthly_quota_units)
+        return (
+            self.parallel_limit.status is QuotaDimensionStatus.KNOWN
+            and all(
+                dimension.status is not QuotaDimensionStatus.UNKNOWN
+                for dimension in (
+                    self.rpm_limit,
+                    self.tpm_limit,
+                    self.monthly_quota_units,
+                )
+            )
         )
 
     @property
     def enforced_max_in_flight(self) -> int:
         """Conservative parallel limit; unmeasured accounts serve one at a time."""
-        return self.max_in_flight if self.fully_attested else 1
+        if not self.fully_attested:
+            return 1
+        assert self.parallel_limit.value is not None
+        return self.parallel_limit.value
 
     @model_validator(mode="after")
     def _derive_and_guard_state(self) -> Self:
+        if self.parallel_limit.status is QuotaDimensionStatus.ATTESTED_ABSENT:
+            raise ValueError("parallel capacity must be known or unknown, never unbounded")
+
+        reset = (self.monthly_reset_day_utc, self.monthly_reset_hour_utc)
+        if self.monthly_quota_units.status is QuotaDimensionStatus.KNOWN and not all(
+            value is not None for value in reset
+        ):
+            raise ValueError("a known monthly quota requires explicit UTC monthly reset semantics")
+        if self.monthly_quota_units.status is not QuotaDimensionStatus.KNOWN and any(
+            value is not None for value in reset
+        ):
+            raise ValueError("monthly reset semantics apply only to a known monthly quota")
+
         binding = (self.connection, self.provider_token, self.binding_ref)
         if any(binding) and not all(binding):
             raise ValueError("account binding must be fully populated or fully empty")
+        attestation = (self.credential_fingerprint, self.credential_epoch)
+        if any(value is not None for value in attestation) and not all(
+            value is not None for value in attestation
+        ):
+            raise ValueError("credential attestation must include fingerprint and epoch")
         bound = all(binding)
+        attested_credential = all(value is not None for value in attestation)
 
         if not self.fully_attested:
             if self.state not in (None, AccountState.DRAFT):
@@ -104,10 +139,21 @@ class ProviderAccount(_Frozen):
                 )
             object.__setattr__(self, "state", AccountState.DRAFT)
             return self
+        if self.state is AccountState.ACTIVE and not attested_credential:
+            raise ValueError("an ACTIVE account requires a complete credential attestation")
         if self.state is AccountState.ACTIVE and not bound:
             raise ValueError("an ACTIVE account requires a complete binding")
+        durable_state = self.state in (AccountState.DISABLED, AccountState.TOMBSTONED)
+        if durable_state and not attested_credential:
+            raise ValueError("a durable account state requires a complete credential attestation")
+        if durable_state and not bound:
+            raise ValueError("a durable account state requires a complete binding")
         if self.state is None:
-            object.__setattr__(self, "state", AccountState.ACTIVE if bound else AccountState.DRAFT)
+            object.__setattr__(
+                self,
+                "state",
+                AccountState.ACTIVE if bound and attested_credential else AccountState.DRAFT,
+            )
         return self
 
 
