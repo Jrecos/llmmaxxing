@@ -13,6 +13,7 @@ import uvicorn
 
 from llmmaxxing import __version__
 from llmmaxxing.gateway.app import GatewayApp, create_app
+from llmmaxxing.gateway.emergency import GatewayRuntime, GatewaySingleton
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,7 +28,10 @@ class GatewayLaunch:
             raise ValueError("Gateway launch requires complete app dependencies and runtime")
 
 
-def _load_gateway_launch(factory_path: str | None) -> GatewayLaunch:
+def _load_gateway_launch(
+    factory_path: str | None,
+    singleton: GatewaySingleton,
+) -> GatewayLaunch:
     if not factory_path:
         raise ValueError(
             "gateway requires --factory module:callable (or LLMMAXXING_GATEWAY_FACTORY)"
@@ -38,27 +42,35 @@ def _load_gateway_launch(factory_path: str | None) -> GatewayLaunch:
     factory = getattr(importlib.import_module(module_name), attribute)
     if not callable(factory):
         raise TypeError("Gateway factory target is not callable")
-    launch = factory()
+    launch = factory(singleton)
     if not isinstance(launch, GatewayLaunch):
         raise TypeError("Gateway factory must return GatewayLaunch")
     return launch
 
 
 def _run_gateway(args: argparse.Namespace) -> int:
-    launch = _load_gateway_launch(args.factory)
-    app = create_app(**launch.app_kwargs)
-    runtime = launch.runtime_factory(app)
-    config = uvicorn.Config(
-        runtime,
-        host=args.host,
-        port=args.port,
-        workers=1,
-        reload=False,
-        lifespan="on",
-        timeout_graceful_shutdown=600,
-    )
-    uvicorn.Server(config).run()
-    return 0
+    singleton = GatewaySingleton(args.data_dir)
+    if not singleton.acquire():
+        raise RuntimeError("another Gateway dispatcher owns the singleton")
+    try:
+        launch = _load_gateway_launch(args.factory, singleton)
+        app = create_app(**launch.app_kwargs)
+        runtime = launch.runtime_factory(app)
+        if isinstance(runtime, GatewayRuntime) and runtime.singleton is not singleton:
+            raise ValueError("Gateway runtime must reuse the pre-acquired singleton")
+        config = uvicorn.Config(
+            runtime,
+            host=args.host,
+            port=args.port,
+            workers=1,
+            reload=False,
+            lifespan="on",
+            timeout_graceful_shutdown=600,
+        )
+        uvicorn.Server(config).run()
+        return 0
+    finally:
+        singleton.release()
 
 
 def _run_control(_args: argparse.Namespace) -> int:
@@ -83,6 +95,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--factory",
         default=os.environ.get("LLMMAXXING_GATEWAY_FACTORY"),
         help="mandatory module:callable returning GatewayLaunch",
+    )
+    gateway.add_argument(
+        "--data-dir",
+        default=os.environ.get("LLMMAXXING_GATEWAY_DATA_DIR", "/var/lib/llmmaxxing"),
     )
     gateway.add_argument("--host", default="0.0.0.0")
     gateway.add_argument("--port", type=int, default=4000)

@@ -8,10 +8,11 @@ import hashlib
 import json
 import os
 import sqlite3
+import stat
 import tempfile
 import threading
 import time
-from collections.abc import AsyncIterator, Callable, Iterator, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -40,6 +41,7 @@ from llmmaxxing.core.wire import (
     ChannelSigner,
     ChannelTrustSet,
     ClearDenyCommandPayload,
+    CommandBootMismatch,
     CommandChainGap,
     DenyCommandPayload,
     DenyOverlayV1,
@@ -57,14 +59,15 @@ from llmmaxxing.core.wire import (
     PrepareCommandPayload,
     ReadinessReason,
     StaleFenceEpoch,
+    StaleSecurityEpoch,
     StatusCommandPayload,
     TakeoverState,
     VerifiedGatewayCommand,
     WireCommandKind,
+    authenticate_gateway_command,
     seal_fence_receipt,
     seal_gateway_ack,
     verify_fence_receipt,
-    verify_gateway_command,
 )
 from llmmaxxing.gateway.auth import AuthRuntimeView, LegacyKeyIndexEntry, build_legacy_key_index
 from llmmaxxing.gateway.routing import GenerationOperationalGate
@@ -93,6 +96,8 @@ class BundleLimits(BaseModel):
     max_route_groups: int = Field(default=100_000, ge=1, le=100_000)
     max_legs: int = Field(default=100_000, ge=1, le=100_000)
     max_authorized_legs: int = Field(default=1_000_000, ge=1, le=1_000_000)
+    max_command_records: int = Field(default=100_000, ge=16, le=1_000_000)
+    max_auth_leases: int = Field(default=128, ge=1, le=10_000)
 
 
 class DispatcherGate:
@@ -160,6 +165,41 @@ def _write_all(fd: int, content: bytes) -> None:
         offset += written
 
 
+async def _await_durable[T](awaitable: Awaitable[T]) -> tuple[T, bool]:
+    task = asyncio.ensure_future(awaitable)
+    cancelled = False
+    while True:
+        try:
+            return await asyncio.shield(task), cancelled
+        except asyncio.CancelledError:
+            cancelled = True
+
+
+def _bounded_read(path: Path, limit: int) -> bytes:
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags)
+    try:
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > limit:
+            raise ValueError("stored file exceeds its bounded read limit")
+        chunks: list[bytes] = []
+        remaining = limit + 1
+        while remaining:
+            chunk = os.read(fd, min(remaining, 64 * 1024))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        payload = b"".join(chunks)
+        if len(payload) > limit:
+            raise ValueError("stored file exceeds its bounded read limit")
+        return payload
+    finally:
+        os.close(fd)
+
+
 class GatewayLocalState:
     """SQLite FULL state plus immutable content-addressed canonical bundle files."""
 
@@ -196,7 +236,9 @@ class GatewayLocalState:
         self._previous: BundleReference | None = None
         self._base: BaseReference | None = None
         self._active_bundle: PolicyBundleV1 | None = None
+        self._recovery_reason = ""
         self._denies: dict[tuple[DenySubjectType, str], DenyOverlayV1] = {}
+        self._deny_highwater: dict[tuple[DenySubjectType, str], tuple[int, int | None]] = {}
         self._deny_heartbeat_ms = 0
         self._recovery_required = False
         self._takeover_state = TakeoverState.NONE
@@ -237,10 +279,10 @@ class GatewayLocalState:
             return GatewayLifecycle.RECOVERY_REQUIRED
         if self._takeover_state is TakeoverState.FENCED_OLD:
             return GatewayLifecycle.FENCED_OLD
-        if self._active is not None:
-            return GatewayLifecycle.APPLIED
         if self._staged is not None:
             return GatewayLifecycle.STAGED
+        if self._active is not None:
+            return GatewayLifecycle.APPLIED
         return GatewayLifecycle.NONE
 
     @property
@@ -261,6 +303,26 @@ class GatewayLocalState:
     @property
     def active_bundle(self) -> PolicyBundleV1 | None:
         return self._active_bundle
+
+    def enter_recovery_required(self, reason: str) -> None:
+        if not reason:
+            raise ValueError("recovery reason is required")
+        with self.transaction():
+            self._set_meta("recovery_reason", reason)
+        self._recovery_reason = reason
+        self._recovery_required = True
+
+    def confirm_live_bundle(self, reference: BundleReference) -> None:
+        if (
+            self._recovery_reason != "live_swap_failed"
+            or self._active != reference
+            or self._active_bundle is None
+        ):
+            raise ValueError("live bundle cannot clear recovery state")
+        with self.transaction():
+            self._set_meta("recovery_reason", "")
+        self._recovery_reason = ""
+        self._recovery_required = False
 
     @property
     def command_count(self) -> int:
@@ -299,6 +361,7 @@ class GatewayLocalState:
         self._create_schema()
         self._load_identity()
         self._recover()
+        self._deny_heartbeat_ms = 0
         return self
 
     def _create_schema(self) -> None:
@@ -360,6 +423,14 @@ class GatewayLocalState:
                 receipt_json TEXT NOT NULL,
                 checksum TEXT NOT NULL
             ) STRICT;
+            CREATE TABLE IF NOT EXISTS deny_highwater(
+                subject_type TEXT NOT NULL,
+                subject_id TEXT NOT NULL,
+                deny_epoch INTEGER NOT NULL,
+                floor_generation INTEGER,
+                checksum TEXT NOT NULL,
+                PRIMARY KEY(subject_type, subject_id)
+            ) STRICT;
             """
         )
 
@@ -405,6 +476,7 @@ class GatewayLocalState:
                     ("fence_epoch", "1"),
                     ("takeover_state", TakeoverState.NONE.value),
                     ("deny_heartbeat_ms", "0"),
+                    ("recovery_reason", ""),
                 ):
                     self._set_meta(key, value)
             else:
@@ -420,6 +492,8 @@ class GatewayLocalState:
             self._fence_epoch = int(self._meta("fence_epoch") or 1)
             self._takeover_state = TakeoverState(self._meta("takeover_state") or "none")
             self._deny_heartbeat_ms = int(self._meta("deny_heartbeat_ms") or 0)
+            self._recovery_reason = self._meta("recovery_reason") or ""
+            self._recovery_required = bool(self._recovery_reason)
 
     @staticmethod
     def _pointer_record(name: str, ref: BundleReference | BaseReference) -> dict[str, object]:
@@ -482,12 +556,14 @@ class GatewayLocalState:
                     if staged.generation != self._staged.generation:
                         raise ValueError("staged generation mismatch")
                 except (OSError, ValueError):
+                    self._quarantine_bundle(self._staged.bundle_hash)
                     with self.transaction():
                         self._put_pointer("staged", None)
                         self._put_pointer("base", None)
                     self._staged = None
                     self._base = None
             self._load_denies()
+            self._load_deny_highwater()
             self._quarantine_corrupt_commands()
             self._reconcile_pointer()
         except (OSError, sqlite3.DatabaseError, ValueError):
@@ -502,7 +578,7 @@ class GatewayLocalState:
                 _fsync_dir(self.path)
             return
         expected = canonical_json_bytes(self._active.model_dump(mode="json"))
-        actual = self.pointer_path.read_bytes() if self.pointer_path.exists() else b""
+        actual = _bounded_read(self.pointer_path, 4096) if self.pointer_path.exists() else b""
         if actual != expected:
             self._write_active_pointer(expected, inject=False)
 
@@ -531,6 +607,29 @@ class GatewayLocalState:
             )
             loaded[(overlay.subject_type, overlay.subject_id)] = overlay
         self._denies = loaded
+
+    def _load_deny_highwater(self) -> None:
+        loaded: dict[tuple[DenySubjectType, str], tuple[int, int | None]] = {}
+        for row in self.db.execute("SELECT * FROM deny_highwater"):
+            record = {
+                "subject_type": str(row["subject_type"]),
+                "subject_id": str(row["subject_id"]),
+                "deny_epoch": int(row["deny_epoch"]),
+                "floor_generation": (
+                    None if row["floor_generation"] is None else int(row["floor_generation"])
+                ),
+            }
+            if row["checksum"] != _checksum("deny_highwater", record):
+                raise ValueError("corrupt deny high-water")
+            key = (
+                DenySubjectType(str(record["subject_type"])),
+                str(record["subject_id"]),
+            )
+            loaded[key] = (
+                int(cast(Any, record["deny_epoch"])),
+                cast(int | None, record["floor_generation"]),
+            )
+        self._deny_highwater = loaded
 
     @staticmethod
     def _command_values(row: sqlite3.Row | Mapping[str, object]) -> dict[str, object]:
@@ -566,6 +665,18 @@ class GatewayLocalState:
             ack,
         )
 
+    def _quarantine_bundle(self, bundle_hash_value: BundleHash) -> None:
+        source = self.bundle_path(bundle_hash_value)
+        if not source.exists():
+            return
+        quarantine = self.path / "quarantine"
+        quarantine.mkdir(mode=0o700, exist_ok=True)
+        os.chmod(quarantine, 0o700)
+        destination = quarantine / f"{bundle_hash_value}.{time.time_ns()}.invalid"
+        os.replace(source, destination)
+        _fsync_dir(quarantine)
+        _fsync_dir(self.bundles_path)
+
     def _quarantine_corrupt_commands(self) -> None:
         corrupt: list[str] = []
         for row in self.db.execute("SELECT * FROM commands"):
@@ -586,7 +697,7 @@ class GatewayLocalState:
             raise ValueError("bundle content hash differs from target")
         destination = self.bundle_path(expected)
         if destination.exists():
-            if destination.read_bytes() != payload:
+            if _bounded_read(destination, self.limits.max_bundle_bytes) != payload:
                 raise ValueError("content-addressed path contains different bytes")
             return destination
         fd, name = tempfile.mkstemp(prefix=".tmp-", dir=self.bundles_path)
@@ -605,7 +716,7 @@ class GatewayLocalState:
         return destination
 
     def load_bundle(self, expected: BundleHash) -> PolicyBundleV1:
-        payload = self.bundle_path(expected).read_bytes()
+        payload = _bounded_read(self.bundle_path(expected), self.limits.max_bundle_bytes)
         if len(payload) > self.limits.max_bundle_bytes or bundle_hash(payload) != expected:
             raise ValueError("stored bundle is corrupt")
         try:
@@ -664,6 +775,21 @@ class GatewayLocalState:
         with self.transaction():
             self._record_pending(verified, ack_id, status, result)
 
+    def _reserve_command_record(self) -> None:
+        count = int(self.db.execute("SELECT count(*) FROM commands").fetchone()[0])
+        excess = count - self.limits.max_command_records + 1
+        if excess <= 0:
+            return
+        self.db.execute(
+            "DELETE FROM commands WHERE command_id IN ("
+            "SELECT command_id FROM commands WHERE ack_json IS NOT NULL "
+            "ORDER BY channel_epoch,sequence LIMIT ?)",
+            (excess,),
+        )
+        remaining = int(self.db.execute("SELECT count(*) FROM commands").fetchone()[0])
+        if remaining >= self.limits.max_command_records:
+            raise RuntimeError("command dedupe retention is full")
+
     def _record_pending(
         self,
         verified: VerifiedGatewayCommand,
@@ -673,6 +799,7 @@ class GatewayLocalState:
     ) -> None:
         if self.validate_new_command(verified) is not None:
             raise DuplicateCommand("command already recorded")
+        self._reserve_command_record()
         command = verified.command
         result_json = _canonical(dict(result))
         values = {
@@ -747,11 +874,7 @@ class GatewayLocalState:
     @property
     def deny_floor_generation(self) -> int | None:
         return max(
-            (
-                x.deny_floor_generation
-                for x in self._denies.values()
-                if x.deny_floor_generation is not None
-            ),
+            (floor for _epoch, floor in self._deny_highwater.values() if floor is not None),
             default=None,
         )
 
@@ -777,6 +900,23 @@ class GatewayLocalState:
             raise ValueError("target generation does not exceed deny floor")
         if base is not None and ref.generation <= base.generation:
             raise ValueError("target generation must increase")
+
+    def validate_commit_reference(self, target: BundleReference) -> None:
+        if self._staged != target:
+            raise ValueError("commit target differs from staged bundle")
+        floor = self.deny_floor_generation
+        if floor is not None and target.generation <= floor:
+            raise ValueError("commit target does not exceed deny floor")
+        expected_base = (
+            None
+            if self._active is None
+            else BaseReference(
+                generation=self._active.generation,
+                bundle_hash=self._active.bundle_hash,
+            )
+        )
+        if self._base != expected_base:
+            raise ValueError("staged base differs from current active bundle")
 
     def stage_prepare(
         self,
@@ -833,8 +973,7 @@ class GatewayLocalState:
         ack_id: AckId,
         result: Mapping[str, JsonValue],
     ) -> PolicyBundleV1:
-        if self._staged != target:
-            raise ValueError("commit target differs from staged bundle")
+        self.validate_commit_reference(target)
         bundle = self.load_bundle(target.bundle_hash)
         self._write_active_pointer(canonical_json_bytes(target.model_dump(mode="json")))
         with self.transaction():
@@ -868,6 +1007,7 @@ class GatewayLocalState:
     def _verify_deny_store(self) -> None:
         try:
             self._load_denies()
+            self._load_deny_highwater()
         except (sqlite3.DatabaseError, ValueError):
             self._recovery_required = True
             raise
@@ -882,9 +1022,18 @@ class GatewayLocalState:
     ) -> None:
         key = (payload.subject_type, payload.subject_id)
         self._verify_deny_store()
-        existing = self._denies.get(key)
-        if existing is not None and payload.deny_epoch <= existing.deny_epoch:
+        highwater = self._deny_highwater.get(key)
+        if highwater is not None and payload.deny_epoch <= highwater[0]:
             raise ValueError("deny epoch must strictly increase")
+        if (
+            highwater is not None
+            and highwater[1] is not None
+            and (
+                payload.deny_floor_generation is None
+                or payload.deny_floor_generation < highwater[1]
+            )
+        ):
+            raise ValueError("deny floor cannot contract")
         now = self.clock.now_ms()
         overlay = DenyOverlayV1(**payload.model_dump(mode="python"), heartbeat_at_ms=now)
         record = {
@@ -906,9 +1055,30 @@ class GatewayLocalState:
                 "checksum=excluded.checksum",
                 (*record.values(), _checksum("denies", record)),
             )
+            highwater_record = {
+                "subject_type": overlay.subject_type.value,
+                "subject_id": overlay.subject_id,
+                "deny_epoch": overlay.deny_epoch,
+                "floor_generation": overlay.deny_floor_generation,
+            }
+            self.db.execute(
+                "INSERT INTO deny_highwater VALUES(?,?,?,?,?) "
+                "ON CONFLICT(subject_type,subject_id) DO UPDATE SET "
+                "deny_epoch=excluded.deny_epoch,"
+                "floor_generation=excluded.floor_generation,"
+                "checksum=excluded.checksum",
+                (
+                    *highwater_record.values(),
+                    _checksum("deny_highwater", highwater_record),
+                ),
+            )
             self._set_meta("deny_heartbeat_ms", str(now))
             self._record_pending(verified, ack_id, GatewayAckStatus.DENIED, result)
         self._denies[key], self._deny_heartbeat_ms = overlay, now
+        self._deny_highwater[key] = (
+            overlay.deny_epoch,
+            overlay.deny_floor_generation,
+        )
         self.crash("deny_after_commit")
 
     def clear_deny(
@@ -935,36 +1105,44 @@ class GatewayLocalState:
         del self._denies[key]
         self._deny_heartbeat_ms = now
 
+    def _renew_deny_rows(
+        self,
+        now: int,
+    ) -> dict[tuple[DenySubjectType, str], DenyOverlayV1]:
+        self._load_denies()
+        self._load_deny_highwater()
+        updated: dict[tuple[DenySubjectType, str], DenyOverlayV1] = {}
+        for key, overlay in self._denies.items():
+            fresh = overlay.model_copy(update={"heartbeat_at_ms": now})
+            record = {
+                "subject_type": fresh.subject_type.value,
+                "subject_id": fresh.subject_id,
+                "deny_epoch": fresh.deny_epoch,
+                "reason": fresh.reason.value,
+                "floor_generation": fresh.deny_floor_generation,
+                "heartbeat_at_ms": now,
+            }
+            self.db.execute(
+                "UPDATE denies SET heartbeat_at_ms=?,checksum=? "
+                "WHERE subject_type=? AND subject_id=?",
+                (
+                    now,
+                    _checksum("denies", record),
+                    fresh.subject_type.value,
+                    fresh.subject_id,
+                ),
+            )
+            updated[key] = fresh
+        self._set_meta("deny_heartbeat_ms", str(now))
+        return updated
+
     def renew_deny_heartbeats(self, now_ms: int | None = None) -> None:
         now = self.clock.now_ms() if now_ms is None else now_ms
         if now < 1:
             raise ValueError("heartbeat time must be positive")
-        updated: dict[tuple[DenySubjectType, str], DenyOverlayV1] = {}
         try:
             with self.transaction():
-                self._load_denies()
-                for key, overlay in self._denies.items():
-                    fresh = overlay.model_copy(update={"heartbeat_at_ms": now})
-                    record = {
-                        "subject_type": fresh.subject_type.value,
-                        "subject_id": fresh.subject_id,
-                        "deny_epoch": fresh.deny_epoch,
-                        "reason": fresh.reason.value,
-                        "floor_generation": fresh.deny_floor_generation,
-                        "heartbeat_at_ms": now,
-                    }
-                    self.db.execute(
-                        "UPDATE denies SET heartbeat_at_ms=?,checksum=? "
-                        "WHERE subject_type=? AND subject_id=?",
-                        (
-                            now,
-                            _checksum("denies", record),
-                            fresh.subject_type.value,
-                            fresh.subject_id,
-                        ),
-                    )
-                    updated[key] = fresh
-                self._set_meta("deny_heartbeat_ms", str(now))
+                updated = self._renew_deny_rows(now)
         except (sqlite3.DatabaseError, ValueError):
             self._recovery_required = True
             raise
@@ -1004,6 +1182,31 @@ class GatewayLocalState:
             )
         )
 
+    def _prune_auth_leases(self, now: int) -> None:
+        remove: list[str] = []
+        for row in self.db.execute("SELECT * FROM auth_leases ORDER BY rowid"):
+            try:
+                raw = json.loads(str(row["lease_json"]))
+                lease = AuthLeaseV1.model_validate(raw)
+            except (ValueError, ValidationError):
+                remove.append(str(row["lease_id"]))
+                continue
+            if lease.expires_at_ms <= now or lease.boot_id != self.boot_id:
+                remove.append(str(row["lease_id"]))
+        if remove:
+            self.db.executemany(
+                "DELETE FROM auth_leases WHERE lease_id=?",
+                ((lease_id,) for lease_id in remove),
+            )
+        count = int(self.db.execute("SELECT count(*) FROM auth_leases").fetchone()[0])
+        excess = count - self.limits.max_auth_leases + 1
+        if excess > 0:
+            self.db.execute(
+                "DELETE FROM auth_leases WHERE lease_id IN ("
+                "SELECT lease_id FROM auth_leases ORDER BY rowid LIMIT ?)",
+                (excess,),
+            )
+
     def issue_auth_lease(self, now: int) -> AuthLeaseV1:
         if self._active is None or self.deny_all:
             raise RuntimeError("healthy active state is required for auth lease")
@@ -1011,6 +1214,7 @@ class GatewayLocalState:
             lease_id=AuthLeaseId.new(),
             installation_id=self.installation_id,
             security_epoch=self.security_epoch,
+            boot_id=self.boot_id,
             bundle=self._active,
             issued_at_ms=now,
             expires_at_ms=now + _AUTH_LEASE_MS,
@@ -1037,6 +1241,7 @@ class GatewayLocalState:
                 lease.bundle == self._active
                 and lease.security_epoch == self.security_epoch
                 and lease.issued_at_ms <= now < lease.expires_at_ms
+                and lease.boot_id == self.boot_id
             ):
                 return lease
         return None
@@ -1049,9 +1254,25 @@ class GatewayLocalState:
         issue_lease: bool,
         result_factory: Callable[[AuthLeaseV1 | None], Mapping[str, JsonValue]],
     ) -> None:
-        with self.transaction():
-            lease = self.issue_auth_lease(self.clock.now_ms()) if issue_lease else None
-            self._record_pending(verified, ack_id, GatewayAckStatus.STATUS, result_factory(lease))
+        now = self.clock.now_ms()
+        old_denies = self._denies
+        old_heartbeat = self._deny_heartbeat_ms
+        try:
+            with self.transaction():
+                updated = self._renew_deny_rows(now)
+                self._denies, self._deny_heartbeat_ms = updated, now
+                self._prune_auth_leases(now)
+                lease = self.issue_auth_lease(now) if issue_lease else None
+                self.crash("status_after_heartbeat")
+                self._record_pending(
+                    verified,
+                    ack_id,
+                    GatewayAckStatus.STATUS,
+                    result_factory(lease),
+                )
+        except BaseException:
+            self._denies, self._deny_heartbeat_ms = old_denies, old_heartbeat
+            raise
 
     def current_auth_view(self) -> AuthRuntimeView:
         if self._active_bundle is None or self._active is None:
@@ -1212,7 +1433,10 @@ class GatewayLocalState:
             "staged": dump(self._staged),
             "previous": dump(self._previous),
             "base": dump(self._base),
-            "denies": cast(JsonValue, [x.model_dump(mode="json") for x in self._denies.values()]),
+            "denies": cast(
+                JsonValue,
+                [x.model_dump(mode="json") for x in self._denies.values()],
+            ),
             "deny_heartbeat_ms": self._deny_heartbeat_ms,
             "command_count": self.command_count,
             "recovery_required": self._recovery_required,
@@ -1231,7 +1455,8 @@ class GatewayLocalState:
             retained.update(
                 BundleHash(str(x[0]))
                 for x in self.db.execute(
-                    "SELECT bundle_hash FROM bundles WHERE generation=?", (floor,)
+                    "SELECT bundle_hash FROM bundles WHERE generation=?",
+                    (floor,),
                 )
             )
         for path in self.bundles_path.glob("bh_*.json"):
@@ -1300,7 +1525,11 @@ class TakeoverCoordinator:
                 target_installation_id=target_installation_id,
                 minimum_fence_epoch=self._state.fence_epoch,
             )
-            await asyncio.to_thread(self._state.record_old_fence, receipt)
+            (_result, cancelled) = await _await_durable(
+                asyncio.to_thread(self._state.record_old_fence, receipt)
+            )
+            if cancelled:
+                raise asyncio.CancelledError
             return receipt
 
     async def accept(self, receipt: FenceReceiptV1) -> None:
@@ -1313,7 +1542,11 @@ class TakeoverCoordinator:
                 target_installation_id=self._state.installation_id,
                 minimum_fence_epoch=self._state.fence_epoch,
             )
-            await asyncio.to_thread(self._state.accept_takeover, receipt)
+            (_result, cancelled) = await _await_durable(
+                asyncio.to_thread(self._state.accept_takeover, receipt)
+            )
+            if cancelled:
+                raise asyncio.CancelledError
 
 
 class ActivationGenerationGate:
@@ -1348,6 +1581,7 @@ class ActivationService:
         backend_manifest_hash: str,
         dispatcher_gate: DispatcherGate,
         apply_bundle: Callable[[PolicyBundleV1], None],
+        preflight_bundle: Callable[[PolicyBundleV1], None],
         clock: Clock | None = None,
         limits: BundleLimits | None = None,
         readiness_probe: Callable[[], tuple[bool, bool, bool]] | None = None,
@@ -1360,23 +1594,30 @@ class ActivationService:
         self.ack_signer, self.generation_gate = ack_signer, generation_gate
         self.backend_manifest_hash, self.dispatcher_gate = backend_manifest_hash, dispatcher_gate
         self.apply_bundle, self.clock = apply_bundle, clock or _SystemClock()
+        self.preflight_bundle = preflight_bundle
         self.limits = limits or BundleLimits()
         self._validation_slots = asyncio.Semaphore(2)
         self._command_lock = asyncio.Lock()
         self._readiness = readiness_probe or (lambda: (False, False, False))
 
     def _verify(self, command: GatewayCommandV1) -> VerifiedGatewayCommand:
-        return verify_gateway_command(
+        return authenticate_gateway_command(
             command,
             self.policy_keys,
             self.channel_trust,
-            expected_boot_id=self.state.boot_id,
-            expected_fence_epoch=self.state.fence_epoch,
         )
 
     def _assert_current_fence(self, verified: VerifiedGatewayCommand) -> None:
         if verified.command.dispatcher_fence != self.state.fence_epoch:
             raise StaleFenceEpoch("command dispatcher fence changed while waiting")
+
+    def _assert_unseen_binding(self, verified: VerifiedGatewayCommand) -> None:
+        command = verified.command
+        if command.boot_id != self.state.boot_id:
+            raise CommandBootMismatch("command names another Gateway boot")
+        if command.security_epoch != self.channel_trust.security_epoch:
+            raise StaleSecurityEpoch("command security epoch is not current")
+        self._assert_current_fence(verified)
 
     @staticmethod
     def _policy_matches(
@@ -1416,11 +1657,17 @@ class ActivationService:
             for leg in policy.authorized_legs
         ):
             raise ValueError("bundle deployment generation is not operational")
+        self.preflight_bundle(bundle)
         return bundle
 
     def _ack(self, verified: VerifiedGatewayCommand, record: _CommandRecord) -> GatewayAckV1:
         if record.ack is not None:
             return record.ack
+        if (
+            record.status is GatewayAckStatus.APPLIED
+            and self.state.lifecycle is GatewayLifecycle.RECOVERY_REQUIRED
+        ):
+            raise RuntimeError("live bundle recovery is required before APPLIED ACK")
         command = verified.command
         unsigned = GatewayAckV1(
             ack_id=record.ack_id,
@@ -1428,9 +1675,9 @@ class ActivationService:
             command_digest=verified.command_digest,
             installation_id=self.state.installation_id,
             channel_epoch=command.channel_epoch,
-            security_epoch=self.state.security_epoch,
-            dispatcher_fence=self.state.fence_epoch,
-            boot_id=self.state.boot_id,
+            security_epoch=command.security_epoch,
+            dispatcher_fence=command.dispatcher_fence,
+            boot_id=command.boot_id,
             sequence=command.sequence,
             status=record.status,
             acknowledged_at_ms=self.clock.now_ms(),
@@ -1445,12 +1692,29 @@ class ActivationService:
         self.state.push_ack(ack)
         return ack
 
+    def status_readonly(self, command: GatewayCommandV1) -> GatewayStatusV1:
+        verified = self._verify(command)
+        self._assert_unseen_binding(verified)
+        if command.kind is not WireCommandKind.STATUS:
+            raise ValueError("read-only status requires STATUS")
+        payload = StatusCommandPayload.model_validate(command.payload)
+        if payload.issue_auth_lease:
+            raise ValueError("read-only status cannot issue an auth lease")
+        singleton, backend, capacities = self._readiness()
+        return self.state.status(
+            singleton_held=singleton,
+            backend_ready=backend,
+            capacities_ready=capacities,
+            now_ms=self.clock.now_ms(),
+        )
+
     async def execute(self, command: GatewayCommandV1) -> GatewayAckV1:
         verified = self._verify(command)
         async with self._command_lock:
             existing = self.state.validate_new_command(verified)
             if existing is not None:
                 return self._ack(verified, existing)
+            self._assert_unseen_binding(verified)
             if command.kind is WireCommandKind.PREPARE:
                 await self._prepare(verified)
             elif command.kind is WireCommandKind.COMMIT:
@@ -1460,9 +1724,9 @@ class ActivationService:
             elif command.kind is WireCommandKind.CLEAR_DENY:
                 return await self._clear(verified)
             elif command.kind is WireCommandKind.STATUS:
-                self._status(verified)
+                return await self._status(verified)
             else:
-                raise ValueError("takeover uses the fence-receipt API")
+                raise AssertionError("unreachable command kind")
             recorded = self.state.validate_new_command(verified)
             assert recorded is not None
             return self._ack(verified, recorded)
@@ -1471,36 +1735,69 @@ class ActivationService:
         payload = PrepareCommandPayload.model_validate(verified.command.payload)
         raw = payload.bundle_bytes()
         async with self._validation_slots:
-            bundle = await asyncio.to_thread(self._validate_bundle, raw, payload.target)
+            bundle = await asyncio.to_thread(
+                self._validate_bundle,
+                raw,
+                payload.target,
+            )
         self._policy_matches(verified.policy, payload.base, payload.target)
         self.state.validate_prepare_reference(payload.base, payload.target)
-        self.state.store_bundle(raw, payload.target.bundle_hash)
-        self.state.stage_prepare(
-            verified,
-            bundle,
-            payload.target,
-            payload.base,
-            ack_id=AckId.new(),
-            result={"target": payload.target.model_dump(mode="json")},
+        (_stored, cancelled) = await _await_durable(
+            asyncio.to_thread(
+                self.state.store_bundle,
+                raw,
+                payload.target.bundle_hash,
+            )
         )
+        if cancelled:
+            raise asyncio.CancelledError
+        async with self.dispatcher_gate.hold_activation():
+            self._assert_current_fence(verified)
+            self.state.validate_prepare_reference(payload.base, payload.target)
+            (_result, cancelled) = await _await_durable(
+                asyncio.to_thread(
+                    self.state.stage_prepare,
+                    verified,
+                    bundle,
+                    payload.target,
+                    payload.base,
+                    ack_id=AckId.new(),
+                    result={"target": payload.target.model_dump(mode="json")},
+                )
+            )
+            if cancelled:
+                raise asyncio.CancelledError
 
     async def _commit(self, verified: VerifiedGatewayCommand) -> GatewayAckV1:
         target = BundleReference.model_validate(verified.command.payload)
         self._policy_matches(verified.policy, self.state._base, target)
         async with self.dispatcher_gate.hold_activation():
             self._assert_current_fence(verified)
-            bundle = await asyncio.to_thread(
-                self.state.commit_staged,
-                verified,
-                target,
-                ack_id=AckId.new(),
-                result={"active": target.model_dump(mode="json")},
+            self.state.validate_commit_reference(target)
+            (bundle, cancelled) = await _await_durable(
+                asyncio.to_thread(
+                    self.state.commit_staged,
+                    verified,
+                    target,
+                    ack_id=AckId.new(),
+                    result={"active": target.model_dump(mode="json")},
+                )
             )
-            self.apply_bundle(bundle)
+            try:
+                self.apply_bundle(bundle)
+            except BaseException:
+                await asyncio.to_thread(
+                    self.state.enter_recovery_required,
+                    "live_swap_failed",
+                )
+                raise
             self.state.crash("memory_after_swap")
             recorded = self.state.validate_new_command(verified)
             assert recorded is not None
-            return self._ack(verified, recorded)
+            ack = self._ack(verified, recorded)
+            if cancelled:
+                raise asyncio.CancelledError
+            return ack
 
     def _active_policy(self, policy: ActivationEnvelope | None) -> None:
         if (
@@ -1514,35 +1811,46 @@ class ActivationService:
         payload = DenyCommandPayload.model_validate(verified.command.payload)
         self._active_policy(verified.policy)
         async with self.dispatcher_gate.hold_activation():
-            await asyncio.to_thread(
-                self.state.issue_deny,
-                verified,
-                payload,
-                ack_id=AckId.new(),
-                result={"deny": payload.model_dump(mode="json")},
+            self._assert_current_fence(verified)
+            (_result, cancelled) = await _await_durable(
+                asyncio.to_thread(
+                    self.state.issue_deny,
+                    verified,
+                    payload,
+                    ack_id=AckId.new(),
+                    result={"deny": payload.model_dump(mode="json")},
+                )
             )
             recorded = self.state.validate_new_command(verified)
             assert recorded is not None
-            return self._ack(verified, recorded)
+            ack = self._ack(verified, recorded)
+            if cancelled:
+                raise asyncio.CancelledError
+            return ack
 
     async def _clear(self, verified: VerifiedGatewayCommand) -> GatewayAckV1:
         payload = ClearDenyCommandPayload.model_validate(verified.command.payload)
         self._active_policy(verified.policy)
         async with self.dispatcher_gate.hold_activation():
-            await asyncio.to_thread(
-                self.state.clear_deny,
-                verified,
-                payload,
-                ack_id=AckId.new(),
-                result={"cleared": payload.model_dump(mode="json")},
+            self._assert_current_fence(verified)
+            (_result, cancelled) = await _await_durable(
+                asyncio.to_thread(
+                    self.state.clear_deny,
+                    verified,
+                    payload,
+                    ack_id=AckId.new(),
+                    result={"cleared": payload.model_dump(mode="json")},
+                )
             )
             recorded = self.state.validate_new_command(verified)
             assert recorded is not None
-            return self._ack(verified, recorded)
+            ack = self._ack(verified, recorded)
+            if cancelled:
+                raise asyncio.CancelledError
+            return ack
 
-    def _status(self, verified: VerifiedGatewayCommand) -> None:
+    async def _status(self, verified: VerifiedGatewayCommand) -> GatewayAckV1:
         payload = StatusCommandPayload.model_validate(verified.command.payload)
-        self.state.renew_deny_heartbeats(self.clock.now_ms())
         singleton, backend, capacities = self._readiness()
 
         def result(_lease: AuthLeaseV1 | None) -> Mapping[str, JsonValue]:
@@ -1554,9 +1862,20 @@ class ActivationService:
             )
             return {"status": status.model_dump(mode="json")}
 
-        self.state.record_status(
-            verified,
-            ack_id=AckId.new(),
-            issue_lease=payload.issue_auth_lease,
-            result_factory=result,
-        )
+        async with self.dispatcher_gate.hold_activation():
+            self._assert_current_fence(verified)
+            (_result, cancelled) = await _await_durable(
+                asyncio.to_thread(
+                    self.state.record_status,
+                    verified,
+                    ack_id=AckId.new(),
+                    issue_lease=payload.issue_auth_lease,
+                    result_factory=result,
+                )
+            )
+            recorded = self.state.validate_new_command(verified)
+            assert recorded is not None
+            ack = self._ack(verified, recorded)
+            if cancelled:
+                raise asyncio.CancelledError
+            return ack

@@ -1452,6 +1452,54 @@ class RuntimeState:
     def account_capacity(self, account_id: AccountId) -> AccountCapacity:
         return self.account_runtime(account_id).capacity()
 
+    def validate_publication(self, accounts: Iterable[ProviderAccount]) -> None:
+        with self._lock:
+            validated = tuple(ProviderAccount.model_validate(account) for account in accounts)
+            account_ids = tuple(account.account_id for account in validated)
+            if len(set(account_ids)) != len(account_ids):
+                raise AccountBindingConflict("publication contains duplicate Account IDs")
+            binding_history = dict(self._binding_history)
+            account_binding = dict(self._account_binding)
+            epoch_highwater = dict(self._credential_epoch_highwater)
+            attestation_history = dict(self._credential_attestation_digest)
+            for account in validated:
+                binding_digest = self._binding_digest(account)
+                attestation_digest = self._attestation_digest(account)
+                previous_binding = account_binding.get(account.account_id)
+                if previous_binding is not None and previous_binding != binding_digest:
+                    raise AccountBindingConflict("Account ID cannot change its provider binding")
+                if binding_digest:
+                    owner = binding_history.get(binding_digest)
+                    if owner is not None and owner != account.account_id:
+                        raise AccountBindingConflict(
+                            "provider binding is globally unique across live and "
+                            "tombstoned accounts"
+                        )
+                epoch = account.credential_epoch or 0
+                highwater = epoch_highwater.get(account.account_id, 0)
+                previous_attestation = attestation_history.get(account.account_id)
+                if epoch < highwater or (
+                    epoch == highwater
+                    and previous_attestation is not None
+                    and attestation_digest != previous_attestation
+                ):
+                    raise CredentialAttestationRollback(
+                        "credential attestation cannot rewind or change within one epoch"
+                    )
+                if binding_digest:
+                    binding_history[binding_digest] = account.account_id
+                    account_binding[account.account_id] = binding_digest
+                epoch_highwater[account.account_id] = epoch
+                attestation_history[account.account_id] = attestation_digest
+            selected = set(account_ids)
+            for account_id, runtime in self._runtimes.items():
+                if account_id not in selected and runtime.account.state is AccountState.ACTIVE:
+                    ProviderAccount.model_validate(
+                        runtime.account.model_copy(
+                            update={"state": AccountState.DISABLED}
+                        ).model_dump(mode="python")
+                    )
+
     def apply_publication(self, accounts: Iterable[ProviderAccount]) -> None:
         with self._lock:
             validated = tuple(ProviderAccount.model_validate(account) for account in accounts)
@@ -1877,3 +1925,8 @@ class RuntimeState:
                 )
         if self._journal.checkpoint_due:
             self._journal.maybe_checkpoint(self._snapshot_locked())
+
+    def close(self) -> None:
+        with self._lock:
+            self._journal.maybe_checkpoint(self._snapshot_locked())
+        self._journal.close()

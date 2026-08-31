@@ -24,6 +24,7 @@ from llmmaxxing.core.wire import (
     WireCommandKind,
 )
 from llmmaxxing.gateway.activation import ActivationService, GatewayLocalState
+from llmmaxxing.gateway.runtime_state import RuntimeState
 
 
 class ClosableASGI(Protocol):
@@ -101,12 +102,16 @@ class EmergencyServer:
         required_uid: int = 0,
         crash_injector: Callable[[str], None] | None = None,
         max_command_bytes: int = 64 * 1024,
+        listen_socket: socket.socket | None = None,
+        socket_owner_uid: int = 0,
     ) -> None:
         if required_uid < 0 or max_command_bytes < 1:
             raise ValueError("invalid emergency server bounds")
         self.path = Path(path)
         self.service = service
         self.required_uid = required_uid
+        self.listen_socket = listen_socket
+        self.socket_owner_uid = socket_owner_uid
         self.max_command_bytes = max_command_bytes
         self._crash = crash_injector or (lambda _point: None)
         self._server: asyncio.AbstractServer | None = None
@@ -115,28 +120,31 @@ class EmergencyServer:
     async def start(self) -> None:
         if self._server is not None:
             return
-        if os.geteuid() != self.required_uid:
-            label = "root" if self.required_uid == 0 else f"uid {self.required_uid}"
-            raise PermissionError(f"emergency socket requires {label}")
+        if self.listen_socket is None and os.geteuid() != self.socket_owner_uid:
+            label = "root" if self.socket_owner_uid == 0 else f"uid {self.socket_owner_uid}"
+            raise PermissionError(f"emergency socket creation requires {label}")
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        try:
-            os.lstat(self.path)
-        except FileNotFoundError:
-            pass
+        if self.listen_socket is None:
+            self._remove_stale_socket()
+            server = await asyncio.start_unix_server(
+                self._handle,
+                path=self.path,
+                limit=self.max_command_bytes + 1,
+            )
         else:
-            raise RuntimeError("refusing existing emergency socket path")
-        server = await asyncio.start_unix_server(
-            self._handle,
-            path=self.path,
-            limit=self.max_command_bytes + 1,
-        )
+            server = await asyncio.start_unix_server(
+                self._handle,
+                sock=self.listen_socket,
+                limit=self.max_command_bytes + 1,
+            )
         try:
-            os.chmod(self.path, 0o600)
+            if self.listen_socket is None:
+                os.chmod(self.path, 0o600)
             metadata = os.lstat(self.path)
             if not stat.S_ISSOCK(metadata.st_mode):
                 raise RuntimeError("emergency path is not a fresh socket")
-            if metadata.st_uid != self.required_uid:
-                raise PermissionError("emergency socket owner is not the required uid")
+            if metadata.st_uid != self.socket_owner_uid:
+                raise PermissionError("emergency socket owner is not trusted")
             if stat.S_IMODE(metadata.st_mode) != 0o600:
                 raise PermissionError("emergency socket mode is not 0600")
         except BaseException:
@@ -147,6 +155,31 @@ class EmergencyServer:
             raise
         self._server = server
         self._inode = (metadata.st_dev, metadata.st_ino)
+
+    def _remove_stale_socket(self) -> None:
+        try:
+            metadata = os.lstat(self.path)
+        except FileNotFoundError:
+            return
+        if (
+            not stat.S_ISSOCK(metadata.st_mode)
+            or metadata.st_uid != self.socket_owner_uid
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+        ):
+            raise RuntimeError("refusing existing emergency socket path")
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            try:
+                probe.connect(str(self.path))
+            except ConnectionRefusedError:
+                self.path.unlink()
+                _fsync_parent(self.path)
+                return
+            except OSError as error:
+                raise RuntimeError("cannot prove emergency socket is stale") from error
+            raise RuntimeError("refusing live emergency socket path")
+        finally:
+            probe.close()
 
     def _peer_allowed(self, writer: asyncio.StreamWriter) -> bool:
         connection = writer.get_extra_info("socket")
@@ -197,6 +230,10 @@ class EmergencyServer:
                 await self._reply(writer, {"error": "emergency_command_not_contraction"})
                 return
             try:
+                if command.kind is WireCommandKind.STATUS:
+                    status_value = self.service.status_readonly(command)
+                    await self._reply(writer, status_value.model_dump(mode="json"))
+                    return
                 ack = await self.service.execute(command)
             except Exception:
                 await self._reply(writer, {"error": "emergency_command_rejected"})
@@ -245,6 +282,7 @@ class GatewayRuntime:
         app: ClosableASGI,
         *,
         state: GatewayLocalState,
+        runtime_state: RuntimeState,
         singleton: GatewaySingleton,
         backend_ready: Callable[[], bool],
         capacities_ready: Callable[[], bool],
@@ -252,6 +290,7 @@ class GatewayRuntime:
     ) -> None:
         self.app = app
         self.state = state
+        self.runtime_state = runtime_state
         self.singleton = singleton
         self.backend_ready = backend_ready
         self.capacities_ready = capacities_ready
@@ -261,7 +300,7 @@ class GatewayRuntime:
     async def startup(self) -> None:
         if self._started:
             return
-        if not self.singleton.acquire():
+        if not self.singleton.held and not self.singleton.acquire():
             raise RuntimeError("another Gateway dispatcher owns the singleton")
         try:
             if self.emergency is not None:
@@ -294,9 +333,12 @@ class GatewayRuntime:
             try:
                 await self.app.aclose()
             finally:
-                await asyncio.to_thread(self.state.close)
-                self.singleton.release()
-                self._started = False
+                try:
+                    await asyncio.to_thread(self.runtime_state.close)
+                finally:
+                    await asyncio.to_thread(self.state.close)
+                    self.singleton.release()
+                    self._started = False
 
     async def __call__(
         self,

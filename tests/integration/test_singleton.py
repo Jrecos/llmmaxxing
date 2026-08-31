@@ -4,6 +4,7 @@ import asyncio
 import json
 import multiprocessing
 import os
+import socket
 import stat
 from pathlib import Path
 from typing import Any
@@ -104,6 +105,7 @@ async def test_root_uds_is_0600_contraction_only_and_replays_durable_ack(tmp_pat
         socket_path,
         harness.service,
         required_uid=os.geteuid(),
+        socket_owner_uid=os.geteuid(),
         crash_injector=crash,
     )
     await server.start()
@@ -116,16 +118,14 @@ async def test_root_uds_is_0600_contraction_only_and_replays_durable_ack(tmp_pat
         StatusCommandPayload(issue_auth_lease=False),
         policy=None,
     )
-    assert await _request(socket_path, status) == b""
+    heartbeat_before = harness.state.export_state()["deny_heartbeat_ms"]
     durable_count = harness.state.command_count
-    replay = await _request(socket_path, status)
-    assert replay
+    response = json.loads((await _request(socket_path, status)).decode())
+    assert response["lifecycle"] == "applied"
     assert harness.state.command_count == durable_count
-
-    harness.sequence = status.sequence
-    from llmmaxxing.core.wire import gateway_command_digest
-
-    harness.previous_digest = gateway_command_digest(status)
+    assert harness.state.export_state()["deny_heartbeat_ms"] == heartbeat_before
+    assert await _request(socket_path, status)
+    assert harness.state.command_count == durable_count
     lease_status = harness.command(
         WireCommandKind.STATUS,
         StatusCommandPayload(issue_auth_lease=True),
@@ -158,8 +158,11 @@ async def test_root_uds_is_0600_contraction_only_and_replays_durable_ack(tmp_pat
         ),
         policy=signed_policy(harness.policy_key, bundle, bundle),
     )
+    assert await _request(socket_path, deny) == b""
+    durable_count = harness.state.command_count
     response = await _request(socket_path, deny)
     assert json.loads(response)["status"] == "denied"
+    assert harness.state.command_count == durable_count
     await server.stop()
     assert not socket_path.exists()
 
@@ -181,8 +184,66 @@ async def test_uds_requires_root_by_default_and_never_unlinks_foreign_inode(tmp_
             foreign,
             harness.service,
             required_uid=os.geteuid(),
+            socket_owner_uid=os.geteuid(),
         ).start()
     assert foreign.is_symlink()
+
+
+@async_test
+async def test_emergency_server_recovers_only_safe_stale_socket(tmp_path: Path) -> None:
+    harness = make_harness(tmp_path / "state")
+    path = tmp_path / "stale.sock"
+    stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    stale.bind(str(path))
+    stale.listen(1)
+    os.chmod(path, 0o600)
+    stale.close()
+    server = EmergencyServer(
+        path,
+        harness.service,
+        required_uid=os.geteuid(),
+        socket_owner_uid=os.geteuid(),
+    )
+    await server.start()
+    assert stat.S_ISSOCK(path.stat().st_mode)
+    await server.stop()
+
+    live_path = tmp_path / "live.sock"
+    live = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    live.bind(str(live_path))
+    live.listen(1)
+    os.chmod(live_path, 0o600)
+    with pytest.raises(RuntimeError, match="live"):
+        await EmergencyServer(
+            live_path,
+            harness.service,
+            required_uid=os.geteuid(),
+            socket_owner_uid=os.geteuid(),
+        ).start()
+    live.close()
+    live_path.unlink()
+
+
+@async_test
+async def test_emergency_server_accepts_privileged_socket_activation(
+    tmp_path: Path,
+) -> None:
+    harness = make_harness(tmp_path / "state")
+    path = tmp_path / "activated.sock"
+    activated = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    activated.bind(str(path))
+    activated.listen(16)
+    os.chmod(path, 0o600)
+    server = EmergencyServer(
+        path,
+        harness.service,
+        required_uid=os.geteuid(),
+        socket_owner_uid=os.geteuid(),
+        listen_socket=activated,
+    )
+    await server.start()
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    await server.stop()
 
 
 @async_test
@@ -304,6 +365,14 @@ class _InnerApp:
         self.closed = True
 
 
+class _RuntimeState:
+    def __init__(self) -> None:
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
 @async_test
 async def test_runtime_readiness_and_shutdown_own_singleton_app_and_store(tmp_path: Path) -> None:
     harness = make_harness(tmp_path / "state")
@@ -317,10 +386,12 @@ async def test_runtime_readiness_and_shutdown_own_singleton_app_and_store(tmp_pa
     )
     await harness.execute(status)
     inner = _InnerApp()
+    runtime_state = _RuntimeState()
     singleton = GatewaySingleton(tmp_path / "state")
     runtime = GatewayRuntime(
         inner,
         state=harness.state,
+        runtime_state=runtime_state,  # type: ignore[arg-type]
         singleton=singleton,
         backend_ready=lambda: True,
         capacities_ready=lambda: True,
@@ -329,6 +400,7 @@ async def test_runtime_readiness_and_shutdown_own_singleton_app_and_store(tmp_pa
     assert runtime.status().readiness is GatewayReadiness.READY
     await runtime.shutdown()
     assert inner.closed
+    assert runtime_state.closed
     assert not singleton.held
     with pytest.raises(RuntimeError, match="not open"):
         _ = harness.state.db

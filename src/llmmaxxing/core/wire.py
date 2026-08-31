@@ -204,8 +204,6 @@ class WireCommandKind(StrEnum):
     DENY = "deny"
     CLEAR_DENY = "clear_deny"
     STATUS = "status"
-    TAKEOVER_FENCE = "takeover_fence"
-    TAKEOVER_RELEASE = "takeover_release"
 
 
 _MUTATING_POLICY_KINDS = frozenset(
@@ -318,6 +316,7 @@ class AuthLeaseV1(_Frozen):
     lease_id: AuthLeaseId
     installation_id: InstallationId
     security_epoch: int = Field(ge=1)
+    boot_id: GatewayBootId
     bundle: BundleReference
     issued_at_ms: int = Field(ge=1)
     expires_at_ms: int = Field(ge=1)
@@ -389,8 +388,6 @@ class GatewayAckStatus(StrEnum):
     DENIED = "denied"
     DENY_CLEARED = "deny_cleared"
     STATUS = "status"
-    FENCED = "fenced"
-    TAKEOVER_RELEASED = "takeover_released"
 
 
 class GatewayAckV1(_Frozen):
@@ -426,10 +423,6 @@ class FenceReceiptPayloadV1(_Frozen):
 class FenceReceiptV1(_Frozen):
     payload: FenceReceiptPayloadV1
     channel_seal: ChannelSealV1
-
-
-class TakeoverReleasePayload(_Frozen):
-    receipt: FenceReceiptV1
 
 
 @dataclass(frozen=True, slots=True)
@@ -555,26 +548,15 @@ class VerifiedGatewayCommand:
     policy: ActivationEnvelope | None
 
 
-def verify_gateway_command(
+def authenticate_gateway_command(
     command: GatewayCommandV1,
     policy_keys: Mapping[int, Mapping[str, Ed25519PublicKey]],
     channel_trust: ChannelTrustSet,
-    *,
-    expected_boot_id: GatewayBootId,
-    expected_fence_epoch: int,
 ) -> VerifiedGatewayCommand:
-    """Authenticate a command without reading its body or mutating durable state."""
+    """Verify immutable command identity and signatures without live boot/fence checks."""
 
     if command.installation_id != channel_trust.installation_id:
         raise CommandInstallationMismatch("command names another installation")
-    if command.boot_id != expected_boot_id:
-        raise CommandBootMismatch("command names another Gateway boot")
-    if command.security_epoch != channel_trust.security_epoch:
-        raise StaleSecurityEpoch("command security epoch is not current")
-    if command.kind is not WireCommandKind.TAKEOVER_RELEASE and (
-        command.dispatcher_fence != expected_fence_epoch
-    ):
-        raise StaleFenceEpoch("command dispatcher fence is not current")
     key = _channel_key(command.channel_seal, command.channel_epoch, channel_trust)
     try:
         key.verify(
@@ -587,6 +569,26 @@ def verify_gateway_command(
         None if command.policy is None else verify_signed_activation(command.policy, policy_keys)
     )
     return VerifiedGatewayCommand(command, gateway_command_digest(command), policy)
+
+
+def verify_gateway_command(
+    command: GatewayCommandV1,
+    policy_keys: Mapping[int, Mapping[str, Ed25519PublicKey]],
+    channel_trust: ChannelTrustSet,
+    *,
+    expected_boot_id: GatewayBootId,
+    expected_fence_epoch: int,
+) -> VerifiedGatewayCommand:
+    """Authenticate a new command and require current runtime binding."""
+
+    verified = authenticate_gateway_command(command, policy_keys, channel_trust)
+    if command.boot_id != expected_boot_id:
+        raise CommandBootMismatch("command names another Gateway boot")
+    if command.security_epoch != channel_trust.security_epoch:
+        raise StaleSecurityEpoch("command security epoch is not current")
+    if command.dispatcher_fence != expected_fence_epoch:
+        raise StaleFenceEpoch("command dispatcher fence is not current")
+    return verified
 
 
 def _seal_model[T: BaseModel](
