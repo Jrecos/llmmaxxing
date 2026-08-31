@@ -8,8 +8,6 @@
   "routes": [
     {"name": "chat", "method": "POST", "path": "/v1/chat/completions", "locator": "json.model"},
     {"name": "text", "method": "POST", "path": "/v1/completions", "locator": "json.model"},
-    {"name": "responses", "method": "POST", "path": "/v1/responses", "locator": "json.model"},
-    {"name": "messages", "method": "POST", "path": "/v1/messages", "locator": "json.model"},
     {"name": "embeddings", "method": "POST", "path": "/v1/embeddings", "locator": "json.model"},
     {"name": "rerank", "method": "POST", "path": "/v1/rerank", "locator": "json.model"},
     {"name": "audio_speech", "method": "POST", "path": "/v1/audio/speech", "locator": "json.model"},
@@ -17,6 +15,8 @@
     {"name": "image", "method": "POST", "path": "/v1/images/generations", "locator": "json.model"}
   ],
   "unsupported": [
+    "anthropic_messages",
+    "anthropic_messages_count_tokens",
     "responses_stateful_get",
     "responses_stateful_delete",
     "responses_cancel",

@@ -11,6 +11,8 @@ from typing import Any
 
 import pytest
 
+from llmmaxxing.adapters.litellm.contract import load_contract
+
 ROOT = Path(__file__).resolve().parents[3]
 FIXTURES = Path(__file__).parent / "fixtures"
 GUARD_PATH = ROOT / "deploy/litellm/llmmaxxing_guard.py"
@@ -92,6 +94,12 @@ def test_guard_has_stable_active_callbacks_digest_identity() -> None:
     assert guard.callback_name == "llmmaxxing_guard"
 
 
+def test_guard_execution_fields_match_the_certified_contract() -> None:
+    module = load_guard_module()
+
+    assert load_contract().known_execution_fields == module._CERTIFIED_EXECUTION_FIELDS
+
+
 def test_guard_registration_helper_deduplicates_and_moves_last() -> None:
     module, guard, _, _ = make_guard()
     other = object()
@@ -121,16 +129,32 @@ def test_guard_accepts_identical_metadata_copy_but_rejects_conflicting_copy() ->
         asyncio.run(guard.async_pre_call_deployment_hook(kwargs, None))
 
 
-def test_messages_compares_raw_provider_qualified_model_exactly() -> None:
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("api_path", "/v1/chat/completions"),
+        ("vertex_project", "added-project"),
+        ("vertex_location", "added-location"),
+        ("allow_client_keepalive_override", False),
+        ("merge_reasoning_content_in_choices", False),
+        ("use_in_pass_through", False),
+        ("use_litellm_proxy", False),
+        ("use_xai_oauth", False),
+    ),
+)
+def test_added_certified_execution_field_stops_before_provider(
+    field: str,
+    value: object,
+) -> None:
     module, guard, manifest, secret = make_guard()
     kwargs = request_kwargs(manifest, secret)
-    kwargs["metadata"]["llmmaxxing_guard"]["endpoint"] = "messages"
-    assert asyncio.run(guard.async_pre_call_deployment_hook(kwargs, None)) is kwargs
+    kwargs[field] = value
+    calls: list[dict[str, Any]] = []
 
-    for model in ("other/electron-v1", "electron/electron-v2", "electron-v1"):
-        kwargs["model"] = model
-        with pytest.raises(module.GuardViolation, match="execution"):
-            asyncio.run(guard.async_pre_call_deployment_hook(kwargs, None))
+    with pytest.raises(module.GuardViolation, match="execution"):
+        asyncio.run(guarded_provider_call(guard, kwargs, calls))
+
+    assert calls == []
 
 
 @pytest.mark.parametrize(
@@ -155,6 +179,7 @@ def test_messages_compares_raw_provider_qualified_model_exactly() -> None:
             "credential",
         ),
         (lambda k: k.update(api_base="https://repointed.invalid/v1"), "projection"),
+        (lambda k: k.pop("api_version"), "projection"),
         (lambda k: k["model_info"].update(mode="embedding"), "projection"),
         (
             lambda k: k["model_info"]["llmmaxxing"]["capabilities"].update(tools=False),

@@ -86,8 +86,8 @@ def test_contract_binds_one_exact_build_guard_and_explicit_service_keys() -> Non
     )
     assert contract.litellm.source_commit == "d8f71d7bdbd7c9873d98293f83d64c6db72847e6"
     assert contract.litellm.source_files == {
-        "litellm/llms/anthropic/experimental_pass_through/messages/handler.py": (
-            "sha256:afbb068d6f3d8e7d54c588455f6f81037257f7f9b2cc826e26aecfc34fe13d9b"
+        "litellm/proxy/anthropic_endpoints/endpoints.py": (
+            "sha256:953fd83edd62e1fe502c6481107ba4afa04280e121ac9ffce986632908137790"
         ),
         "litellm/proxy/auth/route_checks.py": (
             "sha256:4842bf096e877547e88492b772b03a8eb5dd579485b4e934ba052c886967758e"
@@ -136,7 +136,6 @@ def test_contract_certifies_only_native_receipt_endpoints_and_exact_locators() -
     assert {(e.name, e.method, e.path, e.model_locator) for e in contract.endpoints} == {
         ("chat", "POST", "/v1/chat/completions", "json.model"),
         ("text", "POST", "/v1/completions", "json.model"),
-        ("messages", "POST", "/v1/messages", "json.model"),
         ("embeddings", "POST", "/v1/embeddings", "json.model"),
         ("rerank", "POST", "/v1/rerank", "json.model"),
         ("audio_speech", "POST", "/v1/audio/speech", "json.model"),
@@ -146,7 +145,6 @@ def test_contract_certifies_only_native_receipt_endpoints_and_exact_locators() -
     assert {endpoint.name: endpoint.fence_locator for endpoint in contract.endpoints} == {
         "chat": "json.metadata",
         "text": "json.metadata",
-        "messages": "json.litellm_metadata",
         "embeddings": "json.metadata",
         "rerank": "json.metadata",
         "audio_speech": "json.metadata",
@@ -159,6 +157,8 @@ def test_contract_certifies_only_native_receipt_endpoints_and_exact_locators() -
         for endpoint in contract.endpoints
     )
     assert {
+        "anthropic_messages",
+        "anthropic_messages_count_tokens",
         "responses_stateful_get",
         "responses_stateful_delete",
         "responses_cancel",
@@ -171,6 +171,8 @@ def test_contract_certifies_only_native_receipt_endpoints_and_exact_locators() -
         "provider_passthrough",
     } <= set(contract.unsupported)
     assert {(probe.protocol, probe.method, probe.path) for probe in contract.denial_probes} == {
+        ("http", "POST", "/v1/messages"),
+        ("http", "POST", "/v1/messages/count_tokens"),
         ("http", "GET", "/v1/responses/{response_id}"),
         ("http", "DELETE", "/v1/responses/{response_id}"),
         ("http", "GET", "/v1/responses/{response_id}/input_items"),
@@ -178,10 +180,21 @@ def test_contract_certifies_only_native_receipt_endpoints_and_exact_locators() -
         ("http", "POST", "/v1/responses/compact"),
         ("websocket", "GET", "/v1/responses"),
     }
+    assert len(contract.endpoints) == 7
+    assert "/v1/messages" not in contract.service_keys.inference.allowed_routes
     assert "/v1/responses" not in contract.service_keys.inference.allowed_routes
 
     selectors = json.loads((FIXTURES / "endpoint-selectors.json").read_text())["fixtures"]
     assert set(selectors) == {endpoint.name for endpoint in contract.endpoints}
+    receipts = json.loads((FIXTURES / "receipts.json").read_text())
+    assert receipts["receipt_header"] == "x-litellm-model-id"
+    assert {
+        (route["name"], route["method"], route["path"], route["locator"])
+        for route in receipts["routes"]
+    } == {
+        (endpoint.name, endpoint.method, endpoint.path, endpoint.model_locator)
+        for endpoint in contract.endpoints
+    }
     for endpoint in contract.endpoints:
         selected = selectors[endpoint.name]
         if endpoint.model_locator == "json.model":
@@ -289,6 +302,37 @@ def test_unmanaged_row_cannot_collide_with_a_certified_alias() -> None:
 
     with pytest.raises(DiscoveryError, match="alias"):
         asyncio.run(LiteLLMAdapter(load_contract(), transport).discover_complete())
+
+
+def test_duplicate_unmanaged_pooled_alias_is_valid() -> None:
+    transport = FixtureTransport()
+    first = deepcopy(fixture("model-info-page-1.json"))
+    first["data"].extend(
+        [
+            {
+                "model_name": "deepseek-v4-flash",
+                "litellm_params": {"model": "openai/unmanaged-a"},
+                "model_info": {"id": "runtime-unmanaged-a"},
+            },
+            {
+                "model_name": "deepseek-v4-flash",
+                "litellm_params": {"model": "openai/unmanaged-b"},
+                "model_info": {"id": "runtime-unmanaged-b"},
+            },
+        ]
+    )
+    first["total_count"] = 4
+    transport.responses[("/v2/model/info", 1)] = first
+    second = deepcopy(fixture("model-info-page-2.json"))
+    second["total_count"] = 4
+    transport.responses[("/v2/model/info", 2)] = second
+
+    snapshot = asyncio.run(LiteLLMAdapter(load_contract(), transport).discover_complete())
+
+    assert [row.hidden_alias for row in snapshot.deployments] == [
+        "lmx/electron-v1",
+        "lmx/local-fixture",
+    ]
 
 
 def test_vertex_execution_fields_are_fenced_and_change_generation() -> None:

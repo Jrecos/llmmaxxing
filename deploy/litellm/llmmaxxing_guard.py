@@ -21,6 +21,7 @@ from typing import Any
 try:
     from litellm.integrations.custom_logger import CustomLogger
 except ImportError:  # Unit contract tests intentionally do not install LiteLLM.
+
     class CustomLogger:  # type: ignore[no-redef]
         pass
 
@@ -32,7 +33,6 @@ class GuardConfigurationError(RuntimeError):
 _CERTIFIED_EXECUTION_NORMALIZERS: dict[str, dict[str, str]] = {
     "chat": {},
     "text": {},
-    "messages": {},
     "embeddings": {},
     "rerank": {},
     "audio_speech": {},
@@ -41,6 +41,25 @@ _CERTIFIED_EXECUTION_NORMALIZERS: dict[str, dict[str, str]] = {
 }
 
 
+_CERTIFIED_EXECUTION_FIELDS = (
+    "custom_llm_provider",
+    "model",
+    "api_base",
+    "api_version",
+    "api_path",
+    "region_name",
+    "project",
+    "organization",
+    "deployment_name",
+    "base_model",
+    "allow_client_keepalive_override",
+    "merge_reasoning_content_in_choices",
+    "use_in_pass_through",
+    "use_litellm_proxy",
+    "use_xai_oauth",
+    "vertex_project",
+    "vertex_location",
+)
 
 
 class GuardViolation(RuntimeError):
@@ -118,7 +137,11 @@ def _validated_manifest(value: Mapping[str, Any], digest: str) -> Mapping[str, A
         if not isinstance(record["runtime_id"], str) or not record["runtime_id"]:
             raise GuardConfigurationError("guard runtime id is malformed")
         generation = record["generation_id"]
-        if not isinstance(generation, str) or not generation.startswith("dg1_") or len(generation) != 68:
+        if (
+            not isinstance(generation, str)
+            or not generation.startswith("dg1_")
+            or len(generation) != 68
+        ):
             raise GuardConfigurationError("guard generation id is malformed")
         if not isinstance(record["credential_field"], str) or not record["credential_field"]:
             raise GuardConfigurationError("guard credential field is empty")
@@ -142,7 +165,11 @@ def _validated_manifest(value: Mapping[str, Any], digest: str) -> Mapping[str, A
         if not isinstance(projection["account_binding"], str) or not projection["account_binding"]:
             raise GuardConfigurationError("guard account binding is empty")
         fingerprint = projection["credential_fingerprint"]
-        if not isinstance(fingerprint, str) or not fingerprint.startswith("hcf1_") or len(fingerprint) != 69:
+        if (
+            not isinstance(fingerprint, str)
+            or not fingerprint.startswith("hcf1_")
+            or len(fingerprint) != 69
+        ):
             raise GuardConfigurationError("guard credential fingerprint is malformed")
         if (
             not isinstance(projection["credential_epoch"], int)
@@ -175,7 +202,8 @@ def _model_group(kwargs: Mapping[str, Any]) -> str:
     groups = {
         value["model_group"]
         for name in ("metadata", "litellm_metadata")
-        if isinstance((value := kwargs.get(name)), Mapping) and isinstance(value.get("model_group"), str)
+        if isinstance((value := kwargs.get(name)), Mapping)
+        and isinstance(value.get("model_group"), str)
     }
     if len(groups) != 1:
         raise GuardViolation("selected hidden alias is missing or ambiguous")
@@ -230,7 +258,9 @@ class LLMMaxxingGuard(CustomLogger):
         key_file = os.environ.get("LLMMAXXING_GUARD_FINGERPRINT_KEY_FILE", "")
         key_text = os.environ.get("LLMMAXXING_GUARD_FINGERPRINT_KEY", "")
         if not manifest_path or not (key_file or key_text):
-            raise GuardConfigurationError("guard manifest and separate fingerprint key are required")
+            raise GuardConfigurationError(
+                "guard manifest and separate fingerprint key are required"
+            )
         try:
             manifest = json.loads(Path(manifest_path).read_text())
         except (OSError, json.JSONDecodeError) as exc:
@@ -242,9 +272,14 @@ class LLMMaxxingGuard(CustomLogger):
         digest = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
         return cls(manifest=manifest, hmac_key=hmac_key, guard_digest=digest)
 
-    async def async_pre_call_deployment_hook(self, kwargs: dict[str, Any], call_type: Any) -> dict[str, Any]:
+    async def async_pre_call_deployment_hook(
+        self, kwargs: dict[str, Any], call_type: Any
+    ) -> dict[str, Any]:
         del call_type
-        if kwargs.get("litellm_credential_name") is not None or kwargs.get("credentials") is not None:
+        if (
+            kwargs.get("litellm_credential_name") is not None
+            or kwargs.get("credentials") is not None
+        ):
             raise GuardViolation("dynamic credential-list forms are unsupported")
 
         fence = _metadata(kwargs)
@@ -316,11 +351,14 @@ class LLMMaxxingGuard(CustomLogger):
             projection["credential_fingerprint"],
         ):
             raise GuardViolation("resolved provider credential fingerprint mismatch")
+        current_execution = {
+            name: kwargs[name] for name in _CERTIFIED_EXECUTION_FIELDS if name in kwargs
+        }
         current_projection = {
             "contract_id": self._manifest["contract_id"],
             "hidden_alias": alias,
             "mode": info.get("mode"),
-            "execution": {name: kwargs.get(name) for name in projection["execution"]},
+            "execution": current_execution,
             "capabilities": semantics["capabilities"],
             "context": semantics["context"],
             "defaults": semantics["defaults"],
@@ -343,8 +381,10 @@ class LLMMaxxingGuard(CustomLogger):
         if "execution" in mismatches:
             execution_mismatches = [
                 field
-                for field in expected_execution
-                if frozen_current["execution"][field] != expected_execution[field]
+                for field in sorted(set(expected_execution) | set(current_execution))
+                if field not in expected_execution
+                or field not in current_execution
+                or current_execution[field] != expected_execution[field]
             ]
             mismatches[mismatches.index("execution")] = (
                 "execution(" + ",".join(execution_mismatches) + ")"

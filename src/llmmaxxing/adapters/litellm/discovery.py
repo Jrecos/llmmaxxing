@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Mapping
 from typing import Any, Protocol, Self
 
@@ -266,12 +267,16 @@ class LiteLLMAdapter:
         raw_aliases = [raw.get("model_name") for raw in raw_rows]
         if any(not isinstance(alias, str) or not alias for alias in raw_aliases):
             raise DiscoveryError("model-info row has an invalid alias")
-        if len(set(raw_aliases)) != len(raw_aliases):
-            raise DiscoveryError("an effective model alias is duplicated")
+        raw_alias_counts = Counter(raw_aliases)
         deployments = [row for raw in raw_rows if (row := self._deployment(raw)) is not None]
         if not deployments:
             raise DiscoveryError("no certified hidden deployments discovered")
         aliases = [row.hidden_alias for row in deployments]
+        collisions = sorted(alias for alias in aliases if raw_alias_counts[alias] != 1)
+        if collisions:
+            raise DiscoveryError(
+                f"a certified hidden alias collides with another effective row: {collisions}"
+            )
         runtime_ids = [row.runtime_id for row in deployments]
         if len(set(aliases)) != len(aliases):
             raise DiscoveryError("a hidden alias maps to more than one deployment")

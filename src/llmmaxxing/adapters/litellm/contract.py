@@ -120,7 +120,6 @@ class CertifiedEndpoint(_Frozen):
     model_locator: Literal["json.model", "multipart.model"]
     fence_locator: Literal[
         "json.metadata",
-        "json.litellm_metadata",
         "multipart.metadata",
     ]
     execution_normalizers: dict[str, Literal["provider_prefix_removed"]]
@@ -131,7 +130,7 @@ class CertifiedEndpoint(_Frozen):
 class DenialProbe(_Frozen):
     protocol: Literal["http", "websocket"]
     method: Literal["GET", "POST", "DELETE"]
-    path: str = Field(pattern=r"^/v1/responses")
+    path: str = Field(pattern=r"^/v1/(?:messages|responses)")
 
 
 class AdapterContract(_Frozen):
@@ -171,6 +170,8 @@ class AdapterContract(_Frozen):
         if discovery_routes != expected_discovery:
             raise ValueError("discovery service key must name exactly the discovery routes")
         expected_denials = {
+            ("http", "POST", "/v1/messages"),
+            ("http", "POST", "/v1/messages/count_tokens"),
             ("http", "GET", "/v1/responses/{response_id}"),
             ("http", "DELETE", "/v1/responses/{response_id}"),
             ("http", "GET", "/v1/responses/{response_id}/input_items"),
@@ -182,7 +183,7 @@ class AdapterContract(_Frozen):
             (probe.protocol, probe.method, probe.path) for probe in self.denial_probes
         }
         if observed_denials != expected_denials or len(self.denial_probes) != len(expected_denials):
-            raise ValueError("Responses denial probes do not match pinned routes")
+            raise ValueError("certified denial probes do not match pinned routes")
         return self
 
     def endpoint(self, name: str) -> CertifiedEndpoint:
@@ -307,7 +308,6 @@ class PreparedDispatch(_Frozen):
     model_locator: Literal["json.model", "multipart.model"]
     fence_locator: Literal[
         "json.metadata",
-        "json.litellm_metadata",
         "multipart.metadata",
     ]
     execution_normalizers: dict[str, Literal["provider_prefix_removed"]]

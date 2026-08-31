@@ -12,10 +12,6 @@
       "content_type": "application/json",
       "body": {"model": "__HIDDEN_ALIAS__", "prompt": "fixture", "max_tokens": 1}
     },
-    "messages": {
-      "content_type": "application/json",
-      "body": {"model": "__HIDDEN_ALIAS__", "messages": [{"role": "user", "content": "fixture"}], "max_tokens": 1}
-    },
     "embeddings": {
       "content_type": "application/json",
       "body": {"model": "__HIDDEN_ALIAS__", "input": "fixture"}

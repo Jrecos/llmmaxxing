@@ -59,14 +59,6 @@ ENDPOINT_SPECS: dict[str, dict[str, str]] = {
         "model": "openai/fixture-text",
         "api_base": "http://fake-provider:8080/v1",
     },
-    "messages": {
-        "alias": "fixture/messages",
-        "deployment_id": "fixture-messages",
-        "mode": "chat",
-        "provider": "openai",
-        "model": "fixture-messages",
-        "api_base": "http://fake-provider:8080/v1",
-    },
     "embeddings": {
         "alias": "fixture/embeddings",
         "deployment_id": "fixture-embeddings",
