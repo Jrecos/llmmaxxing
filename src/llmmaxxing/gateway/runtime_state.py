@@ -386,6 +386,8 @@ class AccountRuntime:
                 return ReservationDenied(ReservationDenialReason.JOURNAL_CAPACITY_STOP)
             if request.account_id != self.account.account_id:
                 return ReservationDenied(ReservationDenialReason.ACCOUNT_NOT_FOUND)
+            if self._recovery_probe_id is not None:
+                return ReservationDenied(ReservationDenialReason.RECOVERY_REQUIRED)
             if self.account.state is not AccountState.ACTIVE:
                 return ReservationDenied(ReservationDenialReason.ACCOUNT_NOT_ACTIVE)
             now_ms = self._now_ms()
@@ -683,7 +685,11 @@ class AccountRuntime:
         if not probe_id.startswith("probe_"):
             raise ValueError("recovery probe requires a typed probe ID")
         with self._lock:
-            if self._recovery_probe_id is not None or self._uncertain_count == 0:
+            if (
+                self._recovery_probe_id is not None
+                or self._uncertain_count == 0
+                or any(attempt.state == "active" for attempt in self._attempts.values())
+            ):
                 return False
             self._journal.record_recovery_probe_started(
                 account_id=str(self.account.account_id), probe_id=probe_id
@@ -696,6 +702,8 @@ class AccountRuntime:
         with self._lock:
             if self._recovery_probe_id != probe_id:
                 raise ValueError("recovery probe is not the serialized active probe")
+            if any(attempt.state == "active" for attempt in self._attempts.values()):
+                raise ValueError("recovery probe cannot evict live active attempts")
             self._journal.record_recovery_probe_finished(
                 account_id=str(self.account.account_id),
                 probe_id=probe_id,
@@ -852,12 +860,18 @@ class AccountRuntime:
         if classification is ProbeClassification.AVAILABLE:
             if self._external_uncertain_holds:
                 self._external_uncertain_holds -= 1
-            elif self._attempts:
-                oldest = min(
-                    self._attempts.values(),
-                    key=lambda attempt: (attempt.started_at_ms, attempt.attempt_id),
-                )
-                del self._attempts[oldest.attempt_id]
+            else:
+                uncertain = [
+                    attempt
+                    for attempt in self._attempts.values()
+                    if attempt.state == "uncertain"
+                ]
+                if uncertain:
+                    oldest = min(
+                        uncertain,
+                        key=lambda attempt: (attempt.started_at_ms, attempt.attempt_id),
+                    )
+                    del self._attempts[oldest.attempt_id]
         self._recovery_probe_id = None
 
     def _maybe_checkpoint_locked(self) -> None:

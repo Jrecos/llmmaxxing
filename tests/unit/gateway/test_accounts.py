@@ -32,6 +32,7 @@ from llmmaxxing.gateway.runtime_state import (
     CircuitState,
     CircuitValue,
     InvalidLeaseTransition,
+    ProbeClassification,
     ReservationDenialReason,
     ReservationDenied,
     ReservationGranted,
@@ -728,8 +729,14 @@ def test_authoritative_count_rejects_while_live_attempt_exists(
         )
         live = state.try_reserve(request(provider_account, clock))
         assert isinstance(live, ReservationGranted)
+        runtime = state.account_runtime(provider_account.account_id)
         with pytest.raises(ValueError, match="live active"):
-            state.account_runtime(provider_account.account_id).apply_authoritative_active_count(1)
+            runtime.apply_authoritative_active_count(1)
+        recovery_probe = f"probe_{uuid4()}"
+        assert not runtime.begin_recovery_probe(recovery_probe)
         finish_actual(live.lease, tokens=10, quota_units=10)
+        assert runtime.begin_recovery_probe(recovery_probe)
+        runtime.finish_recovery_probe(recovery_probe, ProbeClassification.AVAILABLE)
+        assert state.account_capacity(provider_account.account_id).active_attempts == 0
     finally:
         journal.close()
