@@ -103,6 +103,8 @@ class AccountId(_UuidId):
 
     __slots__ = ()
     _prefix = "acc_"
+
+
 class RequestId(_UuidId):
     """Immutable identity of one admitted client request."""
 
@@ -136,8 +138,6 @@ class ProbeToken(_UuidId):
 
     __slots__ = ()
     _prefix = "probe_"
-
-
 
 
 class RouteGroupId(_UuidId):

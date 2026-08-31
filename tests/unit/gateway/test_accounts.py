@@ -1,15 +1,15 @@
 """Provider-account and conservative reservation invariants."""
 
 from __future__ import annotations
+
 import asyncio
 from dataclasses import FrozenInstanceError
-
 from datetime import UTC, datetime
 from pathlib import Path
-from uuid import uuid4
 
 import pytest
 from pydantic import ValidationError
+
 from llmmaxxing.core.ids import (
     AccountId,
     AttemptId,
@@ -26,17 +26,17 @@ from llmmaxxing.core.state_machines import AccountState
 from llmmaxxing.gateway.journal import AttemptJournal
 from llmmaxxing.gateway.runtime_state import (
     AccountBindingConflict,
-    CircuitState,
-    CircuitCause,
     AttemptResolution,
+    CircuitCause,
+    CircuitState,
     CircuitValue,
     InvalidLeaseTransition,
-    RuntimeState,
-    ReservationDenied,
     ReservationDenialReason,
+    ReservationDenied,
     ReservationGranted,
     ReservationRequest,
     RuntimeIdentity,
+    RuntimeState,
 )
 
 
@@ -137,6 +137,8 @@ def request(
         quota_units=tokens if quota_units is None else quota_units,
         circuit=circuit or CircuitValue.closed(),
     )
+
+
 def finish_actual(lease: object, *, tokens: int, quota_units: int) -> None:
     assert hasattr(lease, "finish")
     lease.finish(
@@ -148,8 +150,6 @@ def finish_actual(lease: object, *, tokens: int, quota_units: int) -> None:
             actual_quota_units=quota_units,
         )
     )
-
-
 
 
 @pytest.fixture
@@ -192,9 +192,9 @@ def test_provider_account_declares_every_dimension_and_credential_attestation() 
         )
     with pytest.raises(ValidationError, match="DRAFT"):
         ProviderAccount.model_validate(
-            measured.model_copy(
-                update={"parallel_limit": limit("unknown", None)}
-            ).model_dump(mode="python")
+            measured.model_copy(update={"parallel_limit": limit("unknown", None)}).model_dump(
+                mode="python"
+            )
         )
     with pytest.raises(ValidationError, match="monthly reset"):
         ProviderAccount.model_validate(
@@ -261,9 +261,7 @@ def test_account_runtime_is_shared_across_deployment_generations_and_publication
         journal.close()
 
 
-def test_rpm_and_tpm_have_independent_rolling_windows(
-    tmp_path: Path, clock: FakeClock
-) -> None:
+def test_rpm_and_tpm_have_independent_rolling_windows(tmp_path: Path, clock: FakeClock) -> None:
     provider_account = account(
         parallel=5,
         rpm=2,
@@ -359,6 +357,7 @@ def test_actual_usage_reconciles_but_ambiguity_retains_upper_bound(
     finally:
         journal.close()
 
+
 def test_typed_resolution_is_dimension_specific_idempotent_and_fail_closed(
     tmp_path: Path, clock: FakeClock
 ) -> None:
@@ -366,9 +365,7 @@ def test_typed_resolution_is_dimension_specific_idempotent_and_fail_closed(
     journal, view = open_view(tmp_path, provider_account, clock)
     try:
         granted = asyncio.run(
-            view.try_reserve_async(
-                request(provider_account, clock, tokens=100, quota_units=80)
-            )
+            view.try_reserve_async(request(provider_account, clock, tokens=100, quota_units=80))
         )
         assert isinstance(granted, ReservationGranted)
         resolution = AttemptResolution(
@@ -385,13 +382,9 @@ def test_typed_resolution_is_dimension_specific_idempotent_and_fail_closed(
         assert (capacity.tpm_tokens, capacity.monthly_quota_units) == (30, 80)
 
         with pytest.raises(InvalidLeaseTransition, match="conflicting"):
-            granted.lease.finish(
-                resolution.model_copy(update={"actual_quota_units": 20})
-            )
+            granted.lease.finish(resolution.model_copy(update={"actual_quota_units": 20}))
 
-        second = view.try_reserve(
-            request(provider_account, clock, tokens=40, quota_units=20)
-        )
+        second = view.try_reserve(request(provider_account, clock, tokens=40, quota_units=20))
         assert isinstance(second, ReservationGranted)
         with pytest.raises(InvalidLeaseTransition, match="exceeds"):
             second.lease.finish(
@@ -406,7 +399,6 @@ def test_typed_resolution_is_dimension_specific_idempotent_and_fail_closed(
         assert view.account_capacity(provider_account.account_id).active_attempts == 1
     finally:
         journal.close()
-
 
 
 def test_unknown_capacity_is_never_treated_as_unlimited(tmp_path: Path, clock: FakeClock) -> None:

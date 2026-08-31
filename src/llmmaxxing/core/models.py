@@ -85,15 +85,12 @@ class ProviderAccount(_Frozen):
 
     @property
     def fully_attested(self) -> bool:
-        return (
-            self.parallel_limit.status is QuotaDimensionStatus.KNOWN
-            and all(
-                dimension.status is not QuotaDimensionStatus.UNKNOWN
-                for dimension in (
-                    self.rpm_limit,
-                    self.tpm_limit,
-                    self.monthly_quota_units,
-                )
+        return self.parallel_limit.status is QuotaDimensionStatus.KNOWN and all(
+            dimension.status is not QuotaDimensionStatus.UNKNOWN
+            for dimension in (
+                self.rpm_limit,
+                self.tpm_limit,
+                self.monthly_quota_units,
             )
         )
 

@@ -16,10 +16,10 @@ from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, field
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Protocol, Self, TypeAlias, cast
+from typing import Any, Protocol, Self, cast
 
-JsonScalar: TypeAlias = str | int | bool | None
-JsonValue: TypeAlias = JsonScalar | list["JsonValue"] | dict[str, "JsonValue"]
+type JsonScalar = str | int | bool | None
+type JsonValue = JsonScalar | list[JsonValue] | dict[str, JsonValue]
 
 _ZERO_DIGEST = "0" * 64
 _MANIFEST = "manifest.json"
@@ -123,9 +123,7 @@ _RECORD_FIELDS: dict[str, frozenset[str]] = {
     ),
     "authoritative_active_count": frozenset({"account_id", "active_count"}),
     "recovery_probe_started": frozenset({"account_id", "probe_id"}),
-    "recovery_probe_finished": frozenset(
-        {"account_id", "probe_id", "classification"}
-    ),
+    "recovery_probe_finished": frozenset({"account_id", "probe_id", "classification"}),
 }
 
 
@@ -247,9 +245,9 @@ class _StopCommand:
     done: threading.Event = field(default_factory=threading.Event)
 
 
-_Command: TypeAlias = _AppendCommand | _CheckpointCommand | _StopCommand
-CrashInjector: TypeAlias = Callable[[str], None]
-DiskUsage: TypeAlias = Callable[[Path], float]
+type _Command = _AppendCommand | _CheckpointCommand | _StopCommand
+type CrashInjector = Callable[[str], None]
+type DiskUsage = Callable[[Path], float]
 
 
 def _canonical(value: object) -> bytes:
@@ -293,9 +291,7 @@ def _validate_safe_value(value: JsonValue, *, depth: int = 0) -> None:
         return
     if isinstance(value, str):
         if len(value) > 180 or not (
-            _SAFE_ID.fullmatch(value)
-            or _SAFE_DIGEST.fullmatch(value)
-            or value in _SAFE_WORDS
+            _SAFE_ID.fullmatch(value) or _SAFE_DIGEST.fullmatch(value) or value in _SAFE_WORDS
         ):
             raise ValueError("journal strings must be bounded IDs, digests, or reasons")
         return
@@ -464,11 +460,11 @@ class AttemptJournal:
                 daemon=True,
             )
             self._thread.start()
+
     def enter_recovery_required(self, reason: str) -> None:
         """Fail closed after a semantically invalid recovered runtime image."""
         self._base_status = JournalStatus.RECOVERY_REQUIRED
         self._reason = reason
-
 
     @classmethod
     def create(cls, root: Path, **kwargs: Any) -> Self:
@@ -533,9 +529,7 @@ class AttemptJournal:
         health = self.health
         if health.status is not JournalStatus.HEALTHY:
             raise JournalUnavailable(health.status.value)
-        if health.journal_bytes + len(_canonical(payload)) + 512 > int(
-            self._max_bytes * 0.8
-        ):
+        if health.journal_bytes + len(_canonical(payload)) + 512 > int(self._max_bytes * 0.8):
             raise JournalUnavailable(JournalStatus.ADMISSION_STOP.value)
         record = self._append(
             "attempt_reserved",
@@ -573,8 +567,6 @@ class AttemptJournal:
             boundary="terminal_update",
         )
         return JournalReceipt(record.sequence, record.digest)
-
-
 
     def mark_attempt_uncertain(self, *, attempt_id: str, reason: str) -> JournalRecord:
         return self._append(

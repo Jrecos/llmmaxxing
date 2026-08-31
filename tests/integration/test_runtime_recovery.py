@@ -28,18 +28,20 @@ from llmmaxxing.gateway.journal import (
 from llmmaxxing.gateway.runtime_state import (
     AccountBindingConflict,
     AttemptResolution,
-    CircuitState,
     CircuitCause,
+    CircuitState,
     CircuitValue,
-    RuntimeState,
-    ProbeClassification,
     InvalidLeaseTransition,
-    ReservationDenied,
+    ProbeClassification,
     ReservationDenialReason,
+    ReservationDenied,
     ReservationGranted,
     ReservationRequest,
     RuntimeIdentity,
+    RuntimeState,
 )
+
+
 class FakeClock:
     def __init__(self, now_ms: int) -> None:
         self.value = now_ms
@@ -119,6 +121,8 @@ def request(
         quota_units=tokens if quota_units is None else quota_units,
         circuit=CircuitValue.closed(),
     )
+
+
 def finish_actual(lease: object, *, tokens: int, quota_units: int) -> None:
     assert hasattr(lease, "finish")
     lease.finish(
@@ -130,10 +134,6 @@ def finish_actual(lease: object, *, tokens: int, quota_units: int) -> None:
             actual_quota_units=quota_units,
         )
     )
-
-
-
-
 
 
 class CrashController:
@@ -264,9 +264,12 @@ def test_terminal_update_is_replayed_once_across_crash(
             recovered.account_runtime(  # type: ignore[attr-defined]
                 provider_account.account_id  # type: ignore[attr-defined]
             ).apply_authoritative_active_count(0)
-            assert recovered.account_capacity(  # type: ignore[attr-defined]
-                provider_account.account_id  # type: ignore[attr-defined]
-            ).active_attempts == 0
+            assert (
+                recovered.account_capacity(  # type: ignore[attr-defined]
+                    provider_account.account_id  # type: ignore[attr-defined]
+                ).active_attempts
+                == 0
+            )
     finally:
         reopened.close()
 
@@ -313,7 +316,6 @@ def test_segment_delete_crash_is_safe_after_two_verified_checkpoints(
     first = view.try_reserve(request(provider_account, clock, tokens=11))  # type: ignore[arg-type]
     assert isinstance(first, ReservationGranted)
 
-
     finish_actual(first.lease, tokens=5, quota_units=5)
     view.checkpoint()
 
@@ -333,6 +335,8 @@ def test_segment_delete_crash_is_safe_after_two_verified_checkpoints(
         assert reopened.health.verified_checkpoints >= 1
     finally:
         reopened.close()
+
+
 def test_credential_attestation_highwater_survives_restart(tmp_path: Path) -> None:
     clock = FakeClock(1_800_000_000_000)
     root = tmp_path / "credential-highwater"
@@ -458,9 +462,12 @@ def test_recovery_restores_windows_quota_uncertainty_and_circuit_cas(tmp_path: P
         assert recovered_runtime.begin_recovery_probe(first_probe)
         assert not recovered_runtime.begin_recovery_probe(f"probe_{uuid4()}")
         recovered_runtime.finish_recovery_probe(first_probe, ProbeClassification.AVAILABLE)
-        assert recovered.account_capacity(  # type: ignore[attr-defined]
-            provider_account.account_id  # type: ignore[attr-defined]
-        ).active_attempts == 0
+        assert (
+            recovered.account_capacity(  # type: ignore[attr-defined]
+                provider_account.account_id  # type: ignore[attr-defined]
+            ).active_attempts
+            == 0
+        )
     finally:
         reopened.close()
 
@@ -552,13 +559,9 @@ def test_checkpoints_bound_replay_and_keep_binding_tombstones(tmp_path: Path) ->
 def test_writer_group_and_delay_bounds_are_closed(tmp_path: Path) -> None:
     clock = FakeClock(1_800_000_000_000)
     with pytest.raises(ValueError, match="2ms"):
-        AttemptJournal.create(
-            tmp_path / "slow-group", clock=clock, group_commit_delay_ms=3
-        )
+        AttemptJournal.create(tmp_path / "slow-group", clock=clock, group_commit_delay_ms=3)
     with pytest.raises(ValueError, match="256"):
-        AttemptJournal.create(
-            tmp_path / "large-group", clock=clock, max_group_records=257
-        )
+        AttemptJournal.create(tmp_path / "large-group", clock=clock, max_group_records=257)
 
 
 def test_admission_stops_at_journal_bounds_but_terminal_updates_remain_writable(

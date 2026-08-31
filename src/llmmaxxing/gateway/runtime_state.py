@@ -13,8 +13,8 @@ from enum import StrEnum
 from typing import Annotated, Self, cast
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
-from llmmaxxing.core.canonical import canonical_json_bytes
 
+from llmmaxxing.core.canonical import canonical_json_bytes
 from llmmaxxing.core.ids import (
     AccountId,
     AttemptId,
@@ -32,14 +32,17 @@ from llmmaxxing.gateway.journal import (
     Clock,
     DurableReservation,
     JournalHealth,
+    JournalReceipt,
     JournalRecord,
     JournalStatus,
     JournalUnavailable,
-    JournalReceipt,
     JsonValue,
 )
+
 _PROBE_ID = Annotated[str, Field(pattern=r"^probe_[0-9a-f-]{36}$")]
 _MAX_INT = 2**63 - 1
+
+
 def _require_int(value: object) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or value < 0:
         raise ValueError("recovered runtime integer is invalid")
@@ -56,8 +59,6 @@ def _require_bool(value: object) -> bool:
     if not isinstance(value, bool):
         raise ValueError("recovered runtime boolean is invalid")
     return value
-
-
 
 
 class _Frozen(BaseModel):
@@ -106,10 +107,10 @@ class CircuitCause(StrEnum):
     QUOTA = "quota"
     MANUAL = "manual"
 
+
 class CircuitScope(StrEnum):
     ACCOUNT = "account"
     DEPLOYMENT = "deployment"
-
 
 
 class CircuitValue(_Frozen):
@@ -149,20 +150,15 @@ class CircuitValue(_Frozen):
         ):
             raise ValueError("closed circuit cannot carry open/probe state")
         if self.state is CircuitState.OPEN and (
-            not evidence
-            or self.opened_at_ms == 0
-            or self.retry_at_ms == 0
-            or self.probe_id
+            not evidence or self.opened_at_ms == 0 or self.retry_at_ms == 0 or self.probe_id
         ):
             raise ValueError("open circuit requires evidence/retry state and no probe")
         if self.state is CircuitState.HALF_OPEN and (
-            not evidence
-            or self.opened_at_ms == 0
-            or self.retry_at_ms != 0
-            or self.probe_id is None
+            not evidence or self.opened_at_ms == 0 or self.retry_at_ms != 0 or self.probe_id is None
         ):
             raise ValueError("half-open circuit requires evidence and one probe")
         return self
+
 
 class RuntimeIdentity(_Frozen):
     """Dispatcher identity fenced into every durable provider attempt."""
@@ -174,9 +170,9 @@ class RuntimeIdentity(_Frozen):
     bundle_hash: BundleHash
 
 
-
 class ReservationRequest(_Frozen):
     """Complete immutable authorization input for one candidate provider send."""
+
     request_id: RequestId
     attempt_id: AttemptId
     account_id: AccountId
@@ -193,11 +189,7 @@ class ReservationRequest(_Frozen):
 
     @property
     def total_token_upper_bound(self) -> int:
-        return (
-            self.input_tokens_upper_bound
-            + self.max_output_tokens
-            + self.max_reasoning_tokens
-        )
+        return self.input_tokens_upper_bound + self.max_output_tokens + self.max_reasoning_tokens
 
     @property
     def profile_digest(self) -> str:
@@ -328,7 +320,6 @@ class Lease:
         return await asyncio.to_thread(self.finish, resolution)
 
 
-
 @dataclass(frozen=True, slots=True)
 class ReservationGranted:
     lease: Lease
@@ -369,9 +360,7 @@ class AccountRuntime:
         if self._monthly_reset_at_ms == 0:
             self._monthly_reset_at_ms = self._next_monthly_reset(self._now_ms())
 
-    def try_reserve(
-        self, request: ReservationRequest
-    ) -> ReservationGranted | ReservationDenied:
+    def try_reserve(self, request: ReservationRequest) -> ReservationGranted | ReservationDenied:
         with self._lock:
             if self._journal.status is JournalStatus.RECOVERY_REQUIRED:
                 return ReservationDenied(ReservationDenialReason.RECOVERY_REQUIRED)
@@ -427,7 +416,10 @@ class AccountRuntime:
             if tpm.status is QuotaDimensionStatus.KNOWN:
                 assert tpm.value is not None
                 tpm_starts = self._tpm_starts(now_ms)
-                if sum(start.tokens for start in tpm_starts) + request.total_token_upper_bound > tpm.value:
+                projected_tokens = (
+                    sum(start.tokens for start in tpm_starts) + request.total_token_upper_bound
+                )
+                if projected_tokens > tpm.value:
                     return ReservationDenied(
                         ReservationDenialReason.TPM_EXHAUSTED,
                         retry_at_ms=self._tpm_retry_at(
@@ -504,7 +496,6 @@ class AccountRuntime:
         """Run the blocking reserve-before-send commit off the event loop."""
         return await asyncio.to_thread(self.try_reserve, request)
 
-
     def compare_and_swap_circuit(
         self,
         generation: DeploymentGenerationId,
@@ -536,15 +527,15 @@ class AccountRuntime:
             self._maybe_checkpoint_locked()
             return True
 
-    def finish_attempt(
-        self, attempt_id: str, resolution: AttemptResolution
-    ) -> JournalReceipt:
+    def finish_attempt(self, attempt_id: str, resolution: AttemptResolution) -> JournalReceipt:
         """Idempotently reconcile a durable attempt, including after restart."""
         return self._finish(attempt_id, resolution)
+
     async def finish_attempt_async(
         self, attempt_id: str, resolution: AttemptResolution
     ) -> JournalReceipt:
         return await asyncio.to_thread(self.finish_attempt, attempt_id, resolution)
+
     def account_circuit_value(self) -> CircuitValue:
         return self._account_circuit
 
@@ -574,10 +565,6 @@ class AccountRuntime:
             self._account_circuit = replacement
             self._maybe_checkpoint_locked()
             return True
-
-
-
-
 
     def capacity(self) -> AccountCapacity:
         with self._lock:
@@ -620,9 +607,7 @@ class AccountRuntime:
             self._maybe_checkpoint_locked()
             return True
 
-    def finish_recovery_probe(
-        self, probe_id: str, classification: ProbeClassification
-    ) -> None:
+    def finish_recovery_probe(self, probe_id: str, classification: ProbeClassification) -> None:
         with self._lock:
             if self._recovery_probe_id != probe_id:
                 raise ValueError("recovery probe is not the serialized active probe")
@@ -644,9 +629,7 @@ class AccountRuntime:
                 raise InvalidLeaseTransition("attempt is already terminal")
             self._journal.provider_send_completed(attempt_id)
 
-    def _finish(
-        self, attempt_id: str, resolution: AttemptResolution
-    ) -> JournalReceipt:
+    def _finish(self, attempt_id: str, resolution: AttemptResolution) -> JournalReceipt:
         with self._lock:
             resolved = self._resolutions.get(attempt_id)
             if resolved is not None:
@@ -692,7 +675,6 @@ class AccountRuntime:
             self._maybe_checkpoint_locked()
             return receipt
 
-
     @property
     def _active_count(self) -> int:
         return len(self._attempts) + self._external_uncertain_holds
@@ -715,17 +697,19 @@ class AccountRuntime:
     def _tpm_starts(self, now_ms: int) -> list[_Start]:
         floor = now_ms - self.account.tpm_window_seconds * 1000
         return [start for start in self._starts.values() if start.started_at_ms > floor]
+
     def _now_ms(self) -> int:
         self._time_high_water_ms = max(self._time_high_water_ms, self._clock.now_ms())
         return self._time_high_water_ms
 
-
-
     def _purge_windows(self, now_ms: int) -> None:
-        keep_ms = max(
-            self.account.rpm_window_seconds,
-            self.account.tpm_window_seconds,
-        ) * 1000
+        keep_ms = (
+            max(
+                self.account.rpm_window_seconds,
+                self.account.tpm_window_seconds,
+            )
+            * 1000
+        )
         expired = [
             attempt_id
             for attempt_id, start in self._starts.items()
@@ -947,9 +931,7 @@ class AccountRuntime:
             DeploymentGenerationId(generation): CircuitValue(
                 state=CircuitState(_require_str(item["state"])),
                 cause=(
-                    None
-                    if item["cause"] is None
-                    else CircuitCause(_require_str(item["cause"]))
+                    None if item["cause"] is None else CircuitCause(_require_str(item["cause"]))
                 ),
                 epoch=_require_int(item["epoch"]),
                 opened_at_ms=_require_int(item["opened_at_ms"]),
@@ -1049,9 +1031,7 @@ class RuntimeState:
         with self._lock:
             accounts = tuple(
                 runtime.capacity()
-                for _, runtime in sorted(
-                    self._runtimes.items(), key=lambda item: str(item[0])
-                )
+                for _, runtime in sorted(self._runtimes.items(), key=lambda item: str(item[0]))
             )
             attempts = tuple(
                 AttemptOperationalValue(
@@ -1073,9 +1053,7 @@ class RuntimeState:
                 for account_id, runtime in sorted(
                     self._runtimes.items(), key=lambda item: str(item[0])
                 )
-                for attempt in sorted(
-                    runtime._attempts.values(), key=lambda item: item.attempt_id
-                )
+                for attempt in sorted(runtime._attempts.values(), key=lambda item: item.attempt_id)
             )
             circuits = tuple(
                 CircuitOperationalValue(account_id, generation, value)
@@ -1100,20 +1078,18 @@ class RuntimeState:
                 circuits=circuits,
             )
 
-
     @property
     def journal_health(self) -> JournalHealth:
         return self._journal.health
 
-    def try_reserve(
-        self, request: ReservationRequest
-    ) -> ReservationGranted | ReservationDenied:
+    def try_reserve(self, request: ReservationRequest) -> ReservationGranted | ReservationDenied:
         if self._journal.status is JournalStatus.RECOVERY_REQUIRED:
             return ReservationDenied(ReservationDenialReason.RECOVERY_REQUIRED)
         runtime = self._runtimes.get(request.account_id)
         if runtime is None:
             return ReservationDenied(ReservationDenialReason.ACCOUNT_NOT_FOUND)
         return runtime.try_reserve(request)
+
     async def try_reserve_async(
         self, request: ReservationRequest
     ) -> ReservationGranted | ReservationDenied:
@@ -1121,8 +1097,6 @@ class RuntimeState:
         if runtime is None:
             return ReservationDenied(ReservationDenialReason.ACCOUNT_NOT_FOUND)
         return await runtime.try_reserve_async(request)
-
-
 
     def account_runtime(self, account_id: AccountId) -> AccountRuntime:
         try:
@@ -1146,7 +1120,8 @@ class RuntimeState:
                     owner = self._binding_history.get(binding_digest)
                     if owner is not None and owner != account.account_id:
                         raise AccountBindingConflict(
-                            "provider binding is globally unique across live and tombstoned accounts"
+                            "provider binding is globally unique across live and "
+                            "tombstoned accounts"
                         )
                 epoch = account.credential_epoch or 0
                 highwater = self._credential_epoch_highwater.get(account.account_id, 0)
@@ -1202,9 +1177,7 @@ class RuntimeState:
             self._binding_history[binding] = account.account_id
             self._account_binding[account.account_id] = binding
         self._credential_epoch_highwater[account.account_id] = account.credential_epoch or 0
-        self._credential_attestation_digest[account.account_id] = self._attestation_digest(
-            account
-        )
+        self._credential_attestation_digest[account.account_id] = self._attestation_digest(account)
 
     def _binding_digest(self, account: ProviderAccount) -> str:
         if not all((account.connection, account.provider_token, account.binding_ref)):
@@ -1376,9 +1349,7 @@ class RuntimeState:
             value = CircuitValue(
                 state=CircuitState(cast(str, payload["state"])),
                 cause=(
-                    None
-                    if payload["cause"] is None
-                    else CircuitCause(cast(str, payload["cause"]))
+                    None if payload["cause"] is None else CircuitCause(cast(str, payload["cause"]))
                 ),
                 epoch=cast(int, payload["epoch"]),
                 opened_at_ms=cast(int, payload["opened_at_ms"]),
