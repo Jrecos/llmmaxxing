@@ -862,9 +862,7 @@ class AccountRuntime:
                 self._external_uncertain_holds -= 1
             else:
                 uncertain = [
-                    attempt
-                    for attempt in self._attempts.values()
-                    if attempt.state == "uncertain"
+                    attempt for attempt in self._attempts.values() if attempt.state == "uncertain"
                 ]
                 if uncertain:
                     oldest = min(
