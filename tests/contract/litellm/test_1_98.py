@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
+import llmmaxxing.adapters.litellm.guard as guard_module
 from llmmaxxing.adapters.litellm import LiteLLMAdapter as PublicLiteLLMAdapter
 from llmmaxxing.adapters.litellm.contract import (
     EffectiveDeployment,
@@ -83,6 +84,20 @@ def test_contract_binds_one_exact_build_guard_and_explicit_service_keys() -> Non
         "20b5044b619055374061a6d5b7b08754cad75aeabbf82ddf4f69cc0cf80ddaf4"
     )
     assert contract.litellm.source_commit == "d8f71d7bdbd7c9873d98293f83d64c6db72847e6"
+    assert contract.litellm.source_files == {
+        "litellm/llms/anthropic/experimental_pass_through/messages/handler.py": (
+            "sha256:afbb068d6f3d8e7d54c588455f6f81037257f7f9b2cc826e26aecfc34fe13d9b"
+        ),
+        "litellm/proxy/auth/route_checks.py": (
+            "sha256:4842bf096e877547e88492b772b03a8eb5dd579485b4e934ba052c886967758e"
+        ),
+        "litellm/utils.py": (
+            "sha256:8ea48e3ac4558b4de5450d01c2fa572eb90a33ad06f15249ea3ace47e1d8e71c"
+        ),
+        "litellm/proxy/response_api_endpoints/endpoints.py": (
+            "sha256:563b462e7c36e729869d0acdc016a54c2e99ec07f70a3f6ea17482b1dbf11e4f"
+        ),
+    }
     assert not any(token in contract.litellm.version for token in (">", "<", "^", "~", "*", ","))
 
     guard = ROOT / contract.guard.mount_path
@@ -120,7 +135,6 @@ def test_contract_certifies_only_native_receipt_endpoints_and_exact_locators() -
     assert {(e.name, e.method, e.path, e.model_locator) for e in contract.endpoints} == {
         ("chat", "POST", "/v1/chat/completions", "json.model"),
         ("text", "POST", "/v1/completions", "json.model"),
-        ("responses", "POST", "/v1/responses", "json.model"),
         ("messages", "POST", "/v1/messages", "json.model"),
         ("embeddings", "POST", "/v1/embeddings", "json.model"),
         ("rerank", "POST", "/v1/rerank", "json.model"),
@@ -131,7 +145,6 @@ def test_contract_certifies_only_native_receipt_endpoints_and_exact_locators() -
     assert {endpoint.name: endpoint.fence_locator for endpoint in contract.endpoints} == {
         "chat": "json.metadata",
         "text": "json.metadata",
-        "responses": "json.metadata",
         "messages": "json.litellm_metadata",
         "embeddings": "json.metadata",
         "rerank": "json.metadata",
@@ -146,7 +159,6 @@ def test_contract_certifies_only_native_receipt_endpoints_and_exact_locators() -
         for name in (
             "chat",
             "text",
-            "responses",
             "embeddings",
             "rerank",
             "audio_speech",
@@ -170,6 +182,15 @@ def test_contract_certifies_only_native_receipt_endpoints_and_exact_locators() -
         "realtime",
         "provider_passthrough",
     } <= set(contract.unsupported)
+    assert {(probe.protocol, probe.method, probe.path) for probe in contract.denial_probes} == {
+        ("http", "GET", "/v1/responses/{response_id}"),
+        ("http", "DELETE", "/v1/responses/{response_id}"),
+        ("http", "GET", "/v1/responses/{response_id}/input_items"),
+        ("http", "POST", "/v1/responses/{response_id}/cancel"),
+        ("http", "POST", "/v1/responses/compact"),
+        ("websocket", "GET", "/v1/responses"),
+    }
+    assert "/v1/responses" not in contract.service_keys.inference.allowed_routes
 
     selectors = json.loads((FIXTURES / "endpoint-selectors.json").read_text())["fixtures"]
     assert set(selectors) == {endpoint.name for endpoint in contract.endpoints}
@@ -259,6 +280,52 @@ def test_malformed_catalog_leaves_last_complete_snapshot_unchanged() -> None:
     with pytest.raises(DiscoveryError, match="catalog"):
         asyncio.run(adapter.discover_complete())
     assert adapter.snapshot is previous
+
+def test_unmanaged_row_cannot_collide_with_a_certified_alias() -> None:
+    transport = FixtureTransport()
+    first = deepcopy(fixture("model-info-page-1.json"))
+    first["data"].append(
+        {
+            "model_name": "lmx/electron-v1",
+            "litellm_params": {"model": "openai/unmanaged"},
+            "model_info": {"id": "runtime-unmanaged"},
+        }
+    )
+    first["total_count"] = 3
+    first["total_pages"] = 2
+    transport.responses[("/v2/model/info", 1)] = first
+    second = deepcopy(fixture("model-info-page-2.json"))
+    second["total_count"] = 3
+    transport.responses[("/v2/model/info", 2)] = second
+
+    with pytest.raises(DiscoveryError, match="alias"):
+        asyncio.run(LiteLLMAdapter(load_contract(), transport).discover_complete())
+
+
+def test_vertex_execution_fields_are_fenced_and_change_generation() -> None:
+    transport = FixtureTransport()
+    page = deepcopy(fixture("model-info-page-2.json"))
+    row = page["data"][0]
+    row["litellm_params"].update(
+        vertex_project="certified-project",
+        vertex_location="europe-west4",
+    )
+    row["model_info"]["llmmaxxing"]["execution"].update(
+        vertex_project="certified-project",
+        vertex_location="europe-west4",
+    )
+    transport.responses[("/v2/model/info", 2)] = page
+    adapter = LiteLLMAdapter(load_contract(), transport)
+    deployment = asyncio.run(adapter.discover_complete()).deployments[0]
+
+    assert deployment.execution["vertex_project"] == "certified-project"
+    assert deployment.execution["vertex_location"] == "europe-west4"
+    changed = deployment.model_copy(
+        update={"execution": {**deployment.execution, "vertex_location": "us-central1"}}
+    )
+    assert deployment_generation(changed, adapter.contract) != deployment_generation(
+        deployment, adapter.contract
+    )
 
 
 def test_generation_uses_jcs_semantics_not_runtime_identity() -> None:
@@ -373,8 +440,18 @@ def test_guard_manifest_is_strict_data_driven_and_secret_free() -> None:
     manifest = build_guard_manifest(snapshot, adapter.contract)
     electron = manifest.deployments["lmx/electron-v1"]
     assert manifest.backend_manifest == snapshot.manifest_revision
+    assert hasattr(guard_module, "backend_manifest_revision")
+    assert manifest.backend_manifest == guard_module.backend_manifest_revision(
+        adapter.contract, snapshot.deployments
+    )
     assert electron.runtime_id == "runtime-electron-001"
-    assert electron.execution["custom_llm_provider"] == "electron"
+    assert electron.projection.hidden_alias == "lmx/electron-v1"
+    assert electron.projection.mode == "chat"
+    assert electron.projection.execution["custom_llm_provider"] == "electron"
+    assert electron.projection.capabilities == snapshot.deployments[0].capabilities
+    assert electron.projection.context == snapshot.deployments[0].context
+    assert electron.projection.defaults == snapshot.deployments[0].defaults
+    assert electron.projection.pricing == snapshot.deployments[0].pricing
     assert (
         electron.generation_id
         == deployment_generation(snapshot.deployments[0], adapter.contract).generation_id

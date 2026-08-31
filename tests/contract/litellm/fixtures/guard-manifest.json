@@ -6,16 +6,37 @@
     "lmx/electron-v1": {
       "runtime_id": "runtime-electron-001",
       "generation_id": "dg1_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-      "account_id": "acc_22222222-2222-4222-8222-222222222222",
-      "account_binding": "electron-pro",
       "credential_field": "api_key",
-      "credential_fingerprint": "__CREDENTIAL_FINGERPRINT__",
-      "credential_epoch": 7,
-      "execution": {
-        "custom_llm_provider": "electron",
-        "model": "electron/electron-v1",
-        "api_base": "https://electron.invalid/v1",
-        "api_version": "2026-08-01"
+      "projection": {
+        "contract_id": "litellm-1.98.0",
+        "hidden_alias": "lmx/electron-v1",
+        "mode": "chat",
+        "execution": {
+          "custom_llm_provider": "electron",
+          "model": "electron/electron-v1",
+          "api_base": "https://electron.invalid/v1",
+          "api_version": "2026-08-01"
+        },
+        "capabilities": {
+          "modalities": ["text"],
+          "tools": true,
+          "response_schema": true
+        },
+        "context": {
+          "max_input_tokens": 131072,
+          "max_output_tokens": 8192
+        },
+        "defaults": {
+          "temperature": 0
+        },
+        "pricing": {
+          "input_per_token": "0.000003",
+          "output_per_token": "0.000006"
+        },
+        "account_id": "acc_22222222-2222-4222-8222-222222222222",
+        "account_binding": "electron-pro",
+        "credential_fingerprint": "__CREDENTIAL_FINGERPRINT__",
+        "credential_epoch": 7
       }
     }
   }

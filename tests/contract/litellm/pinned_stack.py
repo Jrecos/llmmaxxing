@@ -33,8 +33,10 @@ from llmmaxxing.adapters.litellm.contract import (
     load_contract,
 )
 from llmmaxxing.adapters.litellm.discovery import LiteLLMAdapter
-from llmmaxxing.adapters.litellm.guard import deployment_generation
-from llmmaxxing.core.canonical import canonical_json_bytes
+from llmmaxxing.adapters.litellm.guard import (
+    backend_manifest_revision,
+    deployment_generation,
+)
 
 POSTGRES_IMAGE = "postgres@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777"
 ACCOUNT_ID = "acc_99999999-9999-4999-8999-999999999999"
@@ -55,14 +57,6 @@ ENDPOINT_SPECS: dict[str, dict[str, str]] = {
         "mode": "completion",
         "provider": "openai",
         "model": "openai/fixture-text",
-        "api_base": "http://fake-provider:8080/v1",
-    },
-    "responses": {
-        "alias": "fixture/responses",
-        "deployment_id": "fixture-responses",
-        "mode": "responses",
-        "provider": "openai",
-        "model": "openai/fixture-responses",
         "api_base": "http://fake-provider:8080/v1",
     },
     "messages": {
@@ -178,6 +172,7 @@ def materialize_stack(root: Path) -> StackMaterial:
 
     model_list: list[dict[str, Any]] = []
     expected: dict[str, GuardDeploymentExpectation] = {}
+    rows: list[EffectiveDeployment] = []
     for endpoint, spec in ENDPOINT_SPECS.items():
         metadata = _metadata(spec, fingerprint, endpoint)
         model_list.append(
@@ -212,15 +207,13 @@ def materialize_stack(root: Path) -> StackMaterial:
             credential_fingerprint=fingerprint,
             credential_epoch=1,
         )
+        generation = deployment_generation(row, contract)
+        rows.append(row)
         expected[spec["alias"]] = GuardDeploymentExpectation(
             runtime_id=row.runtime_id,
-            generation_id=deployment_generation(row, contract).generation_id,
-            account_id=row.account_id,
-            account_binding=row.account_binding,
+            generation_id=generation.generation_id,
             credential_field=row.credential_field,
-            credential_fingerprint=row.credential_fingerprint,
-            credential_epoch=row.credential_epoch,
-            execution=row.execution,
+            projection=generation.projection,
         )
 
     config = {
@@ -238,13 +231,7 @@ def materialize_stack(root: Path) -> StackMaterial:
             "allow_public_health_readiness_details": False,
         },
     }
-    backend_payload = {
-        "contract_id": contract.contract_id,
-        "deployments": {
-            alias: deployment.model_dump(mode="json") for alias, deployment in expected.items()
-        },
-    }
-    backend_manifest = "bm1_" + hashlib.sha256(canonical_json_bytes(backend_payload)).hexdigest()
+    backend_manifest = backend_manifest_revision(contract, rows)
     manifest = GuardManifest(
         contract_id=contract.contract_id,
         backend_manifest=backend_manifest,
@@ -279,6 +266,7 @@ def materialize_stack(root: Path) -> StackMaterial:
             "fake-provider": {
                 "image": contract.litellm.image,
                 "entrypoint": ["python", "/fixture/fake_provider.py"],
+                "ports": ["127.0.0.1::8080"],
                 "volumes": [f"{fake_provider}:/fixture/fake_provider.py:ro"],
                 "healthcheck": {
                     "test": [
@@ -475,6 +463,47 @@ def _wait_guard_last(
         time.sleep(0.1)
     raise RuntimeError("certified generation guard did not register once and last")
 
+def _inspect_source_files(
+    material: StackMaterial,
+    contract: AdapterContract,
+) -> dict[str, str]:
+    paths = sorted(contract.litellm.source_files)
+    script = (
+        "import hashlib,json,pathlib,litellm;"
+        "root=pathlib.Path(litellm.__file__).resolve().parent.parent;"
+        f"paths={paths!r};"
+        "print(json.dumps({p:'sha256:'+hashlib.sha256((root/p).read_bytes()).hexdigest() "
+        "for p in paths},sort_keys=True))"
+    )
+    result = _compose(material, "exec", "-T", "litellm", "python", "-c", script)
+    observed = json.loads(result.stdout)
+    if observed != contract.litellm.source_files:
+        raise RuntimeError("pinned image source-file digests differ from compatibility manifest")
+    return observed
+
+
+def _set_provider_secret(material: StackMaterial, value: str) -> None:
+    compose = json.loads(material.compose_path.read_text())
+    compose["services"]["litellm"]["environment"]["FAKE_API_KEY"] = value
+    material.compose_path.write_text(json.dumps(compose, indent=2) + "\n")
+
+
+def _run_pinned_test(environment: dict[str, str]) -> int:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "tests/contract/litellm/test_pinned_runtime.py",
+            "-q",
+            "-ra",
+        ],
+        cwd=Path(__file__).resolve().parents[3],
+        env=environment,
+        check=False,
+    )
+    return result.returncode
+
 
 def _provision_key(
     base_url: str,
@@ -550,39 +579,55 @@ def main() -> int:
                 material.manifest_path.read_text()
             )
             live_manifest = build_guard_manifest(snapshot, contract)
-            if live_manifest.deployments != configured_manifest.deployments:
-                raise RuntimeError(
-                    "live deployment generations differ from immutable guard manifest"
-                )
+            if live_manifest != configured_manifest:
+                raise RuntimeError("live backend manifest differs from immutable guard manifest")
+            source_files = _inspect_source_files(material, contract)
+            provider_port = (
+                _compose(material, "port", "fake-provider", "8080")
+                .stdout.strip()
+                .rsplit(":", 1)[-1]
+            )
 
             environment = os.environ.copy()
             environment.update(
                 {
                     "LLMMAXXING_PINNED_LITELLM_URL": base_url,
+                    "LLMMAXXING_PINNED_PROVIDER_URL": f"http://127.0.0.1:{provider_port}",
                     "LLMMAXXING_PINNED_DISCOVERY_KEY": discovery_key,
                     "LLMMAXXING_PINNED_INFERENCE_KEY": inference_key,
                     "LLMMAXXING_PINNED_ENDPOINT_TARGETS_JSON": json.dumps(
                         material.endpoint_targets
                     ),
                     "LLMMAXXING_PINNED_IMAGE": contract.litellm.image,
-                    "LLMMAXXING_PINNED_SOURCE_COMMIT": contract.litellm.source_commit,
-                    "LLMMAXXING_PINNED_BACKEND_MANIFEST": material.backend_manifest,
+                    "LLMMAXXING_PINNED_SOURCE_FILES_JSON": json.dumps(source_files),
                 }
             )
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    "-m",
-                    "pytest",
-                    "tests/contract/litellm/test_pinned_runtime.py",
-                    "-q",
-                    "-ra",
-                ],
-                cwd=Path(__file__).resolve().parents[3],
-                env=environment,
-                check=False,
+
+            _set_provider_secret(material, secrets.token_urlsafe(32))
+            _compose(material, "up", "-d", "--force-recreate", "--no-deps", "litellm")
+            _wait_ready(base_url)
+            _wait_guard_last(
+                base_url,
+                material.master_key,
+                contract.guard.active_callback_identity,
             )
-            return result.returncode
+            swapped_environment = {
+                **environment,
+                "LLMMAXXING_PINNED_EXPECT_SECRET_SWAP": "1",
+            }
+            if _run_pinned_test(swapped_environment):
+                return 1
+
+            _set_provider_secret(material, material.provider_secret)
+            _compose(material, "up", "-d", "--force-recreate", "--no-deps", "litellm")
+            _wait_ready(base_url)
+            _wait_guard_last(
+                base_url,
+                material.master_key,
+                contract.guard.active_callback_identity,
+            )
+            environment.pop("LLMMAXXING_PINNED_EXPECT_SECRET_SWAP", None)
+            return _run_pinned_test(environment)
         finally:
             if preserve:
                 print(

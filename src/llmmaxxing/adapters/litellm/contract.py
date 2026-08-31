@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
+from llmmaxxing.core.canonical import canonical_json_bytes
 
 from llmmaxxing.core.ids import AccountId, DeploymentGenerationId
 
@@ -25,6 +27,20 @@ class ExactLiteLLMBuild(_Frozen):
     version: Literal["1.98.0"]
     image: str = Field(pattern=r"^ghcr\.io/berriai/litellm@sha256:[0-9a-f]{64}$")
     source_commit: str = Field(pattern=_HEX64.replace("64", "40"))
+    source_files: dict[str, str]
+
+    @model_validator(mode="after")
+    def _source_attestation(self) -> Self:
+        if not self.source_files:
+            raise ValueError("certified source-file digests are empty")
+        if any(
+            not path.startswith("litellm/")
+            or not digest.startswith("sha256:")
+            or len(digest) != 71
+            for path, digest in self.source_files.items()
+        ):
+            raise ValueError("certified source-file attestation is malformed")
+        return self
 
 
 class GuardContract(_Frozen):
@@ -113,6 +129,11 @@ class CertifiedEndpoint(_Frozen):
     receipt_header: Literal["x-litellm-model-id"]
     guard_required: Literal[True]
 
+class DenialProbe(_Frozen):
+    protocol: Literal["http", "websocket"]
+    method: Literal["GET", "POST", "DELETE"]
+    path: str = Field(pattern=r"^/v1/responses")
+
 
 class AdapterContract(_Frozen):
     contract_id: Literal["litellm-1.98.0"]
@@ -124,6 +145,7 @@ class AdapterContract(_Frozen):
     known_litellm_params: tuple[str, ...]
     known_execution_fields: tuple[str, ...]
     endpoints: tuple[CertifiedEndpoint, ...]
+    denial_probes: tuple[DenialProbe, ...]
     unsupported: tuple[str, ...]
 
     @model_validator(mode="after")
@@ -149,6 +171,21 @@ class AdapterContract(_Frozen):
         }
         if discovery_routes != expected_discovery:
             raise ValueError("discovery service key must name exactly the discovery routes")
+        expected_denials = {
+            ("http", "GET", "/v1/responses/{response_id}"),
+            ("http", "DELETE", "/v1/responses/{response_id}"),
+            ("http", "GET", "/v1/responses/{response_id}/input_items"),
+            ("http", "POST", "/v1/responses/{response_id}/cancel"),
+            ("http", "POST", "/v1/responses/compact"),
+            ("websocket", "GET", "/v1/responses"),
+        }
+        observed_denials = {
+            (probe.protocol, probe.method, probe.path) for probe in self.denial_probes
+        }
+        if observed_denials != expected_denials or len(self.denial_probes) != len(
+            expected_denials
+        ):
+            raise ValueError("Responses denial probes do not match pinned routes")
         return self
 
     def endpoint(self, name: str) -> CertifiedEndpoint:
@@ -239,12 +276,8 @@ class DiscoverySnapshot(_Frozen):
 class GuardDeploymentExpectation(_Frozen):
     runtime_id: str = Field(min_length=1)
     generation_id: DeploymentGenerationId
-    account_id: AccountId
-    account_binding: str = Field(min_length=1)
     credential_field: str = Field(min_length=1)
-    credential_fingerprint: str = Field(pattern=_CREDENTIAL_FINGERPRINT)
-    credential_epoch: int = Field(ge=1)
-    execution: dict[str, JsonValue]
+    projection: DeploymentGenerationProjection
 
 
 class GuardManifest(_Frozen):
@@ -259,6 +292,14 @@ class GuardManifest(_Frozen):
             raise ValueError("guard manifest deployments are empty")
         if any("/" not in alias for alias in self.deployments):
             raise ValueError("guard manifest contains an unqualified alias")
+        for alias, expectation in self.deployments.items():
+            if expectation.projection.hidden_alias != alias:
+                raise ValueError("guard deployment alias differs from semantic projection")
+            digest = hashlib.sha256(
+                canonical_json_bytes(expectation.projection.model_dump(mode="json"))
+            ).hexdigest()
+            if expectation.generation_id != DeploymentGenerationId.from_digest(digest):
+                raise ValueError("guard generation differs from semantic projection")
         return self
 
 

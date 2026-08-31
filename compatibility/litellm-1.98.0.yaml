@@ -3,12 +3,18 @@
   "litellm": {
     "version": "1.98.0",
     "image": "ghcr.io/berriai/litellm@sha256:20b5044b619055374061a6d5b7b08754cad75aeabbf82ddf4f69cc0cf80ddaf4",
-    "source_commit": "d8f71d7bdbd7c9873d98293f83d64c6db72847e6"
+    "source_commit": "d8f71d7bdbd7c9873d98293f83d64c6db72847e6",
+    "source_files": {
+      "litellm/llms/anthropic/experimental_pass_through/messages/handler.py": "sha256:afbb068d6f3d8e7d54c588455f6f81037257f7f9b2cc826e26aecfc34fe13d9b",
+      "litellm/proxy/auth/route_checks.py": "sha256:4842bf096e877547e88492b772b03a8eb5dd579485b4e934ba052c886967758e",
+      "litellm/utils.py": "sha256:8ea48e3ac4558b4de5450d01c2fa572eb90a33ad06f15249ea3ace47e1d8e71c",
+      "litellm/proxy/response_api_endpoints/endpoints.py": "sha256:563b462e7c36e729869d0acdc016a54c2e99ec07f70a3f6ea17482b1dbf11e4f"
+    }
   },
   "guard": {
     "mount_path": "deploy/litellm/llmmaxxing_guard.py",
     "callback_name": "llmmaxxing_guard",
-    "digest": "sha256:2999029bc97928d38665f3982378e9436b6697dd87c4a2081e7e9b3a90f539ba",
+    "digest": "sha256:2b37e05efb17d890e77550099a521a098150f8800bc9217bcc9b30d23b39498c",
     "registration": "last",
     "hook": "async_pre_call_deployment_hook",
     "dynamic_credential_lists": "unsupported",
@@ -31,7 +37,6 @@
       "allowed_routes": [
         "/v1/chat/completions",
         "/v1/completions",
-        "/v1/responses",
         "/v1/messages",
         "/v1/embeddings",
         "/v1/rerank",
@@ -108,18 +113,27 @@
     "merge_reasoning_content_in_choices",
     "use_in_pass_through",
     "use_litellm_proxy",
-    "use_xai_oauth"
+    "use_xai_oauth",
+    "vertex_project",
+    "vertex_location"
   ],
   "endpoints": [
     {"name": "chat", "method": "POST", "path": "/v1/chat/completions", "model_locator": "json.model", "fence_locator": "json.metadata", "execution_normalizers": {}, "receipt_header": "x-litellm-model-id", "guard_required": true},
     {"name": "text", "method": "POST", "path": "/v1/completions", "model_locator": "json.model", "fence_locator": "json.metadata", "execution_normalizers": {}, "receipt_header": "x-litellm-model-id", "guard_required": true},
-    {"name": "responses", "method": "POST", "path": "/v1/responses", "model_locator": "json.model", "fence_locator": "json.metadata", "execution_normalizers": {}, "receipt_header": "x-litellm-model-id", "guard_required": true},
     {"name": "messages", "method": "POST", "path": "/v1/messages", "model_locator": "json.model", "fence_locator": "json.litellm_metadata", "execution_normalizers": {"model": "provider_prefix_removed"}, "receipt_header": "x-litellm-model-id", "guard_required": true},
     {"name": "embeddings", "method": "POST", "path": "/v1/embeddings", "model_locator": "json.model", "fence_locator": "json.metadata", "execution_normalizers": {}, "receipt_header": "x-litellm-model-id", "guard_required": true},
     {"name": "rerank", "method": "POST", "path": "/v1/rerank", "model_locator": "json.model", "fence_locator": "json.metadata", "execution_normalizers": {}, "receipt_header": "x-litellm-model-id", "guard_required": true},
     {"name": "audio_speech", "method": "POST", "path": "/v1/audio/speech", "model_locator": "json.model", "fence_locator": "json.metadata", "execution_normalizers": {}, "receipt_header": "x-litellm-model-id", "guard_required": true},
     {"name": "audio_transcription", "method": "POST", "path": "/v1/audio/transcriptions", "model_locator": "multipart.model", "fence_locator": "multipart.metadata", "execution_normalizers": {}, "receipt_header": "x-litellm-model-id", "guard_required": true},
     {"name": "image", "method": "POST", "path": "/v1/images/generations", "model_locator": "json.model", "fence_locator": "json.metadata", "execution_normalizers": {}, "receipt_header": "x-litellm-model-id", "guard_required": true}
+  ],
+  "denial_probes": [
+    {"protocol": "http", "method": "GET", "path": "/v1/responses/{response_id}"},
+    {"protocol": "http", "method": "DELETE", "path": "/v1/responses/{response_id}"},
+    {"protocol": "http", "method": "GET", "path": "/v1/responses/{response_id}/input_items"},
+    {"protocol": "http", "method": "POST", "path": "/v1/responses/{response_id}/cancel"},
+    {"protocol": "http", "method": "POST", "path": "/v1/responses/compact"},
+    {"protocol": "websocket", "method": "GET", "path": "/v1/responses"}
   ],
   "unsupported": [
     "responses_stateful_get",

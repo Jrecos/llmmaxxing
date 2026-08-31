@@ -32,7 +32,6 @@ class GuardConfigurationError(RuntimeError):
 _CERTIFIED_EXECUTION_NORMALIZERS: dict[str, dict[str, str]] = {
     "chat": {},
     "text": {},
-    "responses": {},
     "messages": {"model": "provider_prefix_removed"},
     "embeddings": {},
     "rerank": {},
@@ -42,13 +41,19 @@ _CERTIFIED_EXECUTION_NORMALIZERS: dict[str, dict[str, str]] = {
 }
 
 
-def _normalize_execution(value: Any, normalizer: str | None) -> Any:
+def _expected_execution(
+    value: Any,
+    normalizer: str | None,
+    execution: Mapping[str, Any],
+) -> Any:
     if normalizer is None:
         return value
     if normalizer == "provider_prefix_removed":
-        if not isinstance(value, str):
-            raise GuardViolation("normalized execution field is not a string")
-        return value.split("/", 1)[1] if "/" in value else value
+        provider = execution.get("custom_llm_provider")
+        if not isinstance(value, str) or not isinstance(provider, str) or not provider:
+            raise GuardViolation("normalized execution field is not a certified string")
+        prefix = provider + "/"
+        return value.removeprefix(prefix) if value.startswith(prefix) else value
     raise GuardViolation("uncertified execution normalizer")
 
 
@@ -103,12 +108,22 @@ def _validated_manifest(value: Mapping[str, Any], digest: str) -> Mapping[str, A
     deployment_fields = {
         "runtime_id",
         "generation_id",
+        "credential_field",
+        "projection",
+    }
+    projection_fields = {
+        "contract_id",
+        "hidden_alias",
+        "mode",
+        "execution",
+        "capabilities",
+        "context",
+        "defaults",
+        "pricing",
         "account_id",
         "account_binding",
-        "credential_field",
         "credential_fingerprint",
         "credential_epoch",
-        "execution",
     }
     for alias, record in deployments.items():
         if not isinstance(alias, str) or not alias or not isinstance(record, dict):
@@ -119,19 +134,35 @@ def _validated_manifest(value: Mapping[str, Any], digest: str) -> Mapping[str, A
         generation = record["generation_id"]
         if not isinstance(generation, str) or not generation.startswith("dg1_") or len(generation) != 68:
             raise GuardConfigurationError("guard generation id is malformed")
-        if not isinstance(record["account_id"], str) or not record["account_id"].startswith("acc_"):
-            raise GuardConfigurationError("guard account id is malformed")
-        if not isinstance(record["account_binding"], str) or not record["account_binding"]:
-            raise GuardConfigurationError("guard account binding is empty")
         if not isinstance(record["credential_field"], str) or not record["credential_field"]:
             raise GuardConfigurationError("guard credential field is empty")
-        fingerprint = record["credential_fingerprint"]
+        projection = record["projection"]
+        if not isinstance(projection, dict):
+            raise GuardConfigurationError("guard semantic projection is malformed")
+        _require_exact_keys(projection, projection_fields, "guard semantic projection")
+        if projection["contract_id"] != value["contract_id"] or projection["hidden_alias"] != alias:
+            raise GuardConfigurationError("guard semantic projection identity mismatch")
+        if not isinstance(projection["mode"], str) or not projection["mode"]:
+            raise GuardConfigurationError("guard semantic projection mode is malformed")
+        for field in ("execution", "capabilities", "context", "defaults", "pricing"):
+            if not isinstance(projection[field], dict):
+                raise GuardConfigurationError(f"guard semantic projection {field} is malformed")
+        if not projection["execution"]:
+            raise GuardConfigurationError("guard execution projection is empty")
+        if not isinstance(projection["account_id"], str) or not projection["account_id"].startswith(
+            "acc_"
+        ):
+            raise GuardConfigurationError("guard account id is malformed")
+        if not isinstance(projection["account_binding"], str) or not projection["account_binding"]:
+            raise GuardConfigurationError("guard account binding is empty")
+        fingerprint = projection["credential_fingerprint"]
         if not isinstance(fingerprint, str) or not fingerprint.startswith("hcf1_") or len(fingerprint) != 69:
             raise GuardConfigurationError("guard credential fingerprint is malformed")
-        if not isinstance(record["credential_epoch"], int) or record["credential_epoch"] < 1:
+        if (
+            not isinstance(projection["credential_epoch"], int)
+            or projection["credential_epoch"] < 1
+        ):
             raise GuardConfigurationError("guard credential epoch is malformed")
-        if not isinstance(record["execution"], dict) or not record["execution"]:
-            raise GuardConfigurationError("guard execution projection is empty")
     return _freeze(json.loads(json.dumps(value)))
 
 
@@ -269,35 +300,59 @@ class LLMMaxxingGuard(CustomLogger):
         credential = attestation.get("credential")
         if not isinstance(account, Mapping) or not isinstance(credential, Mapping):
             raise GuardViolation("selected deployment account or credential attestation is missing")
+        semantics: dict[str, dict[str, Any]] = {}
+        for field in ("capabilities", "context", "defaults", "pricing"):
+            value = attestation.get(field)
+            if not isinstance(value, Mapping):
+                raise GuardViolation(f"selected deployment {field} attestation is missing")
+            semantics[field] = dict(value)
 
+        projection = expected["projection"]
         comparisons = {
             "generation_id": expected["generation_id"],
-            "account_id": expected["account_id"],
-            "account_binding": expected["account_binding"],
-            "credential_fingerprint": expected["credential_fingerprint"],
-            "credential_epoch": expected["credential_epoch"],
+            "account_id": projection["account_id"],
+            "account_binding": projection["account_binding"],
+            "credential_fingerprint": projection["credential_fingerprint"],
+            "credential_epoch": projection["credential_epoch"],
         }
         if any(fence.get(name) != value for name, value in comparisons.items()):
             raise GuardViolation("generation, account, or credential fence mismatch")
-        if account.get("id") != expected["account_id"] or account.get("binding") != expected["account_binding"]:
-            raise GuardViolation("selected deployment account attestation mismatch")
-        if credential.get("epoch") != expected["credential_epoch"]:
-            raise GuardViolation("selected deployment credential epoch mismatch")
 
         endpoint = fence["endpoint"]
         normalizers = _CERTIFIED_EXECUTION_NORMALIZERS.get(endpoint)
         if normalizers is None:
             raise GuardViolation("uncertified endpoint fence")
-        for name, value in expected["execution"].items():
-            normalizer = normalizers.get(name)
-            if _normalize_execution(kwargs.get(name), normalizer) != _normalize_execution(
-                value, normalizer
-            ):
-                raise GuardViolation("selected deployment execution projection mismatch")
+        expected_execution = {
+            name: _expected_execution(value, normalizers.get(name), projection["execution"])
+            for name, value in projection["execution"].items()
+        }
         credential_value = _resolved_credential(kwargs.get(expected["credential_field"]))
         actual_fingerprint = credential_fingerprint(self._hmac_key, credential_value)
-        if not hmac.compare_digest(actual_fingerprint, expected["credential_fingerprint"]):
+        if not hmac.compare_digest(
+            actual_fingerprint,
+            projection["credential_fingerprint"],
+        ):
             raise GuardViolation("resolved provider credential fingerprint mismatch")
+        current_projection = {
+            "contract_id": self._manifest["contract_id"],
+            "hidden_alias": alias,
+            "mode": info.get("mode"),
+            "execution": {name: kwargs.get(name) for name in projection["execution"]},
+            "capabilities": semantics["capabilities"],
+            "context": semantics["context"],
+            "defaults": semantics["defaults"],
+            "pricing": semantics["pricing"],
+            "account_id": account.get("id"),
+            "account_binding": account.get("binding"),
+            "credential_fingerprint": actual_fingerprint,
+            "credential_epoch": credential.get("epoch"),
+        }
+        expected_projection = {
+            **dict(projection),
+            "execution": expected_execution,
+        }
+        if _freeze(current_projection) != expected_projection:
+            raise GuardViolation("selected deployment semantic execution projection mismatch")
         return kwargs
 
 

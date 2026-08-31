@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import json
 import time
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    _counter_lock = threading.Lock()
+    _provider_calls = 0
 
     def log_message(self, format: str, *args: object) -> None:
         return
@@ -34,9 +37,16 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/health":
             self._send_json({"status": "ok"})
             return
+        if self.path == "/counter":
+            with self._counter_lock:
+                count = self._provider_calls
+            self._send_json({"provider_calls": count})
+            return
         self._send_json({"error": "not found"}, 404)
 
     def do_POST(self) -> None:
+        with self._counter_lock:
+            type(self)._provider_calls += 1
         request = self._read_json()
         model = request.get("model", "fixture-model")
         now = int(time.time())

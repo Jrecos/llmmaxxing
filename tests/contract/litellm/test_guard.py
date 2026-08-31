@@ -31,7 +31,7 @@ def make_guard() -> tuple[ModuleType, Any, dict[str, Any], str]:
     digest = hashlib.sha256(GUARD_PATH.read_bytes()).hexdigest()
     manifest = json.loads((FIXTURES / "guard-manifest.json").read_text())
     manifest = json.loads(json.dumps(manifest).replace("__GUARD_DIGEST__", digest))
-    manifest["deployments"]["lmx/electron-v1"]["credential_fingerprint"] = (
+    manifest["deployments"]["lmx/electron-v1"]["projection"]["credential_fingerprint"] = (
         module.credential_fingerprint(hmac_key, provider_secret)
     )
     guard = module.LLMMaxxingGuard(manifest=manifest, hmac_key=hmac_key, guard_digest=digest)
@@ -40,33 +40,36 @@ def make_guard() -> tuple[ModuleType, Any, dict[str, Any], str]:
 
 def request_kwargs(manifest: dict[str, Any], provider_secret: str) -> dict[str, Any]:
     expected = manifest["deployments"]["lmx/electron-v1"]
+    projection = expected["projection"]
     return {
-        "model": "electron/electron-v1",
-        "custom_llm_provider": "electron",
-        "api_base": "https://electron.invalid/v1",
-        "api_version": "2026-08-01",
+        **projection["execution"],
         "api_key": provider_secret,
         "model_info": {
-            "id": "runtime-electron-001",
+            "id": expected["runtime_id"],
+            "mode": projection["mode"],
             "llmmaxxing": {
+                "capabilities": deepcopy(projection["capabilities"]),
+                "context": deepcopy(projection["context"]),
+                "defaults": deepcopy(projection["defaults"]),
+                "pricing": deepcopy(projection["pricing"]),
                 "account": {
-                    "id": expected["account_id"],
-                    "binding": expected["account_binding"],
+                    "id": projection["account_id"],
+                    "binding": projection["account_binding"],
                 },
-                "credential": {"epoch": expected["credential_epoch"]},
+                "credential": {"epoch": projection["credential_epoch"]},
             },
         },
         "metadata": {
-            "model_group": "lmx/electron-v1",
+            "model_group": projection["hidden_alias"],
             "llmmaxxing_guard": {
-                "alias": "lmx/electron-v1",
+                "alias": projection["hidden_alias"],
                 "generation_id": expected["generation_id"],
-                "account_id": expected["account_id"],
-                "account_binding": expected["account_binding"],
+                "account_id": projection["account_id"],
+                "account_binding": projection["account_binding"],
                 "backend_manifest": manifest["backend_manifest"],
-                "credential_fingerprint": expected["credential_fingerprint"],
-                "credential_epoch": expected["credential_epoch"],
-                "contract_id": manifest["contract_id"],
+                "credential_fingerprint": projection["credential_fingerprint"],
+                "credential_epoch": projection["credential_epoch"],
+                "contract_id": projection["contract_id"],
                 "endpoint": "chat",
             },
         },
@@ -118,12 +121,31 @@ def test_guard_accepts_identical_metadata_copy_but_rejects_conflicting_copy() ->
         asyncio.run(guard.async_pre_call_deployment_hook(kwargs, None))
 
 
-def test_messages_normalizes_only_provider_prefixed_model_field() -> None:
-    _, guard, manifest, secret = make_guard()
+def test_messages_strips_only_the_certified_expected_provider_prefix() -> None:
+    module, guard, manifest, secret = make_guard()
     kwargs = request_kwargs(manifest, secret)
     kwargs["metadata"]["llmmaxxing_guard"]["endpoint"] = "messages"
     kwargs["model"] = "electron-v1"
     assert asyncio.run(guard.async_pre_call_deployment_hook(kwargs, None)) is kwargs
+
+    kwargs["model"] = "other/electron-v1"
+    with pytest.raises(module.GuardViolation, match="execution"):
+        asyncio.run(guard.async_pre_call_deployment_hook(kwargs, None))
+
+    wrong_manifest = deepcopy(manifest)
+    wrong_manifest["deployments"]["lmx/electron-v1"]["projection"]["execution"]["model"] = (
+        "other/electron-v1"
+    )
+    wrong_guard = module.LLMMaxxingGuard(
+        manifest=wrong_manifest,
+        hmac_key=b"unit-test-guard-fingerprint-key",
+        guard_digest=hashlib.sha256(GUARD_PATH.read_bytes()).hexdigest(),
+    )
+    kwargs = request_kwargs(wrong_manifest, secret)
+    kwargs["metadata"]["llmmaxxing_guard"]["endpoint"] = "messages"
+    kwargs["model"] = "electron-v1"
+    with pytest.raises(module.GuardViolation, match="execution"):
+        asyncio.run(wrong_guard.async_pre_call_deployment_hook(kwargs, None))
 
 
 @pytest.mark.parametrize(
@@ -147,7 +169,24 @@ def test_messages_normalizes_only_provider_prefixed_model_field() -> None:
             lambda k: k["metadata"]["llmmaxxing_guard"].update(credential_epoch=8),
             "credential",
         ),
-        (lambda k: k.update(api_base="https://repointed.invalid/v1"), "execution"),
+        (lambda k: k.update(api_base="https://repointed.invalid/v1"), "projection"),
+        (lambda k: k["model_info"].update(mode="embedding"), "projection"),
+        (
+            lambda k: k["model_info"]["llmmaxxing"]["capabilities"].update(tools=False),
+            "projection",
+        ),
+        (
+            lambda k: k["model_info"]["llmmaxxing"]["context"].update(max_input_tokens=1),
+            "projection",
+        ),
+        (
+            lambda k: k["model_info"]["llmmaxxing"]["defaults"].update(temperature=1),
+            "projection",
+        ),
+        (
+            lambda k: k["model_info"]["llmmaxxing"]["pricing"].update(input_per_token="9"),
+            "projection",
+        ),
     ),
 )
 def test_alias_generation_account_backend_and_execution_drift_stop_before_provider(
@@ -161,6 +200,25 @@ def test_alias_generation_account_backend_and_execution_drift_stop_before_provid
         asyncio.run(guarded_provider_call(guard, kwargs, calls))
     assert calls == []
 
+
+def test_vertex_project_and_location_are_part_of_the_live_guard_projection() -> None:
+    module, _, manifest, secret = make_guard()
+    expected = manifest["deployments"]["lmx/electron-v1"]["projection"]["execution"]
+    expected.update(vertex_project="certified-project", vertex_location="europe-west4")
+    digest = hashlib.sha256(GUARD_PATH.read_bytes()).hexdigest()
+    guard = module.LLMMaxxingGuard(
+        manifest=manifest,
+        hmac_key=b"unit-test-guard-fingerprint-key",
+        guard_digest=digest,
+    )
+    kwargs = request_kwargs(manifest, secret)
+    assert asyncio.run(guard.async_pre_call_deployment_hook(kwargs, None)) is kwargs
+
+    kwargs["vertex_location"] = "us-central1"
+    calls: list[dict[str, Any]] = []
+    with pytest.raises(module.GuardViolation, match="projection"):
+        asyncio.run(guarded_provider_call(guard, kwargs, calls))
+    assert calls == []
 
 def test_secret_swap_stops_before_provider_without_exposing_secret() -> None:
     module, guard, manifest, secret = make_guard()

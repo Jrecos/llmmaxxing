@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 from collections.abc import Mapping
 from typing import Any, Protocol, Self
 
@@ -18,7 +17,6 @@ from llmmaxxing.adapters.litellm.contract import (
     PreparedDispatch,
     TransportResponse,
 )
-from llmmaxxing.core.canonical import canonical_json_bytes
 from llmmaxxing.core.ids import AccountId
 
 
@@ -265,6 +263,11 @@ class LiteLLMAdapter:
     async def discover_complete(self) -> DiscoverySnapshot:
         probe = await self.probe()
         raw_rows = await self._model_rows()
+        raw_aliases = [raw.get("model_name") for raw in raw_rows]
+        if any(not isinstance(alias, str) or not alias for alias in raw_aliases):
+            raise DiscoveryError("model-info row has an invalid alias")
+        if len(set(raw_aliases)) != len(raw_aliases):
+            raise DiscoveryError("an effective model alias is duplicated")
         deployments = [row for raw in raw_rows if (row := self._deployment(raw)) is not None]
         if not deployments:
             raise DiscoveryError("no certified hidden deployments discovered")
@@ -300,18 +303,9 @@ class LiteLLMAdapter:
         if not catalog or not set(aliases) <= catalog_ids:
             raise DiscoveryError("expanded catalog omits a hidden alias")
 
-        from llmmaxxing.adapters.litellm.guard import deployment_generation
+        from llmmaxxing.adapters.litellm.guard import backend_manifest_revision
 
-        revision_payload = {
-            "contract_id": self.contract.contract_id,
-            "build": self.contract.litellm.model_dump(mode="json"),
-            "deployments": [
-                deployment_generation(row, self.contract).projection.model_dump(mode="json")
-                for row in deployments
-            ],
-            "catalog": [row.model_dump(mode="json") for row in catalog],
-        }
-        revision = "bm1_" + hashlib.sha256(canonical_json_bytes(revision_payload)).hexdigest()
+        revision = backend_manifest_revision(self.contract, deployments)
         snapshot = DiscoverySnapshot(
             probe=probe,
             deployments=tuple(deployments),
