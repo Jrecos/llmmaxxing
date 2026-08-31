@@ -39,18 +39,12 @@ class PermitSnapshot:
 
     @property
     def total_active(self) -> int:
-        return (
-            self.foreground_active
-            + self.recovery_active
-            + self.discovery_qualification_active
-        )
+        return self.foreground_active + self.recovery_active + self.discovery_qualification_active
 
     @property
     def total_waiters(self) -> int:
         return (
-            self.foreground_waiters
-            + self.recovery_waiters
-            + self.discovery_qualification_waiters
+            self.foreground_waiters + self.recovery_waiters + self.discovery_qualification_waiters
         )
 
 
@@ -109,10 +103,7 @@ class AttemptPermitPool:
     async def try_shadow(self) -> AttemptPermit | None:
         """Borrow only an immediately idle foreground permit; never queue or bypass waiters."""
         async with self._condition:
-            if (
-                self._waiters["foreground"]
-                or self._active["foreground"] >= FOREGROUND_PERMITS
-            ):
+            if self._waiters["foreground"] or self._active["foreground"] >= FOREGROUND_PERMITS:
                 return None
             self._active["foreground"] += 1
         return AttemptPermit(self, "foreground", shadow=True)
@@ -165,12 +156,15 @@ class ProcessHTTPClient:
     ) -> None:
         if not origin.startswith(("http://", "https://")) or origin.endswith("/"):
             raise ValueError("LiteLLM origin must be an absolute URL without a trailing slash")
-        if min(
-            connect_timeout_s,
-            write_timeout_s,
-            read_inactivity_timeout_s,
-            pool_timeout_s,
-        ) <= 0:
+        if (
+            min(
+                connect_timeout_s,
+                write_timeout_s,
+                read_inactivity_timeout_s,
+                pool_timeout_s,
+            )
+            <= 0
+        ):
             raise ValueError("HTTP timeouts must be positive")
         self.config = HTTPClientConfig(
             origin=origin,
@@ -327,7 +321,9 @@ async def read_prestart_error(
         if chunk is None:
             return bytes(result)
         if len(result) + len(chunk) > MAX_PRESTART_ERROR_BYTES:
-            raise UpstreamStreamError("upstream error envelope exceeds the bounded classifier input")
+            raise UpstreamStreamError(
+                "upstream error envelope exceeds the bounded classifier input"
+            )
         result.extend(chunk)
 
 

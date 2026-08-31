@@ -36,13 +36,12 @@ from llmmaxxing.gateway.ingress import (
 )
 from support.fake_litellm import FaultMode, FaultPlan
 from support.gateway_stack import (
-    AuthView,
-    AuthViews,
     CONTRACT,
     PEPPER,
     PEPPER_VERSION,
+    AuthView,
+    AuthViews,
     call_app,
-    chat_body,
     make_bundle,
     make_stack,
 )
@@ -145,9 +144,9 @@ def test_invalid_auth_and_lifecycle_backpressure_consume_zero_body_waiter_or_att
             response = await call_app(unavailable.app, unavailable.token)
             assert response.status == 503
             assert response.receive_calls == 0
-            assert [reservation[2] for reservation in unavailable.lifecycle_capacity.reservations] == [
-                10
-            ]
+            assert [
+                reservation[2] for reservation in unavailable.lifecycle_capacity.reservations
+            ] == [10]
             assert unavailable.ingress.retained_bytes == 0
             assert unavailable.ingress.body_readers == 0
             assert not unavailable.fake.calls
@@ -193,7 +192,9 @@ def test_lifecycle_capacity_is_reserved_before_body_and_body_is_released_once(tm
         try:
             response = await call_app(shadow.app, shadow.token)
             assert response.status == 200
-            assert [reservation[2] for reservation in shadow.lifecycle_capacity.reservations] == [12]
+            assert [reservation[2] for reservation in shadow.lifecycle_capacity.reservations] == [
+                12
+            ]
         finally:
             await shadow.close()
 
@@ -365,11 +366,15 @@ def test_multipart_uses_quota_counted_mode_0600_spool_and_exact_release() -> Non
         boundary = "fixture-boundary"
         payload = b"a" * (1024 * 1024 + 1)
         body = (
-            f"--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n"
-            "deepseek-v4-flash\r\n"
-            f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\n"
-            "Content-Type: audio/wav\r\n\r\n"
-        ).encode() + payload + f"\r\n--{boundary}--\r\n".encode()
+            (
+                f'--{boundary}\r\nContent-Disposition: form-data; name="model"\r\n\r\n'
+                "deepseek-v4-flash\r\n"
+                f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="a.wav"\r\n'
+                "Content-Type: audio/wav\r\n\r\n"
+            ).encode()
+            + payload
+            + f"\r\n--{boundary}--\r\n".encode()
+        )
         limits = IngressLimits(max_body_bytes=2 * 1024 * 1024)
         resources = IngressResources(limits)
         request = validate_http_request(
@@ -500,9 +505,7 @@ def test_route_group_names_are_globally_unique_but_case_sensitive() -> None:
             "route_group_id": RouteGroupId("rg_bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
             "legs": (
                 original.legs[0].model_copy(
-                    update={
-                        "leg_id": RouteLegId("leg_bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
-                    }
+                    update={"leg_id": RouteLegId("leg_bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")}
                 ),
             ),
         }

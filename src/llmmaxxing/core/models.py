@@ -357,8 +357,8 @@ class LegacyClientCredentialVerifier(_Frozen):
             raise ValueError("credential not_after_s precedes not_before_s")
         return self
 
-type ClientVerifier = ClientCredentialVerifier | LegacyClientCredentialVerifier
 
+type ClientVerifier = ClientCredentialVerifier | LegacyClientCredentialVerifier
 
 
 class ClientKeyRecord(_Frozen):
@@ -371,12 +371,8 @@ class ClientKeyRecord(_Frozen):
     expires_at_s: int = Field(gt=0)
     time_high_water_s: int = Field(gt=0)
     generation_high_water: int = Field(ge=1)
-    credential_verifiers: tuple[ClientCredentialVerifier, ...] = Field(
-        default=(), max_length=2
-    )
-    legacy_verifiers: tuple[LegacyClientCredentialVerifier, ...] = Field(
-        default=(), max_length=2
-    )
+    credential_verifiers: tuple[ClientCredentialVerifier, ...] = Field(default=(), max_length=2)
+    legacy_verifiers: tuple[LegacyClientCredentialVerifier, ...] = Field(default=(), max_length=2)
 
     @model_validator(mode="after")
     def _valid_lifetime_and_generations(self) -> Self:
@@ -417,9 +413,7 @@ class ClientKeyRecord(_Frozen):
             for item in verifiers
             if item.status in (CredentialVerifierStatus.ACTIVE, CredentialVerifierStatus.RETIRING)
         )
-        active = tuple(
-            item for item in verifiers if item.status is CredentialVerifierStatus.ACTIVE
-        )
+        active = tuple(item for item in verifiers if item.status is CredentialVerifierStatus.ACTIVE)
         if len(accepted) > 2:
             raise ValueError("at most two credential generations may be accepted")
         if self.state is KeyLifecycleState.REVOKED or self.time_high_water_s >= self.expires_at_s:

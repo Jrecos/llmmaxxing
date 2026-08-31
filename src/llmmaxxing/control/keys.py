@@ -5,7 +5,7 @@ from __future__ import annotations
 import secrets
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Literal, TypeVar
+from typing import Literal
 
 from llmmaxxing.core.ids import PolicyRevisionId
 from llmmaxxing.core.key_lifecycle import (
@@ -28,13 +28,6 @@ from llmmaxxing.core.state_machines import (
     KeyLifecycleState,
     key_transition,
 )
-ClientVerifierT = TypeVar(
-    "ClientVerifierT",
-    ClientCredentialVerifier,
-    LegacyClientCredentialVerifier,
-)
-
-
 
 _RESPONSE_HEADERS = MappingProxyType(
     {"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"}
@@ -218,10 +211,10 @@ def resume_key(record: ClientKeyRecord, *, now_s: int) -> ClientKeyRecord:
     )
 
 
-def _expire_verifiers(
-    verifiers: tuple[ClientVerifierT, ...],
+def _expire_verifiers[T: (ClientCredentialVerifier, LegacyClientCredentialVerifier)](
+    verifiers: tuple[T, ...],
     expires_at_s: int,
-) -> tuple[ClientVerifierT, ...]:
+) -> tuple[T, ...]:
     return tuple(
         item.model_copy(
             update={
@@ -235,10 +228,10 @@ def _expire_verifiers(
     )
 
 
-def _retire_verifiers(
-    verifiers: tuple[ClientVerifierT, ...],
+def _retire_verifiers[T: (ClientCredentialVerifier, LegacyClientCredentialVerifier)](
+    verifiers: tuple[T, ...],
     now_s: int,
-) -> tuple[ClientVerifierT, ...]:
+) -> tuple[T, ...]:
     return tuple(
         item.model_copy(
             update={
@@ -265,9 +258,7 @@ def expire_key(record: ClientKeyRecord, *, now_s: int) -> ClientKeyRecord:
             "credential_verifiers": _expire_verifiers(
                 record.credential_verifiers, record.expires_at_s
             ),
-            "legacy_verifiers": _expire_verifiers(
-                record.legacy_verifiers, record.expires_at_s
-            ),
+            "legacy_verifiers": _expire_verifiers(record.legacy_verifiers, record.expires_at_s),
         }
     )
     validate_key_record_delta(record, candidate)
@@ -278,7 +269,6 @@ def revoke_key(record: ClientKeyRecord, *, now_s: int) -> ClientKeyRecord:
     if record.state is KeyLifecycleState.REVOKED:
         return record
     _require_live_time(record, now_s)
-
 
     return _transition(
         record,
@@ -304,13 +294,12 @@ def rotate_key(
     if not 0 <= overlap_s <= MAX_ROTATION_OVERLAP_S:
         raise ValueError("credential overlap must be between zero and seven days")
 
-    all_verifiers: tuple[
-        ClientCredentialVerifier | LegacyClientCredentialVerifier, ...
-    ] = (*record.credential_verifiers, *record.legacy_verifiers)
+    all_verifiers: tuple[ClientCredentialVerifier | LegacyClientCredentialVerifier, ...] = (
+        *record.credential_verifiers,
+        *record.legacy_verifiers,
+    )
     current = next(
-        item
-        for item in reversed(all_verifiers)
-        if item.status is CredentialVerifierStatus.ACTIVE
+        item for item in reversed(all_verifiers) if item.status is CredentialVerifierStatus.ACTIVE
     )
     retiring = current.model_copy(
         update={
@@ -331,13 +320,9 @@ def rotate_key(
         expires_at_s=record.expires_at_s,
     )
     canonical = (
-        (retiring, verifier)
-        if isinstance(retiring, ClientCredentialVerifier)
-        else (verifier,)
+        (retiring, verifier) if isinstance(retiring, ClientCredentialVerifier) else (verifier,)
     )
-    legacy = (
-        (retiring,) if isinstance(retiring, LegacyClientCredentialVerifier) else ()
-    )
+    legacy = (retiring,) if isinstance(retiring, LegacyClientCredentialVerifier) else ()
     candidate = ClientKeyRecord.model_validate(
         {
             **record.model_dump(mode="python"),

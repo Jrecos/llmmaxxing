@@ -131,9 +131,7 @@ class FakeLiteLLM:
         headers: dict[str, str] = {"content-type": "application/octet-stream"}
         if plan.mode is not FaultMode.MISSING_RECEIPT:
             headers["x-litellm-model-id"] = (
-                "runtime-wrong"
-                if plan.mode is FaultMode.WRONG_RECEIPT
-                else plan.deployment_id
+                "runtime-wrong" if plan.mode is FaultMode.WRONG_RECEIPT else plan.deployment_id
             )
 
         chunks: tuple[bytes, ...]

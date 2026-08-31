@@ -229,9 +229,7 @@ def _verify_legacy_client_key(
             if record is not None
             else None
         )
-        expected = (
-            bytes.fromhex(verifier.fingerprint_hex) if verifier is not None else b"\x00" * 32
-        )
+        expected = bytes.fromhex(verifier.fingerprint_hex) if verifier is not None else b"\x00" * 32
         matches = hmac.compare_digest(candidate, expected)
         if (
             matches

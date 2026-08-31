@@ -47,6 +47,12 @@ src = ["src", "tests"]
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
 
+[tool.ruff.lint.per-file-ignores]
+"deploy/litellm/llmmaxxing_guard.py" = ["SIM102", "UP037"]
+
+[tool.ruff.format]
+exclude = ["deploy/litellm/llmmaxxing_guard.py"]
+
 [tool.mypy]
 python_version = "3.12"
 strict = true

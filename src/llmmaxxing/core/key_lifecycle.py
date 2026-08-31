@@ -64,9 +64,7 @@ def _validate_existing_verifier(
         else before.fingerprint_hex
     )
     after_digest = (
-        after.verifier_hex
-        if isinstance(after, ClientCredentialVerifier)
-        else after.fingerprint_hex
+        after.verifier_hex if isinstance(after, ClientCredentialVerifier) else after.fingerprint_hex
     )
     if (
         before_digest != after_digest
@@ -147,18 +145,12 @@ def validate_key_record_delta(
         raise ValueError("new verifier requires a higher generation")
 
     active = next(
-        (
-            item
-            for item in _verifiers(after)
-            if item.status is CredentialVerifierStatus.ACTIVE
-        ),
+        (item for item in _verifiers(after) if item.status is CredentialVerifierStatus.ACTIVE),
         None,
     )
     if active is not None:
         for retiring in (
-            item
-            for item in _verifiers(after)
-            if item.status is CredentialVerifierStatus.RETIRING
+            item for item in _verifiers(after) if item.status is CredentialVerifierStatus.RETIRING
         ):
             if retiring.not_after_s - active.not_before_s > MAX_ROTATION_OVERLAP_S:
                 raise ValueError("credential rotation overlap exceeds seven days")

@@ -468,7 +468,8 @@ async def read_retained_body(
         if request.multipart
         else resources.limits.max_body_bytes + 1
     )
-    file = tempfile.SpooledTemporaryFile(max_size=threshold, mode="w+b")
+    # Ownership intentionally transfers to RetainedBody and closes on its release.
+    file = tempfile.SpooledTemporaryFile(max_size=threshold, mode="w+b")  # noqa: SIM115
     size = 0
     events = 0
     try:
@@ -482,9 +483,7 @@ async def read_retained_body(
             if remaining <= 0:
                 raise IngressError(408, "body_timeout")
             try:
-                async with asyncio.timeout(
-                    min(resources.limits.body_chunk_timeout_s, remaining)
-                ):
+                async with asyncio.timeout(min(resources.limits.body_chunk_timeout_s, remaining)):
                     message = await receive()
             except TimeoutError:
                 raise IngressError(408, "body_timeout") from None

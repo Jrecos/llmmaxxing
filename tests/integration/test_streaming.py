@@ -159,7 +159,11 @@ def test_downstream_backpressure_stops_upstream_reads_at_one_64k_chunk(tmp_path)
         release = asyncio.Event()
 
         async def send_hook(message) -> None:  # type: ignore[no-untyped-def]
-            if message["type"] == "http.response.body" and message.get("body") and not blocked.is_set():
+            if (
+                message["type"] == "http.response.body"
+                and message.get("body")
+                and not blocked.is_set()
+            ):
                 blocked.set()
                 await release.wait()
 

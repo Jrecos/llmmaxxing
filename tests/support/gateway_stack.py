@@ -78,7 +78,10 @@ class Clock:
 
 class GenerationGate:
     def permits(self, leg: AuthorizedLeg, backend_manifest_hash: str) -> bool:
-        return leg.generation_id == TARGET.generation.generation_id and len(backend_manifest_hash) == 64
+        return (
+            leg.generation_id == TARGET.generation.generation_id
+            and len(backend_manifest_hash) == 64
+        )
 
 
 class ActivationGate:
@@ -524,7 +527,9 @@ async def call_app(
     await app(scope, receive, send)
     starts = [message for message in sent if message["type"] == "http.response.start"]
     assert len(starts) == 1
-    bodies = [message.get("body", b"") for message in sent if message["type"] == "http.response.body"]
+    bodies = [
+        message.get("body", b"") for message in sent if message["type"] == "http.response.body"
+    ]
     return ASGIResponse(
         starts[0]["status"],
         tuple(starts[0]["headers"]),

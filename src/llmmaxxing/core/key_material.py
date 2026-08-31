@@ -91,10 +91,6 @@ def compute_client_key_verifier(pepper: bytes, key_id: bytes, secret: bytes) -> 
 
 def compute_legacy_key_fingerprint(pepper: bytes, value: str | bytes) -> bytes:
     encoded = value.encode("ascii") if isinstance(value, str) else value
-    if (
-        len(pepper) < 32
-        or len(encoded) > _MAX_LEGACY_TOKEN_BYTES
-        or not encoded.startswith(b"sk-")
-    ):
+    if len(pepper) < 32 or len(encoded) > _MAX_LEGACY_TOKEN_BYTES or not encoded.startswith(b"sk-"):
         raise ValueError("invalid legacy client key fingerprint input")
     return hmac.new(pepper, LEGACY_CLIENT_KEY_DOMAIN + encoded, hashlib.sha256).digest()

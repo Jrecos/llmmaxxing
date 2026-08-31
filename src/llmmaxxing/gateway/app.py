@@ -222,8 +222,7 @@ def _upstream_headers(
     for header_name, header_value in request.headers:
         if header_name == b"connection":
             connection_tokens.update(
-                token.strip().lower()
-                for token in header_value.decode("ascii", "ignore").split(",")
+                token.strip().lower() for token in header_value.decode("ascii", "ignore").split(",")
             )
     headers: dict[str, str] = {}
     for raw_name, raw_value in request.headers:
@@ -331,7 +330,9 @@ class GatewayApp:
         }
         self._closed = False
 
-    async def __call__(self, scope: Mapping[str, Any], receive: ASGIReceive, send: ASGISend) -> None:
+    async def __call__(
+        self, scope: Mapping[str, Any], receive: ASGIReceive, send: ASGISend
+    ) -> None:
         scope_type = scope.get("type")
         if scope_type == "lifespan":
             await self._lifespan(receive, send)
@@ -518,7 +519,6 @@ class GatewayApp:
                     await _shielded(lifecycle.finished(TerminalOutcome.UPSTREAM_FAILED))
                 await _shielded(lifecycle.release())
 
-
     @staticmethod
     def _authorization_has_alternate(
         dispatch: DispatchLease,
@@ -530,7 +530,6 @@ class GatewayApp:
             leg.leg_id != dispatch.candidate.leg_id and trigger in leg.allowed_triggers
             for leg in authorization.authorized_legs
         )
-
 
     async def _attempt(
         self,

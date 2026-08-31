@@ -16,8 +16,8 @@ from llmmaxxing.core.ids import (
     DeploymentGenerationId,
     ProbeToken,
     RequestId,
-    RouteLegId,
     RouteGroupId,
+    RouteLegId,
 )
 from llmmaxxing.core.models import (
     AuthorizedLeg,

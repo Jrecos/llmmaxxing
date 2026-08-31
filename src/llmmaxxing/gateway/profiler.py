@@ -8,8 +8,8 @@ import json
 import multiprocessing
 import re
 import resource
-from dataclasses import dataclass
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any, NoReturn, cast
 
 from llmmaxxing.adapters.litellm.contract import CertifiedEndpoint, PreparedDispatch
@@ -89,6 +89,7 @@ def _pairs_without_duplicates(pairs: Sequence[tuple[str, Any]]) -> dict[str, Any
         result[key] = value
     return result
 
+
 def _prescan_json_limits(body: bytes) -> None:
     """Bound nesting/tokens/strings without constructing attacker-controlled objects."""
     index = 0
@@ -133,7 +134,6 @@ def _prescan_json_limits(body: bytes) -> None:
                 index += 1
         if elements > MAX_JSON_ELEMENTS:
             _reject("json_element_limit")
-
 
 
 def _parse_json(body: bytes) -> dict[str, Any]:
@@ -263,8 +263,7 @@ def _profile_json(endpoint_name: str, body: bytes) -> _ProfileResult:
         tools_count, forced_tool = _tools(data)
         response_schema = _schema(data)
         history_turns = sum(
-            isinstance(message, dict)
-            and message.get("role") in ("assistant", "tool", "function")
+            isinstance(message, dict) and message.get("role") in ("assistant", "tool", "function")
             for message in messages
         )
         modality = Modality.TEXT
@@ -440,7 +439,9 @@ def _rewrite_multipart(body: bytes, content_type: str, prepared: PreparedDispatc
     seen_fence = False
     for part in parts:
         if part.name == model_field:
-            rewritten.append(_MultipartPart(part.header_blob, part.name, prepared.hidden_alias.encode()))
+            rewritten.append(
+                _MultipartPart(part.header_blob, part.name, prepared.hidden_alias.encode())
+            )
         elif part.name == fence_field:
             rewritten.append(_MultipartPart(part.header_blob, part.name, fence_value))
             seen_fence = True
