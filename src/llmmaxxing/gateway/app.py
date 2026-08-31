@@ -358,6 +358,21 @@ class GatewayApp:
         }
         self._closed = False
 
+    def activate_bundle(self, bundle: PolicyBundleV1) -> None:
+        """Apply one already-verified bundle while Task9 holds the dispatcher gate."""
+
+        self.runtime.apply_publication(bundle.accounts)
+        self.route_engine.activate(bundle)
+        self._route_groups = {
+            group.name: group.route_group_id for group in self.route_engine.bundle.route_groups
+        }
+
+    @property
+    def capacity_ready(self) -> bool:
+        """Whether the Task8 process-owned HTTP/profile capacities can serve."""
+
+        return not self._closed and self.http.client_count == 1 and self.profiler.ready
+
     async def __call__(
         self, scope: Mapping[str, Any], receive: ASGIReceive, send: ASGISend
     ) -> None:

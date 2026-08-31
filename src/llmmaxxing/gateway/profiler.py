@@ -579,6 +579,10 @@ class ProfileExecutor:
         self._scratch_by_key: dict[str, int] = {}
         self._closed = False
 
+    @property
+    def ready(self) -> bool:
+        return not self._closed
+
     async def _reserve_scratch(self, key_id: str, amount: int) -> _ScratchReservation:
         async with self._scratch_lock:
             key_total = self._scratch_by_key.get(key_id, 0)
