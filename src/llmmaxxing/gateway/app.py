@@ -110,6 +110,11 @@ class LifecycleCapacity(Protocol):
         events: int,
     ) -> RequestLifecycle | None: ...
 
+    @property
+    def ready(self) -> bool: ...
+
+    async def aclose(self) -> None: ...
+
 
 class RuntimeIdentityProvider(Protocol):
     def current_runtime_identity(self) -> RuntimeIdentity: ...
@@ -371,7 +376,12 @@ class GatewayApp:
     def capacity_ready(self) -> bool:
         """Whether the Task8 process-owned HTTP/profile capacities can serve."""
 
-        return not self._closed and self.http.client_count == 1 and self.profiler.ready
+        return (
+            not self._closed
+            and self.http.client_count == 1
+            and self.profiler.ready
+            and self.lifecycle_capacity.ready
+        )
 
     async def __call__(
         self, scope: Mapping[str, Any], receive: ASGIReceive, send: ASGISend
@@ -465,7 +475,7 @@ class GatewayApp:
                 lifecycle_events,
             )
             if lifecycle is None:
-                await send_error(503, "lifecycle_capacity")
+                await send_error(503, "telemetry_spool_exhausted")
                 return
             await preauth.release()
             preauth = None
@@ -1090,6 +1100,7 @@ class GatewayApp:
         self._closed = True
         await self.profiler.aclose()
         await self.http.aclose()
+        await self.lifecycle_capacity.aclose()
 
 
 def create_app(

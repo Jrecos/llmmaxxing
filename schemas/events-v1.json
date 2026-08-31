@@ -1,0 +1,447 @@
+{
+  "$defs": {
+    "LifecycleEventKind": {
+      "description": "Only the six V1 records covered by the fixed reservation formula.",
+      "enum": [
+        "request_admitted",
+        "request_queued",
+        "request_admission_event",
+        "request_terminal",
+        "attempt_reserved",
+        "attempt_resolved"
+      ],
+      "title": "LifecycleEventKind",
+      "type": "string"
+    },
+    "LifecycleReason": {
+      "description": "Closed event reasons; raw provider/client strings never enter the spool.",
+      "enum": [
+        "authz_denied",
+        "auth_state_unavailable",
+        "unsupported_request",
+        "backpressure_rejected",
+        "route_unavailable",
+        "deadline_exceeded",
+        "upstream_failed",
+        "client_cancelled",
+        "response_stream_failed",
+        "completed",
+        "account_not_active",
+        "account_not_found",
+        "attempt_duplicate",
+        "circuit_changed",
+        "circuit_unavailable",
+        "invalid_quota_charge",
+        "journal_capacity_stop",
+        "journal_unavailable",
+        "monthly_quota_exhausted",
+        "monthly_reset_unavailable",
+        "parallel_exhausted",
+        "recovery_required",
+        "rpm_exhausted",
+        "tpm_exhausted",
+        "crash_recovery",
+        "upstream_unknown",
+        "profile_accepted",
+        "queued_contraction",
+        "spool_pressure",
+        "predispatch_deadline",
+        "telemetry_spool_exhausted",
+        "writer_unavailable",
+        "lifecycle_invariant"
+      ],
+      "title": "LifecycleReason",
+      "type": "string"
+    },
+    "LifecycleTimingsV1": {
+      "additionalProperties": false,
+      "properties": {
+        "duration_ms": {
+          "anyOf": [
+            {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Duration Ms"
+        },
+        "queue_wait_ms": {
+          "anyOf": [
+            {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Queue Wait Ms"
+        },
+        "ttft_ms": {
+          "anyOf": [
+            {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Ttft Ms"
+        }
+      },
+      "title": "LifecycleTimingsV1",
+      "type": "object"
+    },
+    "LifecycleTokenActualsV1": {
+      "additionalProperties": false,
+      "properties": {
+        "input": {
+          "anyOf": [
+            {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Input"
+        },
+        "output": {
+          "anyOf": [
+            {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Output"
+        },
+        "reasoning": {
+          "anyOf": [
+            {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Reasoning"
+        }
+      },
+      "title": "LifecycleTokenActualsV1",
+      "type": "object"
+    },
+    "RouteTrigger": {
+      "description": "Typed causes that may activate a non-primary leg (design: V1 triggers).",
+      "enum": [
+        "primary",
+        "capacity_spill",
+        "failure_fallback",
+        "quota_fallback",
+        "manual_emergency",
+        "shadow"
+      ],
+      "title": "RouteTrigger",
+      "type": "string"
+    },
+    "TerminalOutcome": {
+      "description": "Closed set of terminal request outcomes (design: Deterministic routing).\n\n``QUEUED`` is deliberately absent: it is nonterminal and therefore not a\nlegal value here.",
+      "enum": [
+        "authz_denied",
+        "auth_state_unavailable",
+        "unsupported_request",
+        "backpressure_rejected",
+        "route_unavailable",
+        "deadline_exceeded",
+        "upstream_failed",
+        "client_cancelled",
+        "response_stream_failed",
+        "completed"
+      ],
+      "title": "TerminalOutcome",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "description": "One canonical, bounded lifecycle record safe for durable central storage.",
+  "properties": {
+    "account_id": {
+      "anyOf": [
+        {
+          "pattern": "^acc_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+          "title": "AccountId",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Account Id"
+    },
+    "attempt_id": {
+      "anyOf": [
+        {
+          "pattern": "^att_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+          "title": "AttemptId",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Attempt Id"
+    },
+    "attempts_used": {
+      "anyOf": [
+        {
+          "maximum": 4,
+          "minimum": 0,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Attempts Used"
+    },
+    "boot_id": {
+      "pattern": "^boot_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "title": "GatewayBootId",
+      "type": "string"
+    },
+    "deployment_generation_id": {
+      "anyOf": [
+        {
+          "pattern": "^dg1_[0-9a-f]{64}$",
+          "title": "DeploymentGenerationId",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Deployment Generation Id"
+    },
+    "event_id": {
+      "pattern": "^evt_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "title": "EventId",
+      "type": "string"
+    },
+    "final_byte_at_ms": {
+      "anyOf": [
+        {
+          "maximum": 9007199254740991,
+          "minimum": 1,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Final Byte At Ms"
+    },
+    "first_byte_at_ms": {
+      "anyOf": [
+        {
+          "maximum": 9007199254740991,
+          "minimum": 1,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "First Byte At Ms"
+    },
+    "headers_at_ms": {
+      "anyOf": [
+        {
+          "maximum": 9007199254740991,
+          "minimum": 1,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Headers At Ms"
+    },
+    "installation_id": {
+      "pattern": "^inst_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "title": "InstallationId",
+      "type": "string"
+    },
+    "key_id": {
+      "pattern": "^[0-9a-f]{32}$",
+      "title": "Key Id",
+      "type": "string"
+    },
+    "kind": {
+      "$ref": "#/$defs/LifecycleEventKind"
+    },
+    "lease_released_at_ms": {
+      "anyOf": [
+        {
+          "maximum": 9007199254740991,
+          "minimum": 1,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Lease Released At Ms"
+    },
+    "occurred_at_ms": {
+      "maximum": 9007199254740991,
+      "minimum": 1,
+      "title": "Occurred At Ms",
+      "type": "integer"
+    },
+    "outcome": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/TerminalOutcome"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "reason": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/LifecycleReason"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "request_id": {
+      "pattern": "^req_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "title": "RequestId",
+      "type": "string"
+    },
+    "route_group_id": {
+      "anyOf": [
+        {
+          "pattern": "^rg_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+          "title": "RouteGroupId",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Route Group Id"
+    },
+    "schema_version": {
+      "const": 1,
+      "default": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "spill_from_account_id": {
+      "anyOf": [
+        {
+          "pattern": "^acc_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+          "title": "AccountId",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Spill From Account Id"
+    },
+    "timings_ms": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/LifecycleTimingsV1"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "token_actuals": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/LifecycleTokenActualsV1"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "trigger": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/RouteTrigger"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "uncertain": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Uncertain"
+    }
+  },
+  "required": [
+    "event_id",
+    "request_id",
+    "kind",
+    "occurred_at_ms",
+    "installation_id",
+    "boot_id",
+    "key_id"
+  ],
+  "title": "LifecycleEventV1",
+  "type": "object"
+}

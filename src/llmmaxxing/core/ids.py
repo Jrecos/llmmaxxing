@@ -118,6 +118,12 @@ class AttemptId(_UuidId):
     __slots__ = ()
     _prefix = "att_"
 
+class EventId(_UuidId):
+    """Immutable identity of one deduplicated lifecycle event."""
+
+    __slots__ = ()
+    _prefix = "evt_"
+
 
 class GatewayBootId(_UuidId):
     """Identity of one Gateway process boot."""

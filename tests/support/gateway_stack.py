@@ -165,6 +165,7 @@ class LifecycleCapacity:
     fail_finished: bool = False
     reservations: list[tuple[RequestId, AuthenticatedClient, int]] = field(default_factory=list)
     lifecycles: list[Lifecycle] = field(default_factory=list)
+    closed: bool = False
 
     async def reserve(
         self,
@@ -178,6 +179,13 @@ class LifecycleCapacity:
         lifecycle = Lifecycle(events, self.fail_attempt_started, self.fail_finished)
         self.lifecycles.append(lifecycle)
         return lifecycle
+
+    @property
+    def ready(self) -> bool:
+        return self.available and not self.closed
+
+    async def aclose(self) -> None:
+        self.closed = True
 
 
 class AuthView:
