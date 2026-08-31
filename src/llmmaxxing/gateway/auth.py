@@ -11,10 +11,17 @@ from llmmaxxing.core.ids import BundleHash, PolicyRevisionId
 from llmmaxxing.core.key_material import (
     InvalidClientKeyMaterial,
     ParsedClientKey,
+    ParsedLegacyClientKey,
     compute_client_key_verifier,
+    compute_legacy_key_fingerprint,
     parse_client_key_material,
+    parse_legacy_client_key_material,
 )
-from llmmaxxing.core.models import ClientCredentialVerifier, ClientKeyRecord
+from llmmaxxing.core.models import (
+    ClientCredentialVerifier,
+    ClientKeyRecord,
+    LegacyClientCredentialVerifier,
+)
 from llmmaxxing.core.state_machines import CredentialVerifierStatus, KeyLifecycleState
 
 _PUBLIC_ERROR = "invalid client key"
@@ -50,6 +57,12 @@ _DUMMY_RECORD = ClientKeyRecord(
 )
 
 
+@dataclass(frozen=True, slots=True)
+class LegacyKeyIndexEntry:
+    key_id: str
+    credential_generation: int
+
+
 class ClientAuthenticationError(ValueError):
     """Bounded non-enumerating public authentication failure."""
 
@@ -76,6 +89,9 @@ class AuthRuntimeView(Protocol):
     def accepted_peppers(self) -> Mapping[str, bytes]: ...
 
     @property
+    def legacy_key_index(self) -> Mapping[str, LegacyKeyIndexEntry]: ...
+
+    @property
     def trusted_now_s(self) -> int: ...
 
 
@@ -100,8 +116,8 @@ def parse_client_key(
     value: str | Sequence[str] | None,
     *,
     query_credentials: Sequence[str] = (),
-) -> ParsedClientKey:
-    """Reject ambiguity before body read, then parse exact canonical token material."""
+) -> ParsedClientKey | ParsedLegacyClientKey:
+    """Reject ambiguity, then parse canonical or bounded migration key material."""
     if query_credentials or value is None:
         raise ClientAuthenticationError()
     if isinstance(value, str):
@@ -114,11 +130,14 @@ def parse_client_key(
     try:
         return parse_client_key_material(candidate)
     except (InvalidClientKeyMaterial, TypeError):
-        raise ClientAuthenticationError() from None
+        try:
+            return parse_legacy_client_key_material(candidate)
+        except (InvalidClientKeyMaterial, TypeError):
+            raise ClientAuthenticationError() from None
 
 
 def _credential_is_accepted(
-    verifier: ClientCredentialVerifier,
+    verifier: ClientCredentialVerifier | LegacyClientCredentialVerifier,
     record: ClientKeyRecord,
     runtime_view: AuthRuntimeView,
 ) -> bool:
@@ -149,11 +168,96 @@ def _prepare_verifier(
     return pepper, expected, eligible
 
 
-def verify_client_key(
-    parsed: ParsedClientKey,
+def _legacy_index_key(pepper_version: str, fingerprint_hex: str) -> str:
+    return f"{pepper_version}:{fingerprint_hex}"
+
+
+def build_legacy_key_index(
+    records: Sequence[ClientKeyRecord],
+) -> dict[str, LegacyKeyIndexEntry]:
+    index: dict[str, LegacyKeyIndexEntry] = {}
+    for record in records:
+        for verifier in record.legacy_verifiers:
+            key = _legacy_index_key(verifier.pepper_version, verifier.fingerprint_hex)
+            if key in index:
+                raise ValueError("duplicate legacy credential fingerprint")
+            index[key] = LegacyKeyIndexEntry(record.key_id, verifier.generation)
+    return index
+
+
+def _authenticated(
+    record: ClientKeyRecord,
+    accepted_generation: int,
     runtime_view: AuthRuntimeView,
 ) -> AuthenticatedClient:
-    """Verify locally with one index lookup and a fixed two constant-time compares."""
+    return AuthenticatedClient(
+        key_id=record.key_id,
+        accepted_credential_generation=accepted_generation,
+        policy_id=record.policy_id,
+        key_state=record.state,
+        key_expires_at_s=record.expires_at_s,
+        applied_bundle_generation=runtime_view.applied_bundle_generation,
+        applied_bundle_hash=runtime_view.applied_bundle_hash,
+    )
+
+
+def _verify_legacy_client_key(
+    parsed: ParsedLegacyClientKey,
+    runtime_view: AuthRuntimeView,
+) -> AuthenticatedClient:
+    pepper_set_is_valid = 1 <= len(runtime_view.accepted_peppers) <= 2 and all(
+        len(pepper) >= 32 for pepper in runtime_view.accepted_peppers.values()
+    )
+    slots = list(runtime_view.accepted_peppers.items())[:2]
+    slots.extend((f"dummy-{index}", _DUMMY_PEPPER) for index in range(2 - len(slots)))
+    accepted: tuple[ClientKeyRecord, int] | None = None
+    for pepper_version, pepper in slots:
+        candidate = compute_legacy_key_fingerprint(pepper, parsed.token)
+        entry = runtime_view.legacy_key_index.get(
+            _legacy_index_key(pepper_version, candidate.hex())
+        )
+        record = runtime_view.key_index.get(entry.key_id) if entry is not None else None
+        verifier = (
+            next(
+                (
+                    item
+                    for item in record.legacy_verifiers
+                    if entry is not None and item.generation == entry.credential_generation
+                ),
+                None,
+            )
+            if record is not None
+            else None
+        )
+        expected = (
+            bytes.fromhex(verifier.fingerprint_hex) if verifier is not None else b"\x00" * 32
+        )
+        matches = hmac.compare_digest(candidate, expected)
+        if (
+            matches
+            and record is not None
+            and verifier is not None
+            and _credential_is_accepted(verifier, record, runtime_view)
+        ):
+            accepted = (record, verifier.generation)
+    if (
+        accepted is None
+        or not pepper_set_is_valid
+        or accepted[0].state is not KeyLifecycleState.ENABLED
+        or accepted[0].key_id in runtime_view.denied_key_ids
+        or runtime_view.trusted_now_s >= accepted[0].expires_at_s
+    ):
+        raise ClientAuthenticationError()
+    return _authenticated(accepted[0], accepted[1], runtime_view)
+
+
+def verify_client_key(
+    parsed: ParsedClientKey | ParsedLegacyClientKey,
+    runtime_view: AuthRuntimeView,
+) -> AuthenticatedClient:
+    """Verify locally with bounded HMAC work and no plaintext credential index."""
+    if isinstance(parsed, ParsedLegacyClientKey):
+        return _verify_legacy_client_key(parsed, runtime_view)
     pepper_set_is_valid = 1 <= len(runtime_view.accepted_peppers) <= 2 and all(
         len(pepper) >= 32 for pepper in runtime_view.accepted_peppers.values()
     )
@@ -185,16 +289,7 @@ def verify_client_key(
         or runtime_view.trusted_now_s >= record.expires_at_s
     ):
         raise ClientAuthenticationError()
-
-    return AuthenticatedClient(
-        key_id=record.key_id,
-        accepted_credential_generation=accepted_generation,
-        policy_id=record.policy_id,
-        key_state=record.state,
-        key_expires_at_s=record.expires_at_s,
-        applied_bundle_generation=runtime_view.applied_bundle_generation,
-        applied_bundle_hash=runtime_view.applied_bundle_hash,
-    )
+    return _authenticated(record, accepted_generation, runtime_view)
 
 
 def queued_identity_is_authorized(
@@ -211,8 +306,12 @@ def queued_identity_is_authorized(
         or runtime_view.trusted_now_s >= record.expires_at_s
     ):
         return False
+    verifiers: tuple[ClientCredentialVerifier | LegacyClientCredentialVerifier, ...] = (
+        *record.credential_verifiers,
+        *record.legacy_verifiers,
+    )
     return any(
         verifier.generation == client.accepted_credential_generation
         and _credential_is_accepted(verifier, record, runtime_view)
-        for verifier in record.credential_verifiers
+        for verifier in verifiers
     )

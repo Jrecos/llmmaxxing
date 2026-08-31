@@ -5,7 +5,7 @@ from __future__ import annotations
 import secrets
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Literal
+from typing import Literal, TypeVar
 
 from llmmaxxing.core.ids import PolicyRevisionId
 from llmmaxxing.core.key_lifecycle import (
@@ -17,12 +17,24 @@ from llmmaxxing.core.key_lifecycle import (
     validate_key_record_delta,
 )
 from llmmaxxing.core.key_material import compute_client_key_verifier, format_client_key
-from llmmaxxing.core.models import ClientCredentialVerifier, ClientKeyRecord, KeyPolicyRevision
+from llmmaxxing.core.models import (
+    ClientCredentialVerifier,
+    ClientKeyRecord,
+    KeyPolicyRevision,
+    LegacyClientCredentialVerifier,
+)
 from llmmaxxing.core.state_machines import (
     CredentialVerifierStatus,
     KeyLifecycleState,
     key_transition,
 )
+ClientVerifierT = TypeVar(
+    "ClientVerifierT",
+    ClientCredentialVerifier,
+    LegacyClientCredentialVerifier,
+)
+
+
 
 _RESPONSE_HEADERS = MappingProxyType(
     {"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"}
@@ -145,6 +157,7 @@ def _transition(
     now_s: int,
     state: KeyLifecycleState,
     credential_verifiers: tuple[ClientCredentialVerifier, ...] | None = None,
+    legacy_verifiers: tuple[LegacyClientCredentialVerifier, ...] | None = None,
     policy_id: PolicyRevisionId | None = None,
     policy_reassignment: PolicyReassignment | None = None,
 ) -> ClientKeyRecord:
@@ -153,7 +166,14 @@ def _transition(
             **record.model_dump(mode="python"),
             "state": state,
             "time_high_water_s": now_s,
-            "credential_verifiers": credential_verifiers or record.credential_verifiers,
+            "credential_verifiers": (
+                record.credential_verifiers
+                if credential_verifiers is None
+                else credential_verifiers
+            ),
+            "legacy_verifiers": (
+                record.legacy_verifiers if legacy_verifiers is None else legacy_verifiers
+            ),
             "policy_id": policy_id or record.policy_id,
         }
     )
@@ -198,6 +218,38 @@ def resume_key(record: ClientKeyRecord, *, now_s: int) -> ClientKeyRecord:
     )
 
 
+def _expire_verifiers(
+    verifiers: tuple[ClientVerifierT, ...],
+    expires_at_s: int,
+) -> tuple[ClientVerifierT, ...]:
+    return tuple(
+        item.model_copy(
+            update={
+                "status": CredentialVerifierStatus.EXPIRED,
+                "not_after_s": min(item.not_after_s, expires_at_s),
+            }
+        )
+        if item.status in (CredentialVerifierStatus.ACTIVE, CredentialVerifierStatus.RETIRING)
+        else item
+        for item in verifiers
+    )
+
+
+def _retire_verifiers(
+    verifiers: tuple[ClientVerifierT, ...],
+    now_s: int,
+) -> tuple[ClientVerifierT, ...]:
+    return tuple(
+        item.model_copy(
+            update={
+                "status": CredentialVerifierStatus.RETIRED,
+                "not_after_s": min(item.not_after_s, now_s),
+            }
+        )
+        for item in verifiers
+    )
+
+
 def expire_key(record: ClientKeyRecord, *, now_s: int) -> ClientKeyRecord:
     """Materialize absolute expiry without adding any grace period."""
     if now_s < record.time_high_water_s:
@@ -206,22 +258,16 @@ def expire_key(record: ClientKeyRecord, *, now_s: int) -> ClientKeyRecord:
         raise ValueError("client key has not reached absolute expiry")
     if record.time_high_water_s >= record.expires_at_s:
         return record
-    expired = tuple(
-        item.model_copy(
-            update={
-                "status": CredentialVerifierStatus.EXPIRED,
-                "not_after_s": min(item.not_after_s, record.expires_at_s),
-            }
-        )
-        if item.status in (CredentialVerifierStatus.ACTIVE, CredentialVerifierStatus.RETIRING)
-        else item
-        for item in record.credential_verifiers
-    )
     candidate = ClientKeyRecord.model_validate(
         {
             **record.model_dump(mode="python"),
             "time_high_water_s": now_s,
-            "credential_verifiers": expired,
+            "credential_verifiers": _expire_verifiers(
+                record.credential_verifiers, record.expires_at_s
+            ),
+            "legacy_verifiers": _expire_verifiers(
+                record.legacy_verifiers, record.expires_at_s
+            ),
         }
     )
     validate_key_record_delta(record, candidate)
@@ -232,20 +278,14 @@ def revoke_key(record: ClientKeyRecord, *, now_s: int) -> ClientKeyRecord:
     if record.state is KeyLifecycleState.REVOKED:
         return record
     _require_live_time(record, now_s)
-    retired = tuple(
-        item.model_copy(
-            update={
-                "status": CredentialVerifierStatus.RETIRED,
-                "not_after_s": min(item.not_after_s, now_s),
-            }
-        )
-        for item in record.credential_verifiers
-    )
+
+
     return _transition(
         record,
         now_s=now_s,
         state=key_transition(record.state, "revoke"),
-        credential_verifiers=retired,
+        credential_verifiers=_retire_verifiers(record.credential_verifiers, now_s),
+        legacy_verifiers=_retire_verifiers(record.legacy_verifiers, now_s),
     )
 
 
@@ -264,9 +304,12 @@ def rotate_key(
     if not 0 <= overlap_s <= MAX_ROTATION_OVERLAP_S:
         raise ValueError("credential overlap must be between zero and seven days")
 
+    all_verifiers: tuple[
+        ClientCredentialVerifier | LegacyClientCredentialVerifier, ...
+    ] = (*record.credential_verifiers, *record.legacy_verifiers)
     current = next(
         item
-        for item in reversed(record.credential_verifiers)
+        for item in reversed(all_verifiers)
         if item.status is CredentialVerifierStatus.ACTIVE
     )
     retiring = current.model_copy(
@@ -287,12 +330,21 @@ def rotate_key(
         now_s=now_s,
         expires_at_s=record.expires_at_s,
     )
+    canonical = (
+        (retiring, verifier)
+        if isinstance(retiring, ClientCredentialVerifier)
+        else (verifier,)
+    )
+    legacy = (
+        (retiring,) if isinstance(retiring, LegacyClientCredentialVerifier) else ()
+    )
     candidate = ClientKeyRecord.model_validate(
         {
             **record.model_dump(mode="python"),
             "time_high_water_s": now_s,
             "generation_high_water": generation,
-            "credential_verifiers": (retiring, verifier),
+            "credential_verifiers": canonical,
+            "legacy_verifiers": legacy,
         }
     )
     validate_key_record_delta(record, candidate)

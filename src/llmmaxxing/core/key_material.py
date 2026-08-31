@@ -10,6 +10,9 @@ import re
 from dataclasses import dataclass, field
 
 CLIENT_KEY_DOMAIN = b"llmmaxxing-client-key-v1\x00"
+LEGACY_CLIENT_KEY_DOMAIN = b"llmmaxxing-legacy-client-key-v1\x00"
+_MAX_LEGACY_TOKEN_BYTES = 512
+_LEGACY_TOKEN_RE = re.compile(r"^sk-[\x21-\x7e]{5,509}$")
 _KEY_ID_BYTES = 16
 _SECRET_BYTES = 32
 _TOKEN_RE = re.compile(r"^lmxk1\.([A-Za-z0-9_-]{22})\.([A-Za-z0-9_-]{43})$")
@@ -27,6 +30,14 @@ class ParsedClientKey:
 
     def __repr__(self) -> str:
         return f"ParsedClientKey(key_id={self.key_id!r}, secret=<redacted>)"
+
+
+@dataclass(frozen=True, slots=True)
+class ParsedLegacyClientKey:
+    token: bytes = field(repr=False)
+
+    def __repr__(self) -> str:
+        return "ParsedLegacyClientKey(token=<redacted>)"
 
 
 def _decode_canonical(value: str, expected_bytes: int) -> bytes:
@@ -52,6 +63,20 @@ def parse_client_key_material(value: str) -> ParsedClientKey:
     return ParsedClientKey(key_id=key_id_bytes.hex(), key_id_bytes=key_id_bytes, secret=secret)
 
 
+def parse_legacy_client_key_material(value: str) -> ParsedLegacyClientKey:
+    try:
+        encoded = value.encode("ascii")
+    except UnicodeEncodeError as error:
+        raise InvalidClientKeyMaterial("invalid client key") from error
+    if (
+        not _LEGACY_TOKEN_RE.fullmatch(value)
+        or len(encoded) > _MAX_LEGACY_TOKEN_BYTES
+        or any(byte <= 0x20 or byte == 0x7F for byte in encoded)
+    ):
+        raise InvalidClientKeyMaterial("invalid client key")
+    return ParsedLegacyClientKey(encoded)
+
+
 def format_client_key(key_id: bytes, secret: bytes) -> str:
     if len(key_id) != _KEY_ID_BYTES or len(secret) != _SECRET_BYTES:
         raise ValueError("client key requires 128-bit ID and 256-bit secret")
@@ -62,3 +87,14 @@ def compute_client_key_verifier(pepper: bytes, key_id: bytes, secret: bytes) -> 
     if len(key_id) != _KEY_ID_BYTES or len(secret) != _SECRET_BYTES:
         raise ValueError("client key verifier requires 128-bit ID and 256-bit secret")
     return hmac.new(pepper, CLIENT_KEY_DOMAIN + key_id + secret, hashlib.sha256).digest()
+
+
+def compute_legacy_key_fingerprint(pepper: bytes, value: str | bytes) -> bytes:
+    encoded = value.encode("ascii") if isinstance(value, str) else value
+    if (
+        len(pepper) < 32
+        or len(encoded) > _MAX_LEGACY_TOKEN_BYTES
+        or not encoded.startswith(b"sk-")
+    ):
+        raise ValueError("invalid legacy client key fingerprint input")
+    return hmac.new(pepper, LEGACY_CLIENT_KEY_DOMAIN + encoded, hashlib.sha256).digest()

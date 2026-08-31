@@ -325,7 +325,7 @@ class KeyPolicyRevision(_Frozen):
 
 
 class ClientCredentialVerifier(_Frozen):
-    """One immutable verifier generation; plaintext key material never enters bundles."""
+    """One immutable canonical-key verifier generation."""
 
     generation: int = Field(ge=1)
     verifier_hex: _HEX64
@@ -341,8 +341,28 @@ class ClientCredentialVerifier(_Frozen):
         return self
 
 
+class LegacyClientCredentialVerifier(_Frozen):
+    """One bounded ``sk-*`` HMAC fingerprint; plaintext is never serialized."""
+
+    generation: int = Field(ge=1)
+    fingerprint_hex: _HEX64
+    pepper_version: Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")]
+    not_before_s: int = Field(gt=0)
+    not_after_s: int = Field(gt=0)
+    status: CredentialVerifierStatus
+
+    @model_validator(mode="after")
+    def _valid_window(self) -> Self:
+        if self.not_after_s < self.not_before_s:
+            raise ValueError("credential not_after_s precedes not_before_s")
+        return self
+
+type ClientVerifier = ClientCredentialVerifier | LegacyClientCredentialVerifier
+
+
+
 class ClientKeyRecord(_Frozen):
-    """One logical client key with at most two verifier generations."""
+    """One logical client key with at most two canonical/legacy generations."""
 
     key_id: _HEX32
     policy_id: PolicyRevisionId
@@ -351,7 +371,12 @@ class ClientKeyRecord(_Frozen):
     expires_at_s: int = Field(gt=0)
     time_high_water_s: int = Field(gt=0)
     generation_high_water: int = Field(ge=1)
-    credential_verifiers: tuple[ClientCredentialVerifier, ...] = Field(min_length=1, max_length=2)
+    credential_verifiers: tuple[ClientCredentialVerifier, ...] = Field(
+        default=(), max_length=2
+    )
+    legacy_verifiers: tuple[LegacyClientCredentialVerifier, ...] = Field(
+        default=(), max_length=2
+    )
 
     @model_validator(mode="after")
     def _valid_lifetime_and_generations(self) -> Self:
@@ -362,26 +387,38 @@ class ClientKeyRecord(_Frozen):
         if self.time_high_water_s < self.issued_at_s:
             raise ValueError("trusted time high-water precedes issuance")
 
-        generations = tuple(item.generation for item in self.credential_verifiers)
-        if generations != tuple(sorted(set(generations))):
-            raise ValueError("credential generations must be unique and increasing")
-        if generations[-1] != self.generation_high_water:
+        if tuple(item.generation for item in self.credential_verifiers) != tuple(
+            sorted(item.generation for item in self.credential_verifiers)
+        ):
+            raise ValueError("canonical credential generations must be increasing")
+        if tuple(item.generation for item in self.legacy_verifiers) != tuple(
+            sorted(item.generation for item in self.legacy_verifiers)
+        ):
+            raise ValueError("legacy credential generations must be increasing")
+        verifiers: tuple[ClientVerifier, ...] = (
+            *self.credential_verifiers,
+            *self.legacy_verifiers,
+        )
+        generations = tuple(item.generation for item in verifiers)
+        if not verifiers:
+            raise ValueError("client key requires at least one credential verifier")
+        if len(verifiers) > 2 or len(set(generations)) != len(generations):
+            raise ValueError("credential generations must be unique and bounded to two")
+        if max(generations) != self.generation_high_water:
             raise ValueError("generation high-water must equal the newest verifier generation")
         if any(
             item.not_before_s < self.issued_at_s or item.not_after_s > self.expires_at_s
-            for item in self.credential_verifiers
+            for item in verifiers
         ):
             raise ValueError("credential window must stay within logical key lifetime")
 
         accepted = tuple(
             item
-            for item in self.credential_verifiers
+            for item in verifiers
             if item.status in (CredentialVerifierStatus.ACTIVE, CredentialVerifierStatus.RETIRING)
         )
         active = tuple(
-            item
-            for item in self.credential_verifiers
-            if item.status is CredentialVerifierStatus.ACTIVE
+            item for item in verifiers if item.status is CredentialVerifierStatus.ACTIVE
         )
         if len(accepted) > 2:
             raise ValueError("at most two credential generations may be accepted")
@@ -519,6 +556,16 @@ class PolicyBundleV1(_Frozen):
         ):
             if len(set(seen)) != len(seen):
                 raise ValueError(f"duplicate {label} in bundle")
+        route_group_names = [group.name for group in self.route_groups]
+        if len(set(route_group_names)) != len(route_group_names):
+            raise ValueError("duplicate RouteGroupRevision.name in bundle")
+        legacy_fingerprints = [
+            (verifier.pepper_version, verifier.fingerprint_hex)
+            for key in self.keys
+            for verifier in key.legacy_verifiers
+        ]
+        if len(set(legacy_fingerprints)) != len(legacy_fingerprints):
+            raise ValueError("duplicate legacy credential fingerprint in bundle")
 
         bindings = [
             binding

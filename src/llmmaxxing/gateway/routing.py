@@ -17,6 +17,7 @@ from llmmaxxing.core.ids import (
     ProbeToken,
     RequestId,
     RouteLegId,
+    RouteGroupId,
 )
 from llmmaxxing.core.models import (
     AuthorizedLeg,
@@ -361,6 +362,25 @@ class RouteEngine:
         self._policies = {policy.policy_id: policy for policy in validated.policies}
         self._groups = {group.route_group_id: group for group in validated.route_groups}
         self._accounts = {account.account_id: account for account in validated.accounts}
+        self._groups_by_name = {group.name: group for group in validated.route_groups}
+
+    def resolve_route_group_id(self, model_alias: str) -> RouteGroupId:
+        try:
+            return self._groups_by_name[model_alias].route_group_id
+        except KeyError:
+            raise ValueError("unknown client-visible model") from None
+
+    def policy_deadline_ms(self, client: AuthenticatedClient) -> int:
+        policy = self._policies.get(client.policy_id)
+        if policy is None:
+            raise ValueError("client policy is absent from the current bundle")
+        return policy.deadline_ms
+
+    def client_authorizes_shadow(self, client: AuthenticatedClient) -> bool:
+        policy = self._policies.get(client.policy_id)
+        return policy is not None and any(
+            RouteTrigger.SHADOW in leg.allowed_triggers for leg in policy.authorized_legs
+        )
 
     def authorize(
         self,

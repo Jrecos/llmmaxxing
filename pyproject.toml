@@ -13,6 +13,7 @@ classifiers = [
 ]
 dependencies = [
     "cryptography>=44,<47",
+    "httpx>=0.28,<1",
     "pydantic>=2.9,<3",
 ]
 

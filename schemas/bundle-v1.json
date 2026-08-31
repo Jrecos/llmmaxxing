@@ -60,7 +60,7 @@
     },
     "ClientCredentialVerifier": {
       "additionalProperties": false,
-      "description": "One immutable verifier generation; plaintext key material never enters bundles.",
+      "description": "One immutable canonical-key verifier generation.",
       "properties": {
         "generation": {
           "minimum": 1,
@@ -104,14 +104,14 @@
     },
     "ClientKeyRecord": {
       "additionalProperties": false,
-      "description": "One logical client key with at most two verifier generations.",
+      "description": "One logical client key with at most two canonical/legacy generations.",
       "properties": {
         "credential_verifiers": {
+          "default": [],
           "items": {
             "$ref": "#/$defs/ClientCredentialVerifier"
           },
           "maxItems": 2,
-          "minItems": 1,
           "title": "Credential Verifiers",
           "type": "array"
         },
@@ -135,6 +135,15 @@
           "title": "Key Id",
           "type": "string"
         },
+        "legacy_verifiers": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/LegacyClientCredentialVerifier"
+          },
+          "maxItems": 2,
+          "title": "Legacy Verifiers",
+          "type": "array"
+        },
         "policy_id": {
           "pattern": "^pol_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
           "title": "PolicyRevisionId",
@@ -156,8 +165,7 @@
         "issued_at_s",
         "expires_at_s",
         "time_high_water_s",
-        "generation_high_water",
-        "credential_verifiers"
+        "generation_high_water"
       ],
       "title": "ClientKeyRecord",
       "type": "object"
@@ -340,6 +348,50 @@
         "shadow"
       ],
       "title": "LegCapabilities",
+      "type": "object"
+    },
+    "LegacyClientCredentialVerifier": {
+      "additionalProperties": false,
+      "description": "One bounded ``sk-*`` HMAC fingerprint; plaintext is never serialized.",
+      "properties": {
+        "fingerprint_hex": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Fingerprint Hex",
+          "type": "string"
+        },
+        "generation": {
+          "minimum": 1,
+          "title": "Generation",
+          "type": "integer"
+        },
+        "not_after_s": {
+          "exclusiveMinimum": 0,
+          "title": "Not After S",
+          "type": "integer"
+        },
+        "not_before_s": {
+          "exclusiveMinimum": 0,
+          "title": "Not Before S",
+          "type": "integer"
+        },
+        "pepper_version": {
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
+          "title": "Pepper Version",
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/CredentialVerifierStatus"
+        }
+      },
+      "required": [
+        "generation",
+        "fingerprint_hex",
+        "pepper_version",
+        "not_before_s",
+        "not_after_s",
+        "status"
+      ],
+      "title": "LegacyClientCredentialVerifier",
       "type": "object"
     },
     "Modality": {

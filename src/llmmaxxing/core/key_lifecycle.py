@@ -6,7 +6,11 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 from llmmaxxing.core.ids import PolicyRevisionId
-from llmmaxxing.core.models import ClientCredentialVerifier, ClientKeyRecord
+from llmmaxxing.core.models import (
+    ClientCredentialVerifier,
+    ClientKeyRecord,
+    LegacyClientCredentialVerifier,
+)
 from llmmaxxing.core.state_machines import CredentialVerifierStatus, KeyLifecycleState
 
 DEFAULT_KEY_LIFETIME_S = 90 * 86_400
@@ -49,11 +53,23 @@ def _validated(record: ClientKeyRecord) -> ClientKeyRecord:
 
 
 def _validate_existing_verifier(
-    before: ClientCredentialVerifier,
-    after: ClientCredentialVerifier,
+    before: ClientCredentialVerifier | LegacyClientCredentialVerifier,
+    after: ClientCredentialVerifier | LegacyClientCredentialVerifier,
 ) -> None:
+    if type(before) is not type(after):
+        raise ValueError("credential verifier kind is immutable")
+    before_digest = (
+        before.verifier_hex
+        if isinstance(before, ClientCredentialVerifier)
+        else before.fingerprint_hex
+    )
+    after_digest = (
+        after.verifier_hex
+        if isinstance(after, ClientCredentialVerifier)
+        else after.fingerprint_hex
+    )
     if (
-        before.verifier_hex != after.verifier_hex
+        before_digest != after_digest
         or before.pepper_version != after.pepper_version
         or before.not_before_s != after.not_before_s
     ):
@@ -64,6 +80,12 @@ def _validate_existing_verifier(
         if before.status in _TERMINAL_CREDENTIAL_STATES:
             raise ValueError("terminal credential generation cannot resurrect")
         raise ValueError("illegal credential verifier status transition")
+
+
+def _verifiers(
+    record: ClientKeyRecord,
+) -> tuple[ClientCredentialVerifier | LegacyClientCredentialVerifier, ...]:
+    return (*record.credential_verifiers, *record.legacy_verifiers)
 
 
 def validate_key_record_delta(
@@ -106,8 +128,8 @@ def validate_key_record_delta(
     if after.generation_high_water < before.generation_high_water:
         raise ValueError("credential generation high-water cannot roll back")
 
-    old = {item.generation: item for item in before.credential_verifiers}
-    new = {item.generation: item for item in after.credential_verifiers}
+    old = {item.generation: item for item in _verifiers(before)}
+    new = {item.generation: item for item in _verifiers(after)}
     for generation in old.keys() & new.keys():
         _validate_existing_verifier(old[generation], new[generation])
     for generation in new.keys() - old.keys():
@@ -127,7 +149,7 @@ def validate_key_record_delta(
     active = next(
         (
             item
-            for item in after.credential_verifiers
+            for item in _verifiers(after)
             if item.status is CredentialVerifierStatus.ACTIVE
         ),
         None,
@@ -135,7 +157,7 @@ def validate_key_record_delta(
     if active is not None:
         for retiring in (
             item
-            for item in after.credential_verifiers
+            for item in _verifiers(after)
             if item.status is CredentialVerifierStatus.RETIRING
         ):
             if retiring.not_after_s - active.not_before_s > MAX_ROTATION_OVERLAP_S:

@@ -1,0 +1,65 @@
+{
+  "contract_id": "litellm-1.98.0",
+  "source_commit": "d8f71d7bdbd7c9873d98293f83d64c6db72847e6",
+  "normalizer": "ProxyException.to_dict wrapped by openai_exception_handler",
+  "fixtures": [
+    {
+      "name": "nan_parallel_429",
+      "status": 429,
+      "headers": {
+        "content-type": "application/json"
+      },
+      "body": {
+        "error": {
+          "message": "Limit type: max_parallel_requests. Current limit: 5, Remaining: 0. Limit resets at: 2026-08-31T00:00:00Z",
+          "type": "rate_limit_error",
+          "param": null,
+          "code": "429"
+        }
+      }
+    },
+    {
+      "name": "arliai_parallel_403",
+      "status": 403,
+      "headers": {
+        "content-type": "application/json"
+      },
+      "body": {
+        "error": {
+          "message": "User has exceeded the maximum number of parallel requests for ADVANCED (3/2)",
+          "type": "permission_error",
+          "param": null,
+          "code": "403"
+        }
+      }
+    },
+    {
+      "name": "upstream_unavailable_503",
+      "status": 503,
+      "headers": {
+        "content-type": "application/json"
+      },
+      "body": {
+        "error": {
+          "message": "Upstream service unavailable",
+          "type": "upstream_unavailable",
+          "param": null,
+          "code": "503"
+        }
+      }
+    },
+    {
+      "name": "unhandled_500",
+      "status": 500,
+      "headers": {
+        "content-type": "application/json"
+      },
+      "body": {
+        "error": {
+          "message": "Internal server error",
+          "type": "internal_server_error"
+        }
+      }
+    }
+  ]
+}
