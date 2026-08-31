@@ -133,7 +133,11 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
         if self.path.endswith("/audio/speech"):
-            raw = b"RIFF$\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00@\x1f\x00\x00@\x1f\x00\x00\x01\x00\x08\x00data\x00\x00\x00\x00"
+            raw = (
+                b"RIFF$\x00\x00\x00WAVEfmt "
+                b"\x10\x00\x00\x00\x01\x00\x01\x00@\x1f\x00\x00@\x1f\x00\x00"
+                b"\x01\x00\x08\x00data\x00\x00\x00\x00"
+            )
             self.send_response(200)
             self.send_header("Content-Type", "audio/wav")
             self.send_header("Content-Length", str(len(raw)))

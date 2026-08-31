@@ -9,9 +9,9 @@ import os
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Mapping
 from copy import deepcopy
 from pathlib import Path
-from typing import Any, Mapping
 
 import pytest
 
@@ -81,6 +81,8 @@ class PinnedTransport:
 
 def _multipart(fields: Mapping[str, str], file_fixture: Mapping[str, str]) -> tuple[str, bytes]:
     boundary = "llmmaxxing-certified-boundary"
+    file_name = file_fixture["name"]
+    file_content_type = file_fixture["content_type"]
     chunks: list[bytes] = []
     for name, value in fields.items():
         chunks.extend(
@@ -94,10 +96,8 @@ def _multipart(fields: Mapping[str, str], file_fixture: Mapping[str, str]) -> tu
     chunks.extend(
         (
             f"--{boundary}\r\n".encode(),
-            (
-                f'Content-Disposition: form-data; name="file"; filename="{file_fixture["name"]}"\r\n'
-            ).encode(),
-            f'Content-Type: {file_fixture["content_type"]}\r\n\r\n'.encode(),
+            f'Content-Disposition: form-data; name="file"; filename="{file_name}"\r\n'.encode(),
+            f"Content-Type: {file_content_type}\r\n\r\n".encode(),
             base64.b64decode(file_fixture["base64"]),
             b"\r\n",
             f"--{boundary}--\r\n".encode(),

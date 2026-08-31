@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Literal, Mapping, Self
+from typing import Any, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
@@ -68,7 +69,9 @@ class ServiceKeyContract(_Frozen):
     def _closed_scope(self) -> Self:
         if len(set(self.allowed_routes)) != len(self.allowed_routes):
             raise ValueError("duplicate service-key route")
-        if any(route in {"read_only", "llm_api_routes", "llm_api"} for route in self.allowed_routes):
+        if any(
+            route in {"read_only", "llm_api_routes", "llm_api"} for route in self.allowed_routes
+        ):
             raise ValueError("broad service-key route groups are not certified")
         return self
 
@@ -127,7 +130,8 @@ class AdapterContract(_Frozen):
     def _unique_closed_contract(self) -> Self:
         if len({endpoint.name for endpoint in self.endpoints}) != len(self.endpoints):
             raise ValueError("duplicate certified endpoint name")
-        if len({(endpoint.method, endpoint.path) for endpoint in self.endpoints}) != len(self.endpoints):
+        endpoint_routes = {(endpoint.method, endpoint.path) for endpoint in self.endpoints}
+        if len(endpoint_routes) != len(self.endpoints):
             raise ValueError("duplicate certified endpoint route")
         if len(set(self.known_litellm_params)) != len(self.known_litellm_params):
             raise ValueError("duplicate known LiteLLM parameter")

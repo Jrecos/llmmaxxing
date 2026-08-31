@@ -4,9 +4,10 @@ import asyncio
 import hashlib
 import json
 import runpy
+from collections.abc import Mapping
 from copy import deepcopy
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 import pytest
 from pydantic import ValidationError
@@ -23,6 +24,7 @@ from llmmaxxing.adapters.litellm.guard import build_guard_manifest, deployment_g
 
 ROOT = Path(__file__).resolve().parents[3]
 FIXTURES = Path(__file__).parent / "fixtures"
+
 
 def fixture(name: str) -> dict[str, Any]:
     return json.loads((FIXTURES / name).read_text())["response"]
@@ -53,7 +55,8 @@ class FixtureTransport:
             body = fixture("readiness-details.json")
         elif path == "/active/callbacks":
             body = fixture("active-callbacks.json")
-            digest = hashlib.sha256((ROOT / "deploy/litellm/llmmaxxing_guard.py").read_bytes()).hexdigest()
+            guard_path = ROOT / "deploy/litellm/llmmaxxing_guard.py"
+            digest = hashlib.sha256(guard_path.read_bytes()).hexdigest()
             body = json.loads(json.dumps(body).replace("__GUARD_DIGEST__", digest))
         elif path == "/v2/model/info":
             body = deepcopy(self.responses[(path, int(query_dict["page"]))])
@@ -61,7 +64,11 @@ class FixtureTransport:
             body = fixture("models-expanded.json")
         else:
             return TransportResponse(status_code=404, headers={}, body={"error": "not found"})
-        return TransportResponse(status_code=200, headers={"content-type": "application/json"}, body=body)
+        return TransportResponse(
+            status_code=200,
+            headers={"content-type": "application/json"},
+            body=body,
+        )
 
 
 def test_public_adapter_interface() -> None:
@@ -132,9 +139,9 @@ def test_contract_certifies_only_native_receipt_endpoints_and_exact_locators() -
         "audio_transcription": "multipart.metadata",
         "image": "json.metadata",
     }
-    assert {
-        endpoint.name: endpoint.execution_normalizers for endpoint in contract.endpoints
-    } == {"messages": {"model": "provider_prefix_removed"}} | {
+    assert {endpoint.name: endpoint.execution_normalizers for endpoint in contract.endpoints} == {
+        "messages": {"model": "provider_prefix_removed"}
+    } | {
         name: {}
         for name in (
             "chat",
@@ -147,7 +154,10 @@ def test_contract_certifies_only_native_receipt_endpoints_and_exact_locators() -
             "image",
         )
     }
-    assert all(e.guard_required and e.receipt_header == "x-litellm-model-id" for e in contract.endpoints)
+    assert all(
+        endpoint.guard_required and endpoint.receipt_header == "x-litellm-model-id"
+        for endpoint in contract.endpoints
+    )
     assert {
         "responses_stateful_get",
         "responses_stateful_delete",
@@ -290,9 +300,7 @@ def test_unknown_provider_discovers_generates_and_prepares_without_source_enum()
     adapter = LiteLLMAdapter(load_contract(), FixtureTransport())
     snapshot = asyncio.run(adapter.discover_complete())
     electron = next(
-        row
-        for row in snapshot.deployments
-        if row.execution["custom_llm_provider"] == "electron"
+        row for row in snapshot.deployments if row.execution["custom_llm_provider"] == "electron"
     )
     generated = deployment_generation(electron, adapter.contract)
     prepared = adapter.prepare_dispatch(
@@ -338,18 +346,14 @@ def test_pinned_stack_launcher_materializes_exact_isolated_contract(tmp_path: Pa
         "postgres": {"condition": "service_healthy"},
     }
     config = json.loads(stack.config_path.read_text())
-    assert config["litellm_settings"]["callbacks"][-1] == (
-        "llmmaxxing_guard.llmmaxxing_guard"
-    )
-    assert {
-        row["model_name"] for row in config["model_list"]
-    } == {target["alias"] for target in stack.endpoint_targets.values()}
+    assert config["litellm_settings"]["callbacks"][-1] == ("llmmaxxing_guard.llmmaxxing_guard")
+    assert {row["model_name"] for row in config["model_list"]} == {
+        target["alias"] for target in stack.endpoint_targets.values()
+    }
     inference, discovery = launcher["key_requests"](contract, "inference-user", "discovery-user")
     assert set(inference["allowed_routes"]) == set(contract.service_keys.inference.allowed_routes)
     assert set(discovery["allowed_routes"]) == set(contract.service_keys.discovery.allowed_routes)
     assert discovery["key_type"] == inference["key_type"] == "default"
-
-
 
 
 def test_fixture_payloads_are_redacted_and_container_evidence_is_honestly_pending() -> None:
@@ -371,9 +375,10 @@ def test_guard_manifest_is_strict_data_driven_and_secret_free() -> None:
     assert manifest.backend_manifest == snapshot.manifest_revision
     assert electron.runtime_id == "runtime-electron-001"
     assert electron.execution["custom_llm_provider"] == "electron"
-    assert electron.generation_id == deployment_generation(
-        snapshot.deployments[0], adapter.contract
-    ).generation_id
+    assert (
+        electron.generation_id
+        == deployment_generation(snapshot.deployments[0], adapter.contract).generation_id
+    )
     raw = manifest.model_dump_json()
     assert "unit-test-provider-credential" not in raw
     assert "api_key" in raw

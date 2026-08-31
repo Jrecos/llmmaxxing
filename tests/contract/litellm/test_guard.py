@@ -31,8 +31,8 @@ def make_guard() -> tuple[ModuleType, Any, dict[str, Any], str]:
     digest = hashlib.sha256(GUARD_PATH.read_bytes()).hexdigest()
     manifest = json.loads((FIXTURES / "guard-manifest.json").read_text())
     manifest = json.loads(json.dumps(manifest).replace("__GUARD_DIGEST__", digest))
-    manifest["deployments"]["lmx/electron-v1"]["credential_fingerprint"] = module.credential_fingerprint(
-        hmac_key, provider_secret
+    manifest["deployments"]["lmx/electron-v1"]["credential_fingerprint"] = (
+        module.credential_fingerprint(hmac_key, provider_secret)
     )
     guard = module.LLMMaxxingGuard(manifest=manifest, hmac_key=hmac_key, guard_digest=digest)
     return module, guard, manifest, provider_secret
@@ -73,7 +73,11 @@ def request_kwargs(manifest: dict[str, Any], provider_secret: str) -> dict[str, 
     }
 
 
-async def guarded_provider_call(guard: Any, kwargs: dict[str, Any], calls: list[dict[str, Any]]) -> None:
+async def guarded_provider_call(
+    guard: Any,
+    kwargs: dict[str, Any],
+    calls: list[dict[str, Any]],
+) -> None:
     await guard.async_pre_call_deployment_hook(kwargs, None)
     calls.append(kwargs)
 

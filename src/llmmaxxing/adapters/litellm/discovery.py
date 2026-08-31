@@ -12,8 +12,8 @@ from llmmaxxing.adapters.litellm.contract import (
     AdapterContract,
     BuildProbe,
     CatalogModel,
-    DiscoverySnapshot,
     DeploymentReceipt,
+    DiscoverySnapshot,
     EffectiveDeployment,
     PreparedDispatch,
     TransportResponse,
@@ -130,7 +130,10 @@ class LiteLLMAdapter:
         }
         if set(readiness) != expected_readiness:
             raise DiscoveryError("readiness details schema does not match the certified build")
-        if readiness.get("status") != "healthy" or readiness.get("litellm_version") != self.contract.litellm.version:
+        if (
+            readiness.get("status") != "healthy"
+            or readiness.get("litellm_version") != self.contract.litellm.version
+        ):
             raise DiscoveryError("LiteLLM build probe mismatch")
 
         callback_state = await self._get(self.contract.discovery.callbacks_path)
@@ -152,10 +155,16 @@ class LiteLLMAdapter:
             raise DiscoveryError("active callback schema does not match the certified build")
         callbacks = callback_state.get("litellm.callbacks")
         identity = self.contract.guard.active_callback_identity
-        if not isinstance(callbacks, list) or callbacks.count(identity) != 1 or callbacks[-1] != identity:
+        if (
+            not isinstance(callbacks, list)
+            or callbacks.count(identity) != 1
+            or callbacks[-1] != identity
+        ):
             raise DiscoveryError("certified generation guard is missing, duplicated, or not last")
         all_callbacks = callback_state.get("all_litellm_callbacks")
-        if not isinstance(all_callbacks, list) or callback_state.get("num_callbacks") != len(all_callbacks):
+        if not isinstance(all_callbacks, list) or callback_state.get("num_callbacks") != len(
+            all_callbacks
+        ):
             raise DiscoveryError("active callback counts are malformed")
         return BuildProbe(
             contract_id=self.contract.contract_id,
@@ -230,7 +239,12 @@ class LiteLLMAdapter:
                 raise DiscoveryError(f"deployment execution projection mismatch: {field}")
         runtime_id = info.get("id")
         mode = info.get("mode")
-        if not isinstance(runtime_id, str) or not runtime_id or not isinstance(mode, str) or not mode:
+        if (
+            not isinstance(runtime_id, str)
+            or not runtime_id
+            or not isinstance(mode, str)
+            or not mode
+        ):
             raise DiscoveryError("deployment runtime id or mode is missing")
         return EffectiveDeployment(
             runtime_id=runtime_id,
@@ -269,15 +283,14 @@ class LiteLLMAdapter:
         if set(catalog_body) != {"object", "data"} or catalog_body.get("object") != "list":
             raise DiscoveryError("expanded model catalog schema mismatch")
         catalog_data = catalog_body.get("data")
-        if not isinstance(catalog_data, list) or any(not isinstance(row, dict) for row in catalog_data):
+        if not isinstance(catalog_data, list) or any(
+            not isinstance(row, dict) for row in catalog_data
+        ):
             raise DiscoveryError("expanded model catalog is malformed")
         try:
             catalog = tuple(
                 sorted(
-                    (
-                        CatalogModel(id=row["id"], owned_by=row["owned_by"])
-                        for row in catalog_data
-                    ),
+                    (CatalogModel(id=row["id"], owned_by=row["owned_by"]) for row in catalog_data),
                     key=lambda row: row.id,
                 )
             )
@@ -293,7 +306,8 @@ class LiteLLMAdapter:
             "contract_id": self.contract.contract_id,
             "build": self.contract.litellm.model_dump(mode="json"),
             "deployments": [
-                deployment_generation(row, self.contract).projection.model_dump(mode="json") for row in deployments
+                deployment_generation(row, self.contract).projection.model_dump(mode="json")
+                for row in deployments
             ],
             "catalog": [row.model_dump(mode="json") for row in catalog],
         }

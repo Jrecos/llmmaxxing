@@ -19,9 +19,10 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 from llmmaxxing.adapters.litellm.contract import (
     AdapterContract,
@@ -35,9 +36,7 @@ from llmmaxxing.adapters.litellm.discovery import LiteLLMAdapter
 from llmmaxxing.adapters.litellm.guard import deployment_generation
 from llmmaxxing.core.canonical import canonical_json_bytes
 
-POSTGRES_IMAGE = (
-    "postgres@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777"
-)
+POSTGRES_IMAGE = "postgres@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777"
 ACCOUNT_ID = "acc_99999999-9999-4999-8999-999999999999"
 ACCOUNT_BINDING = "pinned-contract-fixture"
 
@@ -242,13 +241,10 @@ def materialize_stack(root: Path) -> StackMaterial:
     backend_payload = {
         "contract_id": contract.contract_id,
         "deployments": {
-            alias: deployment.model_dump(mode="json")
-            for alias, deployment in expected.items()
+            alias: deployment.model_dump(mode="json") for alias, deployment in expected.items()
         },
     }
-    backend_manifest = "bm1_" + hashlib.sha256(
-        canonical_json_bytes(backend_payload)
-    ).hexdigest()
+    backend_manifest = "bm1_" + hashlib.sha256(canonical_json_bytes(backend_payload)).hexdigest()
     manifest = GuardManifest(
         contract_id=contract.contract_id,
         backend_manifest=backend_manifest,
@@ -433,7 +429,11 @@ class _DiscoveryTransport:
         return TransportResponse(status_code=status, headers={}, body=payload)
 
 
-def _compose(material: StackMaterial, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+def _compose(
+    material: StackMaterial,
+    *args: str,
+    check: bool = True,
+) -> subprocess.CompletedProcess[str]:
     result = subprocess.run(
         ["docker", "compose", "-f", str(material.compose_path), *args],
         text=True,
@@ -476,7 +476,13 @@ def _wait_guard_last(
     raise RuntimeError("certified generation guard did not register once and last")
 
 
-def _provision_key(base_url: str, master: str, user_id: str, role: str, request: dict[str, Any]) -> str:
+def _provision_key(
+    base_url: str,
+    master: str,
+    user_id: str,
+    role: str,
+    request: dict[str, Any],
+) -> str:
     status, _ = _request(
         base_url,
         "POST",
