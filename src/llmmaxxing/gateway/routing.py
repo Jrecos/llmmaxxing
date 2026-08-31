@@ -375,17 +375,16 @@ class RouteEngine:
         ):
             raise ValueError("client key has no current complete authorization")
         policy = self._policies.get(client.policy_id)
-        if policy is None or profile.route_group_id not in policy.route_group_ids:
-            raise ValueError("route group is not authorized by the current policy")
+        if policy is None:
+            raise ValueError("client policy is absent from the current bundle")
         group = self._groups.get(profile.route_group_id)
-        if group is None:
-            raise ValueError("route group is absent from the current bundle")
-        group_leg_ids = frozenset(leg.leg_id for leg in group.legs)
-        authorized_legs = tuple(
-            leg for leg in policy.authorized_legs if leg.leg_id in group_leg_ids
-        )
-        if not authorized_legs:
-            raise ValueError("route group has no current authorized legs")
+        if group is None or profile.route_group_id not in policy.route_group_ids:
+            authorized_legs: tuple[AuthorizedLeg, ...] = ()
+        else:
+            group_leg_ids = frozenset(leg.leg_id for leg in group.legs)
+            authorized_legs = tuple(
+                leg for leg in policy.authorized_legs if leg.leg_id in group_leg_ids
+            )
         return RequestAuthorizationCeiling(
             key_id=client.key_id,
             credential_generation=client.accepted_credential_generation,
@@ -796,6 +795,30 @@ class CircuitController:
             else runtime.compare_and_swap_circuit(probe.generation_id, probe.value, replacement)
         )
         return replacement if swapped else None
+
+    def abandon_candidate(
+        self, candidate: Candidate, *, now_ms: int
+    ) -> tuple[CircuitValue | None, ...]:
+        probes: list[CircuitProbe] = []
+        if candidate.account_circuit.state is CircuitState.HALF_OPEN:
+            probes.append(
+                CircuitProbe(
+                    FailureScope.ACCOUNT,
+                    candidate.account_id,
+                    candidate.generation_id,
+                    candidate.account_circuit,
+                )
+            )
+        if candidate.deployment_circuit.state is CircuitState.HALF_OPEN:
+            probes.append(
+                CircuitProbe(
+                    FailureScope.DEPLOYMENT,
+                    candidate.account_id,
+                    candidate.generation_id,
+                    candidate.deployment_circuit,
+                )
+            )
+        return tuple(self.probe_abandoned(probe, now_ms=now_ms) for probe in probes)
 
     def probe_abandoned(self, probe: CircuitProbe, *, now_ms: int) -> CircuitValue | None:
         return self.probe_failed(

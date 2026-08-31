@@ -26,6 +26,7 @@ from llmmaxxing.gateway.auth import (
 from llmmaxxing.gateway.routing import (
     AttemptBudget,
     Candidate,
+    CircuitController,
     EmergencyActivation,
     RouteEngine,
     RoutingContext,
@@ -473,13 +474,14 @@ class _Waiter:
 
 @dataclass(slots=True)
 class DispatchLease:
-    """Task 6 lease plus an idempotently released per-key active permit."""
+    """Task 6 lease plus idempotent active-permit and probe reconciliation."""
 
     lease: Lease
     candidate: Candidate
     attempt_id: AttemptId
     attempt_budget: AttemptBudget
     _release_active: Callable[[], None]
+    _abandon_probes: Callable[[], None]
     _released: bool = False
     _release_lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -511,6 +513,7 @@ class DispatchLease:
         return result
 
     async def cancel_before_send(self) -> object:
+        self._abandon_probes()
         return await self.finish_async(
             AttemptResolution(
                 outcome=TerminalOutcome.CLIENT_CANCELLED,
@@ -534,6 +537,7 @@ class AdmissionController:
         runtime: RuntimeState,
         activation_gate: ActivationGate,
         auth_view_provider: AuthViewProvider,
+        circuit_controller: CircuitController,
         *,
         clock: AdmissionClock,
         attempt_id_factory: Callable[[], AttemptId] = AttemptId.new,
@@ -545,6 +549,7 @@ class AdmissionController:
         self._runtime = runtime
         self._activation_gate = activation_gate
         self._auth_view_provider = auth_view_provider
+        self._circuit_controller = circuit_controller
         self._clock = clock
         self._attempt_id_factory = attempt_id_factory
         self._max_waiters_global = max_waiters_global
@@ -586,6 +591,12 @@ class AdmissionController:
             emergency=waiter.request.emergency,
         )
 
+    def _abandon_candidate(self, candidate: Candidate) -> None:
+        self._circuit_controller.abandon_candidate(
+            candidate,
+            now_ms=self._clock.now_ms(),
+        )
+
     def _current_authorization(
         self,
         waiter: _Waiter,
@@ -600,7 +611,13 @@ class AdmissionController:
             raise AdmissionUnavailable("queued authorization state unavailable") from error
         if not authorized:
             raise AdmissionUnavailable("queued client authorization is no longer valid")
-        current = self._route_engine.authorize(waiter.request.client, waiter.request.profile)
+        try:
+            current = self._route_engine.authorize(waiter.request.client, waiter.request.profile)
+        except ValueError as error:
+            waiter.effective_ceiling = waiter.effective_ceiling.model_copy(
+                update={"authorized_legs": ()}
+            )
+            raise AdmissionUnavailable("queued route authorization contracted to empty") from error
         contracted = waiter.effective_ceiling.intersection(current)
         waiter.effective_ceiling = contracted
         waiter.effective_deadline_at_ms = min(
@@ -867,6 +884,7 @@ class AdmissionController:
                 try:
                     granted = await self._runtime.try_reserve_async(reservation)
                 except BaseException:
+                    self._abandon_candidate(candidate)
                     self._release_active(key_id, wake=False)
                     raise
                 if isinstance(granted, ReservationDenied):
@@ -894,6 +912,7 @@ class AdmissionController:
                             )
                         )
                     )
+                    self._abandon_candidate(candidate)
                     self._release_active(key_id, wake=False)
                     raise
                 except BaseException:
@@ -906,6 +925,7 @@ class AdmissionController:
                             actual_quota_units=0,
                         )
                     )
+                    self._abandon_candidate(candidate)
                     self._release_active(key_id, wake=False)
                     raise
                 waiter.state = WaiterState.DISPATCHED
@@ -916,6 +936,7 @@ class AdmissionController:
                     attempt_id,
                     waiter.request.attempt_budget,
                     partial(self._release_active, key_id),
+                    partial(self._abandon_candidate, candidate),
                 )
                 if waiter.future.cancelled():
                     await dispatch.cancel_before_send()

@@ -751,6 +751,41 @@ def test_deployment_probe_cannot_mutate_account_scope(tmp_path: Path) -> None:
         journal.close()
 
 
+def test_abandoned_half_open_candidate_reopens_every_probe_scope(tmp_path: Path) -> None:
+    bundle = make_bundle()
+    journal, state = runtime(tmp_path, bundle)
+    circuits = CircuitController(
+        state,
+        probe_factory=lambda: ProbeToken("probe_cccccccc-cccc-4ccc-8ccc-cccccccccccc"),
+    )
+    classification = classifier().classify(
+        FailureObservation(
+            status_code=429,
+            error_code="parallel",
+            message="max_parallel_requests",
+            pre_response_bytes=True,
+        )
+    )
+    try:
+        opened = circuits.open(NAN, NAN_GEN, classification, now_ms=NOW)
+        assert opened is not None
+        probe = circuits.begin_probe(NAN, NAN_GEN, now_ms=opened.retry_at_ms)
+        assert probe is not None
+        candidate = Candidate(
+            authorized(make_bundle().route_groups[0].legs[0]),
+            DispatchCause.CAPACITY,
+            probe.value,
+            CircuitValue.closed(),
+        )
+        reopened = circuits.abandon_candidate(candidate, now_ms=opened.retry_at_ms)
+        assert len(reopened) == 1
+        assert reopened[0] is not None
+        assert reopened[0].state is CircuitState.OPEN
+        assert reopened[0].epoch > probe.value.epoch
+    finally:
+        journal.close()
+
+
 def test_attempt_budget_is_three_sends_distinct_generation_or_named_probe_and_no_post_byte() -> (
     None
 ):
@@ -889,7 +924,7 @@ def test_attempt_budget_restores_terminal_sends_from_the_durable_runtime(
         reopened.close()
 
 
-def test_route_engine_authorize_rejects_unbound_route_and_preserves_bundle_identity() -> None:
+def test_route_engine_returns_empty_current_authority_for_removed_route() -> None:
     bundle = make_bundle()
     engine = RouteEngine(bundle, GenerationGate())
     admitted = client(bundle)
@@ -897,8 +932,8 @@ def test_route_engine_authorize_rejects_unbound_route_and_preserves_bundle_ident
     assert isinstance(ceiling, RequestAuthorizationCeiling)
     assert ceiling.bundle_generation == bundle.generation
     assert ceiling.bundle_hash == admitted.applied_bundle_hash
-    with pytest.raises(ValueError, match="route group"):
-        engine.authorize(admitted, profile(route_group_id=RouteGroupId.new()))
+    contracted = engine.authorize(admitted, profile(route_group_id=RouteGroupId.new()))
+    assert contracted.authorized_legs == ()
 
 
 def test_runtime_identity_is_available_for_emergency_fence_checks() -> None:

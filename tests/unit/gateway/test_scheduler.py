@@ -415,10 +415,20 @@ def test_admission_controller_requires_gate_and_persists_dispatched_inside_it() 
             return view
 
     current_ceiling = ceiling
+    half_open = CircuitValue(
+        state="half_open",
+        cause="capacity",
+        epoch=1,
+        opened_at_ms=1_800_000_000_000,
+        retry_at_ms=0,
+        backoff_step=0,
+        evidence_digest="sha256:" + "a" * 64,
+        probe_id="probe_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    )
     candidate = Candidate(
         authorized_leg=authorized_leg,
         cause=DispatchCause.PRIMARY,
-        account_circuit=CircuitValue.closed(),
+        account_circuit=half_open,
         deployment_circuit=CircuitValue.closed(),
     )
     events: list[str] = []
@@ -480,6 +490,12 @@ def test_admission_controller_requires_gate_and_persists_dispatched_inside_it() 
             events.append("task6-reserve")
             return ReservationGranted(DurableLease())  # type: ignore[arg-type]
 
+    class Circuits:
+        def abandon_candidate(self, _: Candidate, *, now_ms: int) -> tuple[()]:
+            assert now_ms
+            events.append("probe-abandoned")
+            return ()
+
     class Clock:
         def now_ms(self) -> int:
             return 1_800_000_000_000
@@ -503,7 +519,14 @@ def test_admission_controller_requires_gate_and_persists_dispatched_inside_it() 
     auth_provider = AuthProvider()
     with pytest.raises(TypeError):
         AdmissionController(Engine(), Runtime(), clock=Clock())  # type: ignore[call-arg]
-    controller = AdmissionController(Engine(), Runtime(), Gate(), auth_provider, clock=Clock())
+    controller = AdmissionController(
+        Engine(),
+        Runtime(),
+        Gate(),
+        auth_provider,
+        Circuits(),  # type: ignore[arg-type]
+        clock=Clock(),
+    )
 
     async def exercise() -> tuple[object, object]:
         nonlocal current_ceiling
@@ -524,15 +547,9 @@ def test_admission_controller_requires_gate_and_persists_dispatched_inside_it() 
         second_task = asyncio.create_task(controller.acquire(second_request))
         await asyncio.sleep(0)
         assert not second_task.done()
-        await first.finish_async(
-            AttemptResolution(
-                outcome=TerminalOutcome.COMPLETED,
-                release_capacity=True,
-                actual_starts=1,
-                actual_token_units=20,
-                actual_quota_units=1,
-            )
-        )
+        await first.cancel_before_send()
+        assert "finish:client_cancelled" in events
+        assert "probe-abandoned" in events
         second = await asyncio.wait_for(second_task, 1)
 
         third_id = RequestId.new()
