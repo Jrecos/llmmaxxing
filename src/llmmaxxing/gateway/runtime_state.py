@@ -44,6 +44,8 @@ _DEFAULT_RESOLUTION_LEDGER_LIMIT = 100_000
 
 
 _DEFAULT_RESOLUTION_RETENTION_MS = 86_400_000
+
+
 def _require_int(value: object) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or value < 0:
         raise ValueError("recovered runtime integer is invalid")
@@ -388,9 +390,7 @@ class AccountRuntime:
                 return ReservationDenied(ReservationDenialReason.ACCOUNT_NOT_ACTIVE)
             now_ms = self._now_ms()
             self._prune_resolutions(now_ms)
-            unresolved = sum(
-                attempt_id not in self._resolutions for attempt_id in self._attempts
-            )
+            unresolved = sum(attempt_id not in self._resolutions for attempt_id in self._attempts)
             if len(self._resolutions) + unresolved >= self._resolution_ledger_limit:
                 return ReservationDenied(ReservationDenialReason.JOURNAL_CAPACITY_STOP)
             if request.quota_units < self.account.quota_units_per_attempt:
@@ -1550,22 +1550,13 @@ class RuntimeState:
             if payload["scope"] == CircuitScope.ACCOUNT.value:
                 account_previous = runtime._account_circuit
                 if account_previous.probe_id is not None:
-                    runtime._consumed_circuit_probes.pop(
-                        account_previous.probe_id, None
-                    )
+                    runtime._consumed_circuit_probes.pop(account_previous.probe_id, None)
                 runtime._account_circuit = value
             else:
-                generation = DeploymentGenerationId(
-                    cast(str, payload["deployment_generation_id"])
-                )
+                generation = DeploymentGenerationId(cast(str, payload["deployment_generation_id"]))
                 deployment_previous = runtime._circuits.get(generation)
-                if (
-                    deployment_previous is not None
-                    and deployment_previous.probe_id is not None
-                ):
-                    runtime._consumed_circuit_probes.pop(
-                        deployment_previous.probe_id, None
-                    )
+                if deployment_previous is not None and deployment_previous.probe_id is not None:
+                    runtime._consumed_circuit_probes.pop(deployment_previous.probe_id, None)
                 runtime._circuits[generation] = value
         elif record.kind == "authoritative_active_count":
             runtime._apply_authoritative_active_count(cast(int, payload["active_count"]))

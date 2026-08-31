@@ -704,11 +704,10 @@ def test_terminal_ledger_stops_before_snapshot_bound(tmp_path: Path, clock: Fake
             ReservationDenialReason.JOURNAL_CAPACITY_STOP
         )
         clock.advance(11)
-        assert isinstance(
-            state.try_reserve(request(provider_account, clock)), ReservationGranted
-        )
+        assert isinstance(state.try_reserve(request(provider_account, clock)), ReservationGranted)
     finally:
         journal.close()
+
 
 def test_authoritative_count_rejects_while_live_attempt_exists(
     tmp_path: Path, clock: FakeClock
