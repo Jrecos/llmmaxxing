@@ -220,6 +220,7 @@ def test_vertex_project_and_location_are_part_of_the_live_guard_projection() -> 
         asyncio.run(guarded_provider_call(guard, kwargs, calls))
     assert calls == []
 
+
 def test_secret_swap_stops_before_provider_without_exposing_secret() -> None:
     module, guard, manifest, secret = make_guard()
     kwargs = request_kwargs(manifest, secret)

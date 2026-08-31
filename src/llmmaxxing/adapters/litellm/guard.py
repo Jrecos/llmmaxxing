@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Sequence
+
 from llmmaxxing.adapters.litellm.contract import (
     AdapterContract,
     DeploymentGenerationFingerprint,
@@ -40,6 +41,7 @@ def deployment_generation(
         generation_id=DeploymentGenerationId.from_digest(digest),
         projection=projection,
     )
+
 
 def backend_manifest_revision(
     contract: AdapterContract,

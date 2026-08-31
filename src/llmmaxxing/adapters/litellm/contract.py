@@ -9,8 +9,8 @@ from pathlib import Path
 from typing import Any, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
-from llmmaxxing.core.canonical import canonical_json_bytes
 
+from llmmaxxing.core.canonical import canonical_json_bytes
 from llmmaxxing.core.ids import AccountId, DeploymentGenerationId
 
 _HEX64 = r"^[0-9a-f]{64}$"
@@ -34,9 +34,7 @@ class ExactLiteLLMBuild(_Frozen):
         if not self.source_files:
             raise ValueError("certified source-file digests are empty")
         if any(
-            not path.startswith("litellm/")
-            or not digest.startswith("sha256:")
-            or len(digest) != 71
+            not path.startswith("litellm/") or not digest.startswith("sha256:") or len(digest) != 71
             for path, digest in self.source_files.items()
         ):
             raise ValueError("certified source-file attestation is malformed")
@@ -129,6 +127,7 @@ class CertifiedEndpoint(_Frozen):
     receipt_header: Literal["x-litellm-model-id"]
     guard_required: Literal[True]
 
+
 class DenialProbe(_Frozen):
     protocol: Literal["http", "websocket"]
     method: Literal["GET", "POST", "DELETE"]
@@ -182,9 +181,7 @@ class AdapterContract(_Frozen):
         observed_denials = {
             (probe.protocol, probe.method, probe.path) for probe in self.denial_probes
         }
-        if observed_denials != expected_denials or len(self.denial_probes) != len(
-            expected_denials
-        ):
+        if observed_denials != expected_denials or len(self.denial_probes) != len(expected_denials):
             raise ValueError("Responses denial probes do not match pinned routes")
         return self
 

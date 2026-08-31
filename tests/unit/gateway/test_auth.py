@@ -161,7 +161,8 @@ def test_unknown_id_runs_dummy_hmac_and_errors_are_non_enumerating(
     assert compare_calls == 2
     assert preparation_calls == 2
 
-    wrong_secret = value[:-1] + ("A" if value[-1] != "A" else "B")
+    prefix, secret = value.rsplit(".", 1)
+    wrong_secret = prefix + "." + ("A" if secret[0] != "A" else "B") + secret[1:]
     with pytest.raises(ClientAuthenticationError) as known_error:
         verify_client_key(parse_client_key(wrong_secret), runtime)
     assert calls == 4

@@ -6,16 +6,16 @@ import asyncio
 import base64
 import json
 import os
+import secrets
+import socket
+import ssl
 import urllib.error
 import urllib.parse
 import urllib.request
-import socket
-import ssl
-import secrets
 from collections.abc import Mapping
-from typing import Any
 from copy import deepcopy
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -60,6 +60,7 @@ def _http(
             return response.status, dict(response.headers.items()), response.read()
     except urllib.error.HTTPError as exc:
         return exc.code, dict(exc.headers.items()), exc.read()
+
 
 def _provider_count() -> int:
     with urllib.request.urlopen(PROVIDER_URL + "/counter", timeout=10) as response:
@@ -142,6 +143,7 @@ def _multipart(fields: Mapping[str, str], file_fixture: Mapping[str, str]) -> tu
     )
     return f"multipart/form-data; boundary={boundary}", b"".join(chunks)
 
+
 def _endpoint_request(
     prepared: Any,
     selected: dict[str, Any],
@@ -166,7 +168,7 @@ def _endpoint_request(
 def test_pinned_build_complete_discovery_key_isolation_and_native_receipts() -> None:
     contract = load_contract()
     assert os.environ["LLMMAXXING_PINNED_IMAGE"] == contract.litellm.image
-    assert SOURCE_FILES == contract.litellm.source_files
+    assert contract.litellm.source_files == SOURCE_FILES
     assert set(TARGETS) == {endpoint.name for endpoint in contract.endpoints}
 
     adapter = LiteLLMAdapter(contract, PinnedTransport())

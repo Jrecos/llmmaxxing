@@ -281,6 +281,7 @@ def test_malformed_catalog_leaves_last_complete_snapshot_unchanged() -> None:
         asyncio.run(adapter.discover_complete())
     assert adapter.snapshot is previous
 
+
 def test_unmanaged_row_cannot_collide_with_a_certified_alias() -> None:
     transport = FixtureTransport()
     first = deepcopy(fixture("model-info-page-1.json"))

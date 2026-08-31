@@ -463,6 +463,7 @@ def _wait_guard_last(
         time.sleep(0.1)
     raise RuntimeError("certified generation guard did not register once and last")
 
+
 def _inspect_source_files(
     material: StackMaterial,
     contract: AdapterContract,
