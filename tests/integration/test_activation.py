@@ -384,6 +384,40 @@ async def test_command_auth_chain_and_dedupe_fail_before_any_new_durable_write(
 
 
 @async_test
+async def test_command_waiting_on_activation_gate_rechecks_dispatcher_fence(
+    tmp_path: Path,
+) -> None:
+    harness = make_harness(tmp_path)
+    first, _ = make_bundle()
+    second = first.model_copy(update={"generation": 2})
+    await activate(harness, first, None)
+    policy = signed_policy(harness.policy_key, second, first)
+    await harness.execute(
+        harness.command(
+            WireCommandKind.PREPARE,
+            prepare_payload(second, first),
+            policy=policy,
+        )
+    )
+    commit = harness.command(
+        WireCommandKind.COMMIT,
+        BundleReference(
+            generation=2,
+            bundle_hash=bundle_hash(canonical_bundle_bytes(second)),
+        ),
+        policy=policy,
+    )
+    async with harness.service.dispatcher_gate.hold_activation():
+        pending = asyncio.create_task(harness.service.execute(commit))
+        await asyncio.sleep(0)
+        harness.state._fence_epoch = 2
+    with pytest.raises(StaleFenceEpoch):
+        await pending
+    assert harness.state.active_reference is not None
+    assert harness.state.active_reference.generation == 1
+
+
+@async_test
 async def test_prepare_rejects_noncanonical_manifest_gate_and_resource_overflow_without_writes(
     tmp_path: Path,
 ) -> None:

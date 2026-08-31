@@ -50,6 +50,7 @@ from llmmaxxing.core.wire import (
     PrepareCommandPayload,
     ReadinessReason,
     StatusCommandPayload,
+    StaleFenceEpoch,
     TakeoverState,
     VerifiedGatewayCommand,
     WireCommandKind,
@@ -1133,6 +1134,10 @@ class ActivationService:
             expected_boot_id=self.state.boot_id, expected_fence_epoch=self.state.fence_epoch,
         )
 
+    def _assert_current_fence(self, verified: VerifiedGatewayCommand) -> None:
+        if verified.command.dispatcher_fence != self.state.fence_epoch:
+            raise StaleFenceEpoch("command dispatcher fence changed while waiting")
+
     @staticmethod
     def _policy_matches(policy: ActivationEnvelope | None, base: BaseReference | None, target: BundleReference) -> None:
         if policy is None or policy.base != base or policy.target != target:
@@ -1220,6 +1225,7 @@ class ActivationService:
         target = BundleReference.model_validate(verified.command.payload)
         self._policy_matches(verified.policy, self.state._base, target)
         async with self.dispatcher_gate.hold_activation():
+            self._assert_current_fence(verified)
             bundle = await asyncio.to_thread(
                 self.state.commit_staged,
                 verified,
