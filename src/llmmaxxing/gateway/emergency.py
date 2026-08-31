@@ -150,8 +150,9 @@ class EmergencyServer:
         except BaseException:
             server.close()
             await server.wait_closed()
-            with contextlib.suppress(OSError):
-                self.path.unlink()
+            if self.listen_socket is None:
+                with contextlib.suppress(OSError):
+                    self.path.unlink()
             raise
         self._server = server
         self._inode = (metadata.st_dev, metadata.st_ino)
