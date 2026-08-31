@@ -307,10 +307,10 @@ class GatewayLocalState:
     def enter_recovery_required(self, reason: str) -> None:
         if not reason:
             raise ValueError("recovery reason is required")
-        with self.transaction():
-            self._set_meta("recovery_reason", reason)
         self._recovery_reason = reason
         self._recovery_required = True
+        with self.transaction():
+            self._set_meta("recovery_reason", reason)
 
     def confirm_live_bundle(self, reference: BundleReference) -> None:
         if (
