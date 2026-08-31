@@ -64,9 +64,11 @@ from llmmaxxing.gateway.scheduler import (
 from llmmaxxing.gateway.streaming import (
     ASGISend,
     AttemptPermitPool,
+    DownstreamDisconnected,
     DownstreamStreamError,
     PermitClass,
     ProcessHTTPClient,
+    drain_raw_response,
     UpstreamStreamError,
     read_prestart_error,
     relay_buffered_response,
@@ -145,6 +147,20 @@ class _AttemptResult:
     alternate: DispatchCause | None = None
 
 
+@dataclass(slots=True)
+class _DeadlineState:
+    monotonic_at: float
+    wall_at_ms: int
+    expired: bool = False
+    response_started: bool = False
+
+
+@dataclass(slots=True)
+class _ShadowState:
+    decided: bool = False
+    task: asyncio.Task[None] | None = None
+
+
 _TRIGGER_FOR_CAUSE = {
     DispatchCause.CAPACITY: RouteTrigger.CAPACITY_SPILL,
     DispatchCause.FAILURE: RouteTrigger.FAILURE_FALLBACK,
@@ -196,7 +212,9 @@ async def _send_error(send: ASGISend, status: int, code: str) -> None:
             }
         )
         await send({"type": "http.response.body", "body": body, "more_body": False})
-    except BaseException:
+    except asyncio.CancelledError:
+        raise
+    except Exception:
         return
 
 
@@ -380,16 +398,34 @@ class GatewayApp:
         lifecycle: RequestLifecycle | None = None
         body: RetainedBody | None = None
         final_recorded = False
+        deadline: _DeadlineState | None = None
+        deadline_handle: asyncio.TimerHandle | None = None
+        shadow = _ShadowState()
         try:
             try:
                 parsed = parse_client_key(_bearer(ingress_request))
                 client = verify_client_key(parsed, self.auth_view_provider.current_auth_view())
-            except (ClientAuthenticationError, Exception) as error:
+            except Exception as error:
                 if not isinstance(error, ClientAuthenticationError):
                     await _send_error(send, 503, "auth_state_unavailable")
                 else:
                     await _send_error(send, 401, "invalid_client_key")
                 return
+            deadline_ms = self.route_engine.policy_deadline_ms(client)
+            loop = asyncio.get_running_loop()
+            deadline = _DeadlineState(
+                monotonic_at=loop.time() + deadline_ms / 1000,
+                wall_at_ms=self.clock.now_ms() + deadline_ms,
+            )
+            request_task = asyncio.current_task()
+            assert request_task is not None
+
+            def expire_request() -> None:
+                assert deadline is not None
+                deadline.expired = True
+                request_task.cancel()
+
+            deadline_handle = loop.call_at(deadline.monotonic_at, expire_request)
             request_id = RequestId.new()
             lifecycle_events = 12 if self.route_engine.client_authorizes_shadow(client) else 10
             lifecycle = await self.lifecycle_capacity.reserve(
@@ -403,8 +439,6 @@ class GatewayApp:
             await preauth.release()
             preauth = None
 
-            deadline_ms = self.route_engine.policy_deadline_ms(client)
-            absolute_deadline_ms = self.clock.now_ms() + deadline_ms
             try:
                 body = await read_retained_body(
                     receive,
@@ -454,30 +488,18 @@ class GatewayApp:
             cause = DispatchCause.PRIMARY
             await lifecycle.queued()
             while True:
-                remaining_s = (absolute_deadline_ms - self.clock.now_ms()) / 1000
-                if remaining_s <= 0:
-                    await lifecycle.finished(TerminalOutcome.DEADLINE_EXCEEDED)
-                    final_recorded = True
-                    await _send_error(send, 504, "deadline_exceeded")
-                    return
                 admission_request = AdmissionRequest(
                     request_id=request_id,
                     client=client,
                     profile=profile,
                     authorization_ceiling=authorization,
                     runtime_identity=identity,
-                    deadline_at_ms=absolute_deadline_ms,
+                    deadline_at_ms=deadline.wall_at_ms,
                     cause=cause,
                     attempt_budget=attempt_budget,
                 )
                 try:
-                    async with asyncio.timeout(remaining_s):
-                        dispatch = await self.admission.acquire(admission_request)
-                except TimeoutError:
-                    await lifecycle.finished(TerminalOutcome.DEADLINE_EXCEEDED)
-                    final_recorded = True
-                    await _send_error(send, 504, "deadline_exceeded")
-                    return
+                    dispatch = await self.admission.acquire(admission_request)
                 except AdmissionUnavailable:
                     await lifecycle.finished(TerminalOutcome.ROUTE_UNAVAILABLE)
                     final_recorded = True
@@ -491,33 +513,75 @@ class GatewayApp:
                     dispatch,
                     authorization,
                     lifecycle,
+                    receive,
                     send,
+                    deadline,
+                    admission_request,
+                    shadow,
                 )
                 if result.terminal:
+                    if shadow.task is not None:
+                        if result.outcome is TerminalOutcome.CLIENT_CANCELLED:
+                            shadow.task.cancel()
+                        await asyncio.gather(shadow.task, return_exceptions=True)
                     await lifecycle.finished(result.outcome)
                     final_recorded = True
                     return
                 assert result.alternate is not None
                 cause = result.alternate
         except asyncio.CancelledError:
+            if shadow.task is not None and not shadow.task.done():
+                shadow.task.cancel()
+                await asyncio.gather(shadow.task, return_exceptions=True)
+            outcome = (
+                TerminalOutcome.DEADLINE_EXCEEDED
+                if deadline is not None and deadline.expired
+                else TerminalOutcome.CLIENT_CANCELLED
+            )
             if lifecycle is not None and not final_recorded:
-                await _shielded(lifecycle.finished(TerminalOutcome.CLIENT_CANCELLED))
+                try:
+                    await _shielded(lifecycle.finished(outcome))
+                except Exception:
+                    pass
                 final_recorded = True
+            if deadline is not None and deadline.expired:
+                if not deadline.response_started:
+                    await _send_error(send, 504, "deadline_exceeded")
+                return
             raise
         except Exception:
             if lifecycle is not None and not final_recorded:
-                await lifecycle.finished(TerminalOutcome.UPSTREAM_FAILED)
+                try:
+                    await lifecycle.finished(TerminalOutcome.UPSTREAM_FAILED)
+                except Exception:
+                    pass
                 final_recorded = True
-            await _send_error(send, 500, "gateway_failure")
+            if deadline is None or not deadline.response_started:
+                await _send_error(send, 500, "gateway_failure")
         finally:
+            if deadline_handle is not None:
+                deadline_handle.cancel()
+            if shadow.task is not None and not shadow.task.done():
+                shadow.task.cancel()
+                await asyncio.gather(shadow.task, return_exceptions=True)
             if preauth is not None:
                 await _shielded(preauth.release())
             if body is not None:
                 await _shielded(body.release())
             if lifecycle is not None:
-                if not final_recorded:
-                    await _shielded(lifecycle.finished(TerminalOutcome.UPSTREAM_FAILED))
-                await _shielded(lifecycle.release())
+                try:
+                    if not final_recorded:
+                        try:
+                            await _shielded(
+                                lifecycle.finished(TerminalOutcome.UPSTREAM_FAILED)
+                            )
+                        except Exception:
+                            pass
+                finally:
+                    try:
+                        await _shielded(lifecycle.release())
+                    except Exception:
+                        pass
 
     @staticmethod
     def _authorization_has_alternate(
@@ -540,7 +604,11 @@ class GatewayApp:
         dispatch: DispatchLease,
         authorization: RequestAuthorizationCeiling,
         lifecycle: RequestLifecycle,
+        receive: ASGIReceive,
         send: ASGISend,
+        deadline: _DeadlineState,
+        admission_request: AdmissionRequest,
+        shadow: _ShadowState,
     ) -> _AttemptResult:
         permit = None
         response: httpx.Response | None = None
@@ -557,15 +625,9 @@ class GatewayApp:
             nonlocal attempt_event_recorded
             if attempt_event_recorded:
                 return
-            task = asyncio.create_task(
+            await _shielded(
                 lifecycle.attempt_finished(dispatch, outcome, uncertain=uncertain)
             )
-            try:
-                await asyncio.shield(task)
-            except asyncio.CancelledError:
-                await asyncio.shield(task)
-                attempt_event_recorded = True
-                raise
             attempt_event_recorded = True
 
         try:
@@ -597,6 +659,22 @@ class GatewayApp:
                     headers=headers,
                     content=rewritten,
                 )
+            except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout):
+                pending_outcome = TerminalOutcome.UPSTREAM_FAILED
+                await dispatch.fail_before_send()
+                await record_attempt(
+                    TerminalOutcome.UPSTREAM_FAILED,
+                    uncertain=False,
+                )
+                fallback_cause = DispatchCause.FAILURE
+                if self._authorization_has_alternate(
+                    dispatch, fallback_cause, authorization
+                ):
+                    return _AttemptResult(
+                        False, TerminalOutcome.UPSTREAM_FAILED, fallback_cause
+                    )
+                await _send_error(send, 502, "upstream_connect_failure")
+                return _AttemptResult(True, TerminalOutcome.UPSTREAM_FAILED)
             except (httpx.HTTPError, OSError):
                 pending_outcome = TerminalOutcome.UPSTREAM_FAILED
                 pending_uncertain = True
@@ -613,7 +691,8 @@ class GatewayApp:
                 await _send_error(send, 502, "upstream_transport_failure")
                 return _AttemptResult(True, TerminalOutcome.UPSTREAM_FAILED)
             except (DispatchError, ProfileError, ValueError, RuntimeError):
-                await dispatch.cancel_before_send()
+                pending_outcome = TerminalOutcome.UPSTREAM_FAILED
+                await dispatch.fail_before_send()
                 await record_attempt(
                     TerminalOutcome.UPSTREAM_FAILED,
                     uncertain=False,
@@ -628,7 +707,7 @@ class GatewayApp:
                         read_inactivity_timeout_s=self.http.config.read_inactivity_timeout_s,
                     )
                     dispatch.lease.provider_send_completed()
-                except (UpstreamStreamError, Exception):
+                except UpstreamStreamError:
                     pending_outcome = TerminalOutcome.UPSTREAM_FAILED
                     pending_uncertain = True
                     await dispatch.finish_async(
@@ -652,7 +731,6 @@ class GatewayApp:
                     now_ms=self.clock.now_ms(),
                 )
                 pending_outcome = TerminalOutcome.UPSTREAM_FAILED
-                pending_uncertain = False
                 await dispatch.finish_async(
                     AttemptResolution(
                         outcome=TerminalOutcome.UPSTREAM_FAILED,
@@ -673,6 +751,7 @@ class GatewayApp:
                 alternate = classification.dispatch_cause
                 if self._authorization_has_alternate(dispatch, alternate, authorization):
                     return _AttemptResult(False, TerminalOutcome.UPSTREAM_FAILED, alternate)
+                deadline.response_started = True
                 try:
                     await relay_buffered_response(response, error_body, send)
                 except DownstreamStreamError:
@@ -690,7 +769,6 @@ class GatewayApp:
             except DispatchError:
                 dispatch.lease.provider_send_completed()
                 pending_outcome = TerminalOutcome.UPSTREAM_FAILED
-                pending_uncertain = False
                 await dispatch.finish_async(
                     AttemptResolution(
                         outcome=TerminalOutcome.UPSTREAM_FAILED,
@@ -705,13 +783,46 @@ class GatewayApp:
                 await _send_error(send, 502, "deployment_receipt_mismatch")
                 return _AttemptResult(True, TerminalOutcome.UPSTREAM_FAILED)
 
+            if not shadow.decided:
+                shadow.decided = True
+                shadow_permit = await self.permits.try_shadow()
+                if shadow_permit is not None:
+                    shadow.task = asyncio.create_task(
+                        self._shadow_attempt(
+                            admission_request,
+                            ingress_request,
+                            body,
+                            profile,
+                            client,
+                            lifecycle,
+                            shadow_permit,
+                            deadline,
+                        )
+                    )
+
             dispatch.mark_response_started()
+            deadline.response_started = True
             try:
                 await relay_raw_response(
                     response,
+                    receive,
                     send,
                     read_inactivity_timeout_s=self.http.config.read_inactivity_timeout_s,
                 )
+            except DownstreamDisconnected:
+                pending_outcome = TerminalOutcome.CLIENT_CANCELLED
+                pending_uncertain = True
+                await dispatch.finish_async(
+                    AttemptResolution(
+                        outcome=TerminalOutcome.CLIENT_CANCELLED,
+                        release_capacity=False,
+                    )
+                )
+                await record_attempt(
+                    TerminalOutcome.CLIENT_CANCELLED,
+                    uncertain=True,
+                )
+                return _AttemptResult(True, TerminalOutcome.CLIENT_CANCELLED)
             except (UpstreamStreamError, DownstreamStreamError):
                 pending_outcome = TerminalOutcome.RESPONSE_STREAM_FAILED
                 pending_uncertain = True
@@ -728,7 +839,6 @@ class GatewayApp:
                 return _AttemptResult(True, TerminalOutcome.RESPONSE_STREAM_FAILED)
             dispatch.lease.provider_send_completed()
             pending_outcome = TerminalOutcome.COMPLETED
-            pending_uncertain = False
             await dispatch.finish_async(
                 AttemptResolution(
                     outcome=TerminalOutcome.COMPLETED,
@@ -744,31 +854,222 @@ class GatewayApp:
             )
             return _AttemptResult(True, TerminalOutcome.COMPLETED)
         except asyncio.CancelledError:
+            outcome = (
+                TerminalOutcome.DEADLINE_EXCEEDED
+                if deadline.expired
+                else TerminalOutcome.CLIENT_CANCELLED
+            )
             if dispatch.terminal:
                 uncertain = pending_uncertain
-                outcome = pending_outcome or TerminalOutcome.CLIENT_CANCELLED
+                event_outcome = pending_outcome or outcome
             else:
                 uncertain = provider_send_started
-                outcome = TerminalOutcome.CLIENT_CANCELLED
+                event_outcome = outcome
                 if uncertain:
                     await _shielded(
                         dispatch.finish_async(
                             AttemptResolution(
-                                outcome=TerminalOutcome.CLIENT_CANCELLED,
+                                outcome=outcome,
                                 release_capacity=False,
                             )
                         )
                     )
                 else:
-                    await _shielded(dispatch.cancel_before_send())
+                    await _shielded(dispatch.fail_before_send())
             if not attempt_event_recorded:
-                await _shielded(record_attempt(outcome, uncertain=uncertain))
+                await _shielded(record_attempt(event_outcome, uncertain=uncertain))
+            raise
+        except BaseException:
+            if not dispatch.terminal:
+                if provider_send_started:
+                    await _shielded(
+                        dispatch.finish_async(
+                            AttemptResolution(
+                                outcome=TerminalOutcome.UPSTREAM_FAILED,
+                                release_capacity=False,
+                            )
+                        )
+                    )
+                else:
+                    await _shielded(dispatch.fail_before_send())
+            if not attempt_event_recorded:
+                try:
+                    await _shielded(
+                        record_attempt(
+                            TerminalOutcome.UPSTREAM_FAILED,
+                            uncertain=provider_send_started,
+                        )
+                    )
+                except Exception:
+                    pass
             raise
         finally:
             if response is not None:
                 await _shielded(response.aclose())
             if permit is not None:
                 await _shielded(permit.release())
+
+    async def _shadow_attempt(
+        self,
+        admission_request: AdmissionRequest,
+        ingress_request: IngressRequest,
+        body: RetainedBody,
+        profile: RequestProfile,
+        client: AuthenticatedClient,
+        lifecycle: RequestLifecycle,
+        permit: Any,
+        deadline: _DeadlineState,
+    ) -> None:
+        dispatch: DispatchLease | None = None
+        response: httpx.Response | None = None
+        provider_send_started = False
+        event_recorded = False
+
+        async def record(
+            outcome: TerminalOutcome,
+            *,
+            uncertain: bool,
+        ) -> None:
+            nonlocal event_recorded
+            if dispatch is None or event_recorded:
+                return
+            await _shielded(
+                lifecycle.attempt_finished(dispatch, outcome, uncertain=uncertain)
+            )
+            event_recorded = True
+
+        try:
+            dispatch = await self.admission.try_acquire_shadow(admission_request)
+            if dispatch is None:
+                return
+            await _shielded(lifecycle.attempt_started(dispatch, shadow=True))
+            target = self.deployment_resolver.resolve(dispatch.candidate.generation_id)
+            prepared = prepare_dispatch(
+                self.contract,
+                endpoint=profile.endpoint.value,
+                deployment=target.deployment,
+                generation=target.generation,
+                backend_manifest=target.backend_manifest,
+            )
+            rewritten = await self.profiler.rewrite(
+                body,
+                ingress_request.content_type,
+                prepared,
+                self.contract.known_litellm_params,
+                client.key_id,
+            )
+            headers = _upstream_headers(ingress_request, self.backend_authorization)
+            provider_send_started = True
+            try:
+                response = await self.http.send(
+                    prepared.method,
+                    prepared.path,
+                    headers=headers,
+                    content=rewritten,
+                )
+            except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout):
+                await dispatch.fail_before_send()
+                await record(TerminalOutcome.UPSTREAM_FAILED, uncertain=False)
+                return
+            if not 200 <= response.status_code < 300:
+                await read_prestart_error(
+                    response,
+                    read_inactivity_timeout_s=self.http.config.read_inactivity_timeout_s,
+                )
+                dispatch.lease.provider_send_completed()
+                await dispatch.finish_async(
+                    AttemptResolution(
+                        outcome=TerminalOutcome.UPSTREAM_FAILED,
+                        release_capacity=True,
+                        actual_starts=1,
+                    )
+                )
+                await record(TerminalOutcome.UPSTREAM_FAILED, uncertain=False)
+                return
+            try:
+                reconcile_dispatch(
+                    self.contract,
+                    prepared,
+                    status_code=response.status_code,
+                    headers=response.headers,
+                    response_started=False,
+                )
+            except DispatchError:
+                dispatch.lease.provider_send_completed()
+                await dispatch.finish_async(
+                    AttemptResolution(
+                        outcome=TerminalOutcome.UPSTREAM_FAILED,
+                        release_capacity=True,
+                        actual_starts=1,
+                    )
+                )
+                await record(TerminalOutcome.UPSTREAM_FAILED, uncertain=False)
+                return
+            await drain_raw_response(
+                response,
+                read_inactivity_timeout_s=self.http.config.read_inactivity_timeout_s,
+            )
+            dispatch.lease.provider_send_completed()
+            await dispatch.finish_async(
+                AttemptResolution(
+                    outcome=TerminalOutcome.COMPLETED,
+                    release_capacity=True,
+                    actual_starts=1,
+                    actual_token_units=dispatch.lease.request.total_token_upper_bound,
+                    actual_quota_units=dispatch.lease.request.quota_units,
+                )
+            )
+            await record(TerminalOutcome.COMPLETED, uncertain=False)
+        except asyncio.CancelledError:
+            outcome = (
+                TerminalOutcome.DEADLINE_EXCEEDED
+                if deadline.expired
+                else TerminalOutcome.CLIENT_CANCELLED
+            )
+            if dispatch is not None and not dispatch.terminal:
+                if provider_send_started:
+                    await _shielded(
+                        dispatch.finish_async(
+                            AttemptResolution(
+                                outcome=outcome,
+                                release_capacity=False,
+                            )
+                        )
+                    )
+                else:
+                    await _shielded(dispatch.fail_before_send())
+                if not event_recorded:
+                    await _shielded(
+                        record(outcome, uncertain=provider_send_started)
+                    )
+            raise
+        except BaseException:
+            if dispatch is not None and not dispatch.terminal:
+                if provider_send_started:
+                    await _shielded(
+                        dispatch.finish_async(
+                            AttemptResolution(
+                                outcome=TerminalOutcome.UPSTREAM_FAILED,
+                                release_capacity=False,
+                            )
+                        )
+                    )
+                else:
+                    await _shielded(dispatch.fail_before_send())
+            if dispatch is not None and not event_recorded:
+                try:
+                    await _shielded(
+                        record(
+                            TerminalOutcome.UPSTREAM_FAILED,
+                            uncertain=provider_send_started,
+                        )
+                    )
+                except Exception:
+                    pass
+        finally:
+            if response is not None:
+                await _shielded(response.aclose())
+            await _shielded(permit.release())
 
     async def aclose(self) -> None:
         if self._closed:

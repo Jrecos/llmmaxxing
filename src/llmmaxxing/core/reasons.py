@@ -69,13 +69,14 @@ class EndpointKind(_Closed):
 
 @final
 class DispatchCause(_Closed):
-    """One serving cause selected before a provider attempt."""
+    """Closed serving causes plus the one explicitly non-serving shadow cause."""
 
     PRIMARY = "primary"
     CAPACITY = "capacity"
     FAILURE = "failure"
     QUOTA = "quota"
     MANUAL_EMERGENCY = "manual_emergency"
+    SHADOW = "shadow"
 
 
 @final

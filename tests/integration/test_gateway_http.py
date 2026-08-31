@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
+import time
 
 import pytest
 from pydantic import ValidationError
@@ -15,6 +17,7 @@ from llmmaxxing.core.models import (
     LegacyClientCredentialVerifier,
     PolicyBundleV1,
 )
+from llmmaxxing.core.reasons import Modality
 from llmmaxxing.core.state_machines import CredentialVerifierStatus
 from llmmaxxing.gateway.auth import (
     build_legacy_key_index,
@@ -33,6 +36,7 @@ from llmmaxxing.gateway.ingress import (
     IngressResources,
     read_retained_body,
     validate_http_request,
+    RetainedBody,
 )
 from support.fake_litellm import FaultMode, FaultPlan
 from support.gateway_stack import (
@@ -186,6 +190,7 @@ def test_lifecycle_capacity_is_reserved_before_body_and_body_is_released_once(tm
 
         shadow = await make_stack(
             tmp_path / "shadow",
+            FaultPlan(FaultMode.JSON),
             FaultPlan(FaultMode.JSON),
             shadow=True,
         )
@@ -523,3 +528,220 @@ def test_route_group_names_are_globally_unique_but_case_sensitive() -> None:
         "deepseek-v4-flash",
         "DEEPSEEK-V4-FLASH",
     ]
+
+
+def test_multipart_rewrite_strips_all_reserved_litellm_controls(tmp_path) -> None:
+    async def scenario() -> None:
+        boundary = "task8-controls"
+        fields = (
+            ("model", "deepseek-v4-flash"),
+            ("language", "en"),
+            ("num_retries", "99"),
+            ("timeout", "9999"),
+            ("api_base", "https://attacker.invalid"),
+            ("custom_llm_provider", "attacker"),
+        )
+        chunks = [
+            (
+                f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
+                f"{value}\r\n"
+            ).encode()
+            for name, value in fields
+        ]
+        chunks.append(
+            (
+                f"--{boundary}\r\n"
+                'Content-Disposition: form-data; name="file"; filename="a.wav"\r\n'
+                "Content-Type: audio/wav\r\n\r\n"
+            ).encode()
+            + b"RIFF-fixture\r\n"
+        )
+        chunks.append(f"--{boundary}--\r\n".encode())
+        body = b"".join(chunks)
+        stack = await make_stack(tmp_path, FaultPlan(FaultMode.JSON))
+        try:
+            response = await call_app(
+                stack.app,
+                stack.token,
+                path="/v1/audio/transcriptions",
+                body=body,
+                content_type=f"multipart/form-data; boundary={boundary}".encode(),
+            )
+            assert response.status == 200
+            forwarded = stack.fake.request_bodies[0]
+            assert b'name="language"' in forwarded
+            for forbidden in (
+                b'name="num_retries"',
+                b'name="timeout"',
+                b'name="api_base"',
+                b'name="custom_llm_provider"',
+            ):
+                assert forbidden not in forwarded
+            assert b"fixture/chat" in forwarded
+            assert b"llmmaxxing_guard" in forwarded
+        finally:
+            await stack.close()
+
+    run(scenario())
+
+
+def test_attempt_event_failure_releases_dispatch_before_any_provider_send(tmp_path) -> None:
+    async def scenario() -> None:
+        stack = await make_stack(
+            tmp_path,
+            FaultPlan(FaultMode.JSON),
+            fail_attempt_started=True,
+        )
+        try:
+            response = await call_app(stack.app, stack.token)
+            assert response.status == 500
+            assert not stack.fake.calls
+            account = stack.runtime.operational_view().accounts[0]
+            assert account.active_attempts == 0
+            assert account.uncertain_attempts == 0
+            assert stack.permits.snapshot().total_active == 0
+            assert stack.lifecycle_capacity.lifecycles[0].released
+        finally:
+            await stack.close()
+
+    run(scenario())
+
+
+def test_lifecycle_capacity_releases_even_when_terminal_event_write_fails(tmp_path) -> None:
+    async def scenario() -> None:
+        stack = await make_stack(tmp_path, fail_finished=True)
+        try:
+            response = await call_app(stack.app, stack.token, body=b"{")
+            assert response.status == 500
+            assert stack.lifecycle_capacity.lifecycles[0].released
+            assert stack.ingress.retained_bytes == 0
+        finally:
+            await stack.close()
+
+    run(scenario())
+
+
+def test_post_auth_deadline_covers_slow_body_and_releases_every_resource(tmp_path) -> None:
+    async def scenario() -> None:
+        limits = IngressLimits(
+            body_chunk_timeout_s=1,
+            body_total_timeout_s=10,
+        )
+        stack = await make_stack(tmp_path, limits=limits, deadline_ms=30)
+        started = time.monotonic()
+        try:
+            response = await call_app(
+                stack.app,
+                stack.token,
+                receive_messages=[
+                    {"type": "http.request", "body": b"{", "more_body": True}
+                ],
+            )
+            assert response.status == 504
+            assert time.monotonic() - started < 0.5
+            assert stack.ingress.retained_bytes == 0
+            assert stack.ingress.body_readers == 0
+            assert stack.lifecycle_capacity.lifecycles[0].released
+        finally:
+            await stack.close()
+
+    run(scenario())
+
+
+def test_retained_body_copy_and_prescan_do_not_block_the_event_loop(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        original = RetainedBody._read_sync
+        entered = threading.Event()
+
+        def delayed_read(body: RetainedBody) -> bytes:
+            entered.set()
+            time.sleep(0.08)
+            return original(body)
+
+        monkeypatch.setattr(RetainedBody, "_read_sync", delayed_read)
+        stack = await make_stack(tmp_path, FaultPlan(FaultMode.JSON))
+        task = asyncio.create_task(call_app(stack.app, stack.token))
+        try:
+            while not entered.is_set():
+                await asyncio.sleep(0)
+            before = asyncio.get_running_loop().time()
+            await asyncio.sleep(0.01)
+            assert asyncio.get_running_loop().time() - before < 0.04
+            assert (await task).status == 200
+        finally:
+            if not task.done():
+                task.cancel()
+            await stack.close()
+
+    run(scenario())
+
+
+def test_chat_profiler_derives_image_and_audio_and_rejects_mixed_nontext(tmp_path) -> None:
+    def body(content: list[dict[str, object]]) -> bytes:
+        return json.dumps(
+            {
+                "model": "deepseek-v4-flash",
+                "messages": [{"role": "user", "content": content}],
+                "max_tokens": 8,
+            },
+            separators=(",", ":"),
+        ).encode()
+
+    async def scenario() -> None:
+        stack = await make_stack(
+            tmp_path,
+            FaultPlan(FaultMode.JSON),
+            FaultPlan(FaultMode.JSON),
+        )
+        try:
+            image = await call_app(
+                stack.app,
+                stack.token,
+                body=body(
+                    [
+                        {"type": "text", "text": "describe"},
+                        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+                    ]
+                ),
+            )
+            audio = await call_app(
+                stack.app,
+                stack.token,
+                body=body(
+                    [
+                        {"type": "text", "text": "transcribe"},
+                        {"type": "input_audio", "input_audio": {"data": "AA==", "format": "wav"}},
+                    ]
+                ),
+            )
+            assert image.status == audio.status == 200
+            profiles = [
+                value
+                for lifecycle in stack.lifecycle_capacity.lifecycles
+                for name, value in lifecycle.events
+                if name == "profile"
+            ]
+            assert [profile.modality for profile in profiles] == [
+                Modality.IMAGE,
+                Modality.AUDIO_TRANSCRIPTION,
+            ]
+            mixed = await call_app(
+                stack.app,
+                stack.token,
+                body=body(
+                    [
+                        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+                        {"type": "input_audio", "input_audio": {"data": "AA==", "format": "wav"}},
+                    ]
+                ),
+            )
+            assert mixed.status == 422
+            assert len(stack.fake.calls) == 2
+        finally:
+            await stack.close()
+
+    run(scenario())

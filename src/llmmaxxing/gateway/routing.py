@@ -48,6 +48,7 @@ _CAUSE_TRIGGER = {
     DispatchCause.FAILURE: RouteTrigger.FAILURE_FALLBACK,
     DispatchCause.QUOTA: RouteTrigger.QUOTA_FALLBACK,
     DispatchCause.MANUAL_EMERGENCY: RouteTrigger.MANUAL_EMERGENCY,
+    DispatchCause.SHADOW: RouteTrigger.SHADOW,
 }
 _FAILURE_DISPATCH = {
     FailureCause.CAPACITY: DispatchCause.CAPACITY,
@@ -650,6 +651,35 @@ class RouteEngine:
             ),
             None,
         )
+
+    def shadow_candidate(
+        self,
+        authorization: RequestAuthorizationCeiling,
+        profile: RequestProfile,
+        view: OperationalRuntimeView,
+        context: RoutingContext,
+    ) -> Candidate | None:
+        """Return at most one currently closed-circuit non-serving shadow leg."""
+        if (
+            profile.route_group_id != authorization.route_group_id
+            or context.now_ms >= context.deadline_at_ms
+        ):
+            return None
+        for leg in authorization.authorized_legs:
+            if (
+                RouteTrigger.SHADOW not in leg.allowed_triggers
+                or not leg.capabilities.shadow
+                or not self._capabilities_allow(leg, profile)
+                or not self._operationally_available(leg, view)
+            ):
+                continue
+            candidate = self.candidate(leg, DispatchCause.SHADOW, view)
+            if (
+                candidate.account_circuit.state is CircuitState.CLOSED
+                and candidate.deployment_circuit.state is CircuitState.CLOSED
+            ):
+                return candidate
+        return None
 
 
 @dataclass(frozen=True, slots=True)

@@ -6,6 +6,7 @@ import asyncio
 import os
 import re
 import tempfile
+import threading
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -295,7 +296,14 @@ class IngressResources:
 class RetainedBody:
     """One quota-counted body retained through queueing and every attempt."""
 
-    __slots__ = ("_file", "_reservation", "size", "spooled_to_disk", "_released")
+    __slots__ = (
+        "_file",
+        "_reservation",
+        "_io_lock",
+        "size",
+        "spooled_to_disk",
+        "_released",
+    )
 
     def __init__(
         self,
@@ -306,6 +314,7 @@ class RetainedBody:
     ) -> None:
         self._file = file
         self._reservation = reservation
+        self._io_lock = threading.Lock()
         self.size = size
         self.spooled_to_disk = spooled_to_disk
         self._released = False
@@ -316,18 +325,27 @@ class RetainedBody:
             return None
         return os.fstat(self._file.fileno()).st_mode & 0o777
 
+    def _read_sync(self) -> bytes:
+        with self._io_lock:
+            if self._released:
+                raise RuntimeError("retained body is released")
+            self._file.seek(0)
+            return self._file.read()
+
     async def read(self) -> bytes:
-        if self._released:
-            raise RuntimeError("retained body is released")
-        self._file.seek(0)
-        return self._file.read()
+        return await asyncio.to_thread(self._read_sync)
+
+    def _close_sync(self) -> bool:
+        with self._io_lock:
+            if self._released:
+                return False
+            self._released = True
+            self._file.close()
+            return True
 
     async def release(self) -> None:
-        if self._released:
-            return
-        self._released = True
-        self._file.close()
-        await self._reservation.release()
+        if await asyncio.to_thread(self._close_sync):
+            await self._reservation.release()
 
 
 def _headers(scope: Mapping[str, Any], limits: IngressLimits) -> tuple[tuple[bytes, bytes], ...]:

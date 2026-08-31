@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -78,10 +79,7 @@ class Clock:
 
 class GenerationGate:
     def permits(self, leg: AuthorizedLeg, backend_manifest_hash: str) -> bool:
-        return (
-            leg.generation_id == TARGET.generation.generation_id
-            and len(backend_manifest_hash) == 64
-        )
+        return str(leg.generation_id).startswith("dg1_") and len(backend_manifest_hash) == 64
 
 
 class ActivationGate:
@@ -101,12 +99,13 @@ class RuntimeIdentityProvider:
 
 @dataclass(frozen=True, slots=True)
 class DeploymentResolver:
-    target: DispatchTarget
+    targets: dict[object, DispatchTarget]
 
     def resolve(self, generation_id):  # type: ignore[no-untyped-def]
-        if generation_id != self.target.generation.generation_id:
-            raise LookupError("unknown deployment generation")
-        return self.target
+        try:
+            return self.targets[generation_id]
+        except KeyError:
+            raise LookupError("unknown deployment generation") from None
 
 
 class BackendAuthorization:
@@ -117,6 +116,8 @@ class BackendAuthorization:
 @dataclass(slots=True)
 class Lifecycle(RequestLifecycle):
     capacity: int
+    fail_attempt_started: bool = False
+    fail_finished: bool = False
     events: list[tuple[str, object]] = field(default_factory=list)
     released: bool = False
 
@@ -126,7 +127,11 @@ class Lifecycle(RequestLifecycle):
     async def queued(self) -> None:
         self.events.append(("queued", None))
 
-    async def attempt_started(self, lease, *, shadow: bool) -> None:  # type: ignore[no-untyped-def]
+    async def attempt_started(
+        self, lease, *, shadow: bool  # type: ignore[no-untyped-def]
+    ) -> None:
+        if self.fail_attempt_started:
+            raise OSError("lifecycle attempt-start failure")
         self.events.append(("attempt_started", (lease.attempt_id, shadow)))
 
     async def attempt_finished(
@@ -139,6 +144,8 @@ class Lifecycle(RequestLifecycle):
         self.events.append(("attempt_finished", (lease.attempt_id, outcome, uncertain)))
 
     async def finished(self, outcome: TerminalOutcome) -> None:
+        if self.fail_finished:
+            raise OSError("lifecycle terminal failure")
         self.events.append(("finished", outcome))
 
     async def release(self) -> None:
@@ -151,6 +158,8 @@ class Lifecycle(RequestLifecycle):
 @dataclass(slots=True)
 class LifecycleCapacity:
     available: bool = True
+    fail_attempt_started: bool = False
+    fail_finished: bool = False
     reservations: list[tuple[RequestId, AuthenticatedClient, int]] = field(default_factory=list)
     lifecycles: list[Lifecycle] = field(default_factory=list)
 
@@ -163,7 +172,7 @@ class LifecycleCapacity:
         self.reservations.append((request_id, client, events))
         if not self.available:
             return None
-        lifecycle = Lifecycle(events)
+        lifecycle = Lifecycle(events, self.fail_attempt_started, self.fail_finished)
         self.lifecycles.append(lifecycle)
         return lifecycle
 
@@ -203,6 +212,19 @@ DEPLOYMENT = EffectiveDeployment(
     credential_fingerprint="hcf1_" + "a" * 64,
     credential_epoch=1,
 )
+FALLBACK_DEPLOYMENT = DEPLOYMENT.model_copy(
+    update={
+        "runtime_id": "runtime-fallback",
+        "hidden_alias": "fixture/fallback",
+        "execution": {
+            "model": "openai/fixture-fallback",
+            "api_base": "https://provider.invalid/v1",
+        },
+    }
+)
+FALLBACK_GENERATION = deployment_generation(FALLBACK_DEPLOYMENT, CONTRACT)
+
+
 
 
 @dataclass(frozen=True, slots=True)
@@ -217,10 +239,17 @@ def quota(value: int) -> QuotaDimension:
     return QuotaDimension(status=QuotaDimensionStatus.KNOWN, value=value)
 
 
-def make_bundle(*, shadow: bool = False) -> tuple[PolicyBundleV1, str]:
+def make_bundle(
+    *,
+    shadow: bool = False,
+    failure_fallback: bool = False,
+    deadline_ms: int = 120_000,
+    modalities: tuple[Modality, ...] | None = None,
+) -> tuple[PolicyBundleV1, str]:
     caps = LegCapabilities(
         endpoints=tuple(EndpointKind(endpoint.name) for endpoint in CONTRACT.endpoints),
-        modalities=(
+        modalities=modalities
+        or (
             Modality.TEXT,
             Modality.EMBEDDING,
             Modality.RERANK,
@@ -256,10 +285,30 @@ def make_bundle(*, shadow: bool = False) -> tuple[PolicyBundleV1, str]:
             capabilities=primary.capabilities,
         )
     ]
-    if shadow:
-        shadow_leg = RouteLeg(
+    if failure_fallback:
+        fallback_leg = RouteLeg(
             leg_id=RouteLegId("leg_bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
             order=20,
+            triggers=(RouteTrigger.FAILURE_FALLBACK,),
+            account_id=ACCOUNT_ID,
+            generation_id=FALLBACK_GENERATION.generation_id,
+            capabilities=caps,
+        )
+        legs.append(fallback_leg)
+        authorized.append(
+            AuthorizedLeg(
+                leg_id=fallback_leg.leg_id,
+                account_id=fallback_leg.account_id,
+                generation_id=fallback_leg.generation_id,
+                order=fallback_leg.order,
+                allowed_triggers=fallback_leg.triggers,
+                capabilities=fallback_leg.capabilities,
+            )
+        )
+    if shadow:
+        shadow_leg = RouteLeg(
+            leg_id=RouteLegId("leg_cccccccc-cccc-4ccc-8ccc-cccccccccccc"),
+            order=30,
             triggers=(RouteTrigger.SHADOW,),
             account_id=ACCOUNT_ID,
             generation_id=TARGET.generation.generation_id,
@@ -291,7 +340,7 @@ def make_bundle(*, shadow: bool = False) -> tuple[PolicyBundleV1, str]:
         queue_weight=4,
         max_concurrency=4,
         max_waiters=16,
-        deadline_ms=120_000,
+        deadline_ms=deadline_ms,
     )
     issued = issue_key(
         policy,
@@ -385,9 +434,20 @@ async def make_stack(
     *plans: FaultPlan,
     limits: IngressLimits | None = None,
     lifecycle_available: bool = True,
+    fail_attempt_started: bool = False,
+    fail_finished: bool = False,
     shadow: bool = False,
+    read_timeout_s: float = 0.05,
+    failure_fallback: bool = False,
+    deadline_ms: int = 120_000,
+    modalities: tuple[Modality, ...] | None = None,
 ) -> Stack:
-    bundle, token = make_bundle(shadow=shadow)
+    bundle, token = make_bundle(
+        shadow=shadow,
+        failure_fallback=failure_fallback,
+        deadline_ms=deadline_ms,
+        modalities=modalities,
+    )
     clock = Clock()
     journal = AttemptJournal.create(tmp_path / "journal", clock=clock, group_commit_delay_ms=0)
     runtime = RuntimeState(bundle.accounts, journal=journal, clock=clock)
@@ -397,13 +457,17 @@ async def make_stack(
         transport=fake.transport(),
         connect_timeout_s=0.1,
         write_timeout_s=0.1,
-        read_inactivity_timeout_s=0.05,
+        read_inactivity_timeout_s=read_timeout_s,
         pool_timeout_s=0.1,
     )
     profiler = ProfileExecutor()
     ingress = IngressResources(limits or IngressLimits())
     permits = AttemptPermitPool()
-    lifecycle_capacity = LifecycleCapacity(available=lifecycle_available)
+    lifecycle_capacity = LifecycleCapacity(
+        available=lifecycle_available,
+        fail_attempt_started=fail_attempt_started,
+        fail_finished=fail_finished,
+    )
     identity = RuntimeIdentity(
         installation_id=InstallationId("inst_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
         dispatcher_fence=1,
@@ -411,11 +475,19 @@ async def make_stack(
         bundle_generation=bundle.generation,
         bundle_hash=bundle_hash(canonical_bundle_bytes(bundle)),
     )
-    target = DispatchTarget(
+    primary_target = DispatchTarget(
         deployment=DEPLOYMENT,
         generation=TARGET.generation,
         backend_manifest="bm1_" + "f" * 64,
     )
+    targets: dict[object, DispatchTarget] = {
+        TARGET.generation.generation_id: primary_target,
+        FALLBACK_GENERATION.generation_id: DispatchTarget(
+            deployment=FALLBACK_DEPLOYMENT,
+            generation=FALLBACK_GENERATION,
+            backend_manifest="bm1_" + "f" * 64,
+        ),
+    }
     app = create_app(
         contract=CONTRACT,
         bundle=bundle,
@@ -424,7 +496,7 @@ async def make_stack(
         auth_view_provider=AuthViews(AuthView(bundle)),
         generation_gate=GenerationGate(),
         runtime_identity_provider=RuntimeIdentityProvider(identity),
-        deployment_resolver=DeploymentResolver(target),
+        deployment_resolver=DeploymentResolver(targets),
         lifecycle_capacity=lifecycle_capacity,
         backend_authorization=BackendAuthorization(),
         clock=clock,
@@ -481,11 +553,12 @@ async def call_app(
     send_hook: Any = None,
     query_string: bytes = b"",
     raw_path: bytes | None = None,
+    content_type: bytes = b"application/json",
 ) -> ASGIResponse:
     selected_body = chat_body() if body is None else body
     headers = [
         (b"host", b"gateway.invalid"),
-        (b"content-type", b"application/json"),
+        (b"content-type", content_type),
         (b"content-length", str(len(selected_body)).encode()),
     ]
     if token is not None:
@@ -512,12 +585,15 @@ async def call_app(
     sent: list[dict[str, Any]] = []
     receive_calls = 0
 
+    never_disconnects = asyncio.Event()
+
     async def receive() -> dict[str, Any]:
         nonlocal receive_calls
         receive_calls += 1
         if pending:
             return pending.pop(0)
-        return {"type": "http.disconnect"}
+        await never_disconnects.wait()
+        raise AssertionError("unreachable")
 
     async def send(message: dict[str, Any]) -> None:
         if send_hook is not None:

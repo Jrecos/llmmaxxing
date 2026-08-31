@@ -260,6 +260,38 @@ class DownstreamStreamError(RuntimeError):
     pass
 
 
+class DownstreamDisconnected(DownstreamStreamError):
+    pass
+
+
+async def _watch_disconnect(receive: Any) -> None:
+    while True:
+        try:
+            message = await receive()
+        except Exception:
+            return
+        if message.get("type") == "http.disconnect":
+            return
+
+
+async def _await_or_disconnect(awaitable: Any, disconnect: asyncio.Task[None]) -> Any:
+    operation = asyncio.create_task(awaitable)
+    try:
+        done, _ = await asyncio.wait(
+            (operation, disconnect),
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if disconnect in done:
+            operation.cancel()
+            await asyncio.gather(operation, return_exceptions=True)
+            raise DownstreamDisconnected("ASGI client disconnected")
+        return await operation
+    except asyncio.CancelledError:
+        operation.cancel()
+        await asyncio.gather(operation, return_exceptions=True)
+        raise
+
+
 async def _next_with_timeout(iterator: Any, timeout_s: float) -> bytes | None:
     try:
         async with asyncio.timeout(timeout_s):
@@ -274,39 +306,73 @@ async def _next_with_timeout(iterator: Any, timeout_s: float) -> bytes | None:
 
 async def relay_raw_response(
     response: httpx.Response,
+    receive: Any,
     send: ASGISend,
     *,
     read_inactivity_timeout_s: float,
 ) -> int:
-    """Start once and relay raw bytes in order, awaiting every downstream send."""
+    """Start once and relay bounded raw bytes while observing ASGI disconnects."""
+    disconnect = asyncio.create_task(_watch_disconnect(receive))
     try:
-        await send(
-            {
-                "type": "http.response.start",
-                "status": response.status_code,
-                "headers": list(response_headers(response)),
-            }
-        )
-    except BaseException as error:
-        raise DownstreamStreamError("downstream rejected response headers") from error
-    sent = 0
-    iterator = response.aiter_raw().__aiter__()
-    while True:
-        chunk = await _next_with_timeout(iterator, read_inactivity_timeout_s)
-        if chunk is None:
-            break
-        for offset in range(0, len(chunk), RAW_CHUNK_BYTES):
-            piece = chunk[offset : offset + RAW_CHUNK_BYTES]
+        try:
+            await _await_or_disconnect(
+                send(
+                    {
+                        "type": "http.response.start",
+                        "status": response.status_code,
+                        "headers": list(response_headers(response)),
+                    }
+                ),
+                disconnect,
+            )
+        except asyncio.CancelledError:
+            raise
+        except DownstreamDisconnected:
+            raise
+        except Exception as error:
+            raise DownstreamStreamError("downstream rejected response headers") from error
+        sent = 0
+        iterator = response.aiter_raw(RAW_CHUNK_BYTES).__aiter__()
+        while True:
+            chunk = await _await_or_disconnect(
+                _next_with_timeout(iterator, read_inactivity_timeout_s),
+                disconnect,
+            )
+            if chunk is None:
+                break
             try:
-                await send({"type": "http.response.body", "body": piece, "more_body": True})
-            except BaseException as error:
+                await _await_or_disconnect(
+                    send(
+                        {
+                            "type": "http.response.body",
+                            "body": chunk,
+                            "more_body": True,
+                        }
+                    ),
+                    disconnect,
+                )
+            except asyncio.CancelledError:
+                raise
+            except DownstreamDisconnected:
+                raise
+            except Exception as error:
                 raise DownstreamStreamError("downstream stream failed") from error
-            sent += len(piece)
-    try:
-        await send({"type": "http.response.body", "body": b"", "more_body": False})
-    except BaseException as error:
-        raise DownstreamStreamError("downstream stream finalization failed") from error
-    return sent
+            sent += len(chunk)
+        try:
+            await _await_or_disconnect(
+                send({"type": "http.response.body", "body": b"", "more_body": False}),
+                disconnect,
+            )
+        except asyncio.CancelledError:
+            raise
+        except DownstreamDisconnected:
+            raise
+        except Exception as error:
+            raise DownstreamStreamError("downstream stream finalization failed") from error
+        return sent
+    finally:
+        disconnect.cancel()
+        await asyncio.gather(disconnect, return_exceptions=True)
 
 
 async def read_prestart_error(
@@ -315,7 +381,7 @@ async def read_prestart_error(
     read_inactivity_timeout_s: float,
 ) -> bytes:
     result = bytearray()
-    iterator = response.aiter_raw().__aiter__()
+    iterator = response.aiter_raw(RAW_CHUNK_BYTES).__aiter__()
     while True:
         chunk = await _next_with_timeout(iterator, read_inactivity_timeout_s)
         if chunk is None:
@@ -325,6 +391,21 @@ async def read_prestart_error(
                 "upstream error envelope exceeds the bounded classifier input"
             )
         result.extend(chunk)
+
+
+async def drain_raw_response(
+    response: httpx.Response,
+    *,
+    read_inactivity_timeout_s: float,
+) -> int:
+    """Consume one non-serving response with the same bounded raw iterator."""
+    total = 0
+    iterator = response.aiter_raw(RAW_CHUNK_BYTES).__aiter__()
+    while True:
+        chunk = await _next_with_timeout(iterator, read_inactivity_timeout_s)
+        if chunk is None:
+            return total
+        total += len(chunk)
 
 
 async def relay_buffered_response(
@@ -349,5 +430,7 @@ async def relay_buffered_response(
                 }
             )
         await send({"type": "http.response.body", "body": b"", "more_body": False})
-    except BaseException as error:
+    except asyncio.CancelledError:
+        raise
+    except Exception as error:
         raise DownstreamStreamError("downstream buffered response failed") from error

@@ -29,6 +29,7 @@ class FaultMode(StrEnum):
     BINARY = "binary"
     COMPRESSED = "compressed"
     BACKPRESSURE = "backpressure"
+    OVERSIZED_CHUNK = "oversized_chunk"
     DELAY_HEADERS = "delay_headers"
     STALL_AFTER_BYTE = "stall_after_byte"
     RESET_BEFORE_HEADERS = "reset_before_headers"
@@ -152,8 +153,10 @@ class FakeLiteLLM:
             chunks = (gzip.compress(b"compressed-exact-bytes", mtime=0),)
         elif plan.mode is FaultMode.BACKPRESSURE:
             chunks = (b"a" * 65_536, b"b" * 65_536)
+        elif plan.mode is FaultMode.OVERSIZED_CHUNK:
+            chunks = (b"z" * (3 * 65_536 + 17),)
         elif plan.mode in {FaultMode.STALL_AFTER_BYTE, FaultMode.RESET_AFTER_BYTE}:
-            chunks = (b"x", b"never")
+            chunks = (b"x" * 65_536, b"never")
         elif plan.mode is FaultMode.DELAY_HEADERS:
             chunks = (b"delayed",)
         else:

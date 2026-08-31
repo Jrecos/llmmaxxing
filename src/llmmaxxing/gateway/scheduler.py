@@ -524,6 +524,18 @@ class DispatchLease:
             )
         )
 
+    async def fail_before_send(self) -> object:
+        self._abandon_probes()
+        return await self.finish_async(
+            AttemptResolution(
+                outcome=TerminalOutcome.UPSTREAM_FAILED,
+                release_capacity=True,
+                actual_starts=0,
+                actual_token_units=0,
+                actual_quota_units=0,
+            )
+        )
+
     def mark_response_started(self) -> None:
         self.attempt_budget.mark_response_started()
 
@@ -769,6 +781,81 @@ class AdmissionController:
             if dispatch is not None and not dispatch.terminal:
                 await asyncio.shield(dispatch.cancel_before_send())
             raise
+
+    async def try_acquire_shadow(self, request: AdmissionRequest) -> DispatchLease | None:
+        """Immediately reserve one authorized shadow leg without entering the serving queue."""
+        shadow_request_id = RequestId.new()
+        shadow_budget = AttemptBudget(shadow_request_id)
+        async with self._activation_gate.hold_dispatch(shadow_request_id):
+            try:
+                auth_view = self._auth_view_provider.current_auth_view()
+                if not queued_identity_is_authorized(request.client, auth_view):
+                    return None
+                current = self._route_engine.authorize(request.client, request.profile)
+                authorization = request.authorization_ceiling.intersection(current)
+            except (Exception, ValueError):
+                return None
+            now_ms = self._clock.now_ms()
+            if now_ms >= request.deadline_at_ms:
+                return None
+            view = self._runtime.operational_view()
+            candidate = self._route_engine.shadow_candidate(
+                authorization,
+                request.profile,
+                view,
+                RoutingContext(
+                    now_ms=now_ms,
+                    deadline_at_ms=request.deadline_at_ms,
+                    dispatcher_fence=request.runtime_identity.dispatcher_fence,
+                ),
+            )
+            if candidate is None:
+                return None
+            attempt_id = self._attempt_id_factory()
+            reservation = ReservationRequest(
+                request_id=shadow_request_id,
+                attempt_id=attempt_id,
+                account_id=candidate.account_id,
+                leg_id=candidate.leg_id,
+                deployment_generation_id=candidate.generation_id,
+                runtime_identity=request.runtime_identity,
+                deadline_at_ms=request.deadline_at_ms,
+                profile=request.profile,
+                input_tokens_upper_bound=request.profile.input_tokens_max,
+                max_output_tokens=request.profile.output_tokens_max,
+                max_reasoning_tokens=request.profile.reasoning_tokens_max,
+                quota_units=self._route_engine.quota_units(candidate.account_id),
+                account_circuit=candidate.account_circuit,
+                circuit=candidate.deployment_circuit,
+            )
+            granted = await self._runtime.try_reserve_async(reservation)
+            if isinstance(granted, ReservationDenied):
+                return None
+            assert isinstance(granted, ReservationGranted)
+            try:
+                await granted.lease.mark_dispatched_async()
+                shadow_budget.record_send(candidate, attempt_id)
+            except BaseException:
+                await asyncio.shield(
+                    granted.lease.finish_async(
+                        AttemptResolution(
+                            outcome=TerminalOutcome.UPSTREAM_FAILED,
+                            release_capacity=True,
+                            actual_starts=0,
+                            actual_token_units=0,
+                            actual_quota_units=0,
+                        )
+                    )
+                )
+                raise
+            return DispatchLease(
+                granted.lease,
+                candidate,
+                attempt_id,
+                shadow_budget,
+                lambda: None,
+                partial(self._abandon_candidate, candidate),
+            )
 
     async def wake(self) -> None:
         async with self._pump_lock:

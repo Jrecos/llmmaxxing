@@ -237,6 +237,38 @@ def _reasoning(data: Mapping[str, Any], output_tokens: int) -> int:
     return output_tokens if data.get("reasoning_effort") is not None else 0
 
 
+def _chat_modality(messages: list[Any]) -> Modality:
+    nontext: set[Modality] = set()
+    for message in messages:
+        if not isinstance(message, dict):
+            _reject("invalid_messages")
+        content = message.get("content")
+        if content is None or isinstance(content, str):
+            continue
+        if not isinstance(content, list):
+            _reject("invalid_message_content")
+        for part in content:
+            if not isinstance(part, dict):
+                _reject("invalid_message_content")
+            part_type = part.get("type")
+            if part_type == "text":
+                if not isinstance(part.get("text"), str):
+                    _reject("invalid_message_content")
+            elif part_type == "image_url":
+                if not isinstance(part.get("image_url"), (str, dict)):
+                    _reject("invalid_message_content")
+                nontext.add(Modality.IMAGE)
+            elif part_type == "input_audio":
+                if not isinstance(part.get("input_audio"), dict):
+                    _reject("invalid_message_content")
+                nontext.add(Modality.AUDIO_TRANSCRIPTION)
+            else:
+                _reject("unsupported_message_modality")
+    if len(nontext) > 1:
+        _reject("mixed_chat_modalities")
+    return next(iter(nontext), Modality.TEXT)
+
+
 def _profile_json(endpoint_name: str, body: bytes) -> _ProfileResult:
     data = _parse_json(body)
     alias = _model(data)
@@ -266,7 +298,7 @@ def _profile_json(endpoint_name: str, body: bytes) -> _ProfileResult:
             isinstance(message, dict) and message.get("role") in ("assistant", "tool", "function")
             for message in messages
         )
-        modality = Modality.TEXT
+        modality = _chat_modality(messages)
     elif endpoint is EndpointKind.TEXT:
         if "prompt" not in data:
             _reject("invalid_prompt")
@@ -430,13 +462,19 @@ def _rewrite_json(
     return rewritten
 
 
-def _rewrite_multipart(body: bytes, content_type: str, prepared: PreparedDispatch) -> bytes:
+def _rewrite_multipart(
+    body: bytes,
+    content_type: str,
+    prepared: PreparedDispatch,
+    known_litellm_params: tuple[str, ...],
+) -> bytes:
     boundary, parts = _multipart_parts(body, content_type)
     model_field = prepared.model_locator.removeprefix("multipart.")
     fence_field = prepared.fence_locator.removeprefix("multipart.")
     rewritten: list[_MultipartPart] = []
     fence_value = json.dumps(prepared.trusted_metadata, separators=(",", ":")).encode()
     seen_fence = False
+    reserved = set(known_litellm_params) - {model_field}
     for part in parts:
         if part.name == model_field:
             rewritten.append(
@@ -445,6 +483,8 @@ def _rewrite_multipart(body: bytes, content_type: str, prepared: PreparedDispatc
         elif part.name == fence_field:
             rewritten.append(_MultipartPart(part.header_blob, part.name, fence_value))
             seen_fence = True
+        elif part.name in reserved:
+            continue
         else:
             rewritten.append(part)
     if not seen_fence:
@@ -475,7 +515,12 @@ def _rewrite_worker(
 ) -> bytes:
     prepared = PreparedDispatch.model_validate(prepared_payload)
     if prepared.model_locator.startswith("multipart."):
-        return _rewrite_multipart(body, content_type, prepared)
+        return _rewrite_multipart(
+            body,
+            content_type,
+            prepared,
+            known_litellm_params,
+        )
     return _rewrite_json(body, prepared, known_litellm_params)
 
 
@@ -506,6 +551,7 @@ class ProfileExecutor:
             initializer=_limit_profile_worker,
             max_tasks_per_child=1,
         )
+        self._worker_slots = asyncio.Semaphore(PROFILE_WORKERS)
         self._scratch_lock = asyncio.Lock()
         self._scratch = 0
         self._scratch_by_key: dict[str, int] = {}
@@ -559,14 +605,15 @@ class ProfileExecutor:
     ) -> RequestProfile:
         scratch = await self._reserve_scratch(key_id, body.size)
         try:
-            raw = await body.read()
-            if endpoint.model_locator == "json.model":
-                try:
-                    _prescan_json_limits(raw)
-                except ValueError as error:
-                    raise ProfileError(422, str(error)) from None
-            result = await self._run(_profile_worker, endpoint.name, raw, content_type)
-            assert isinstance(result, _ProfileResult)
+            async with self._worker_slots:
+                raw = await body.read()
+                if endpoint.model_locator == "json.model":
+                    try:
+                        await asyncio.to_thread(_prescan_json_limits, raw)
+                    except ValueError as error:
+                        raise ProfileError(422, str(error)) from None
+                result = await self._run(_profile_worker, endpoint.name, raw, content_type)
+                assert isinstance(result, _ProfileResult)
         finally:
             await scratch.release()
         route_group_id = route_groups.get(result.model_alias)
@@ -598,16 +645,17 @@ class ProfileExecutor:
     ) -> bytes:
         scratch = await self._reserve_scratch(key_id, min(body.size * 2, DEFAULT_BODY_BYTES * 2))
         try:
-            raw = await body.read()
-            rewritten = await self._run(
-                _rewrite_worker,
-                raw,
-                content_type,
-                prepared.model_dump(mode="python"),
-                known_litellm_params,
-            )
-            assert isinstance(rewritten, bytes)
-            return rewritten
+            async with self._worker_slots:
+                raw = await body.read()
+                rewritten = await self._run(
+                    _rewrite_worker,
+                    raw,
+                    content_type,
+                    prepared.model_dump(mode="python"),
+                    known_litellm_params,
+                )
+                assert isinstance(rewritten, bytes)
+                return rewritten
         finally:
             await scratch.release()
 
