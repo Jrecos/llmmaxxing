@@ -64,7 +64,7 @@ ENDPOINT_SPECS: dict[str, dict[str, str]] = {
         "deployment_id": "fixture-messages",
         "mode": "chat",
         "provider": "openai",
-        "model": "openai/fixture-messages",
+        "model": "fixture-messages",
         "api_base": "http://fake-provider:8080/v1",
     },
     "embeddings": {
@@ -387,7 +387,7 @@ def _request(
         except (UnicodeDecodeError, json.JSONDecodeError):
             payload = {}
         return exc.code, payload
-    except urllib.error.URLError:
+    except (urllib.error.URLError, ConnectionError):
         return 0, {}
 
 
@@ -462,6 +462,23 @@ def _wait_guard_last(
             return
         time.sleep(0.1)
     raise RuntimeError("certified generation guard did not register once and last")
+
+
+def _published_litellm_url(material: StackMaterial) -> str:
+    port = _compose(material, "port", "litellm", "4000").stdout.strip().rsplit(":", 1)[-1]
+    return f"http://127.0.0.1:{port}"
+
+
+def _recreate_litellm(
+    material: StackMaterial,
+    master_key: str,
+    guard_identity: str,
+) -> str:
+    _compose(material, "up", "-d", "--force-recreate", "--no-deps", "litellm")
+    base_url = _published_litellm_url(material)
+    _wait_ready(base_url)
+    _wait_guard_last(base_url, master_key, guard_identity)
+    return base_url
 
 
 def _inspect_source_files(
@@ -541,8 +558,7 @@ def main() -> int:
         os.environ["COMPOSE_PROJECT_NAME"] = project
         try:
             _compose(material, "up", "-d", "--wait", "--wait-timeout", "300")
-            port = _compose(material, "port", "litellm", "4000").stdout.strip().rsplit(":", 1)[-1]
-            base_url = f"http://127.0.0.1:{port}"
+            base_url = _published_litellm_url(material)
             _wait_ready(base_url)
             _wait_guard_last(
                 base_url,
@@ -605,13 +621,12 @@ def main() -> int:
             )
 
             _set_provider_secret(material, secrets.token_urlsafe(32))
-            _compose(material, "up", "-d", "--force-recreate", "--no-deps", "litellm")
-            _wait_ready(base_url)
-            _wait_guard_last(
-                base_url,
+            base_url = _recreate_litellm(
+                material,
                 material.master_key,
                 contract.guard.active_callback_identity,
             )
+            environment["LLMMAXXING_PINNED_LITELLM_URL"] = base_url
             swapped_environment = {
                 **environment,
                 "LLMMAXXING_PINNED_EXPECT_SECRET_SWAP": "1",
@@ -620,13 +635,12 @@ def main() -> int:
                 return 1
 
             _set_provider_secret(material, material.provider_secret)
-            _compose(material, "up", "-d", "--force-recreate", "--no-deps", "litellm")
-            _wait_ready(base_url)
-            _wait_guard_last(
-                base_url,
+            base_url = _recreate_litellm(
+                material,
                 material.master_key,
                 contract.guard.active_callback_identity,
             )
+            environment["LLMMAXXING_PINNED_LITELLM_URL"] = base_url
             environment.pop("LLMMAXXING_PINNED_EXPECT_SECRET_SWAP", None)
             return _run_pinned_test(environment)
         finally:

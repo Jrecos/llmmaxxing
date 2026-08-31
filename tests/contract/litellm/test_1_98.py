@@ -7,6 +7,7 @@ import runpy
 from collections.abc import Mapping
 from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -152,20 +153,7 @@ def test_contract_certifies_only_native_receipt_endpoints_and_exact_locators() -
         "audio_transcription": "multipart.metadata",
         "image": "json.metadata",
     }
-    assert {endpoint.name: endpoint.execution_normalizers for endpoint in contract.endpoints} == {
-        "messages": {"model": "provider_prefix_removed"}
-    } | {
-        name: {}
-        for name in (
-            "chat",
-            "text",
-            "embeddings",
-            "rerank",
-            "audio_speech",
-            "audio_transcription",
-            "image",
-        )
-    }
+    assert all(not endpoint.execution_normalizers for endpoint in contract.endpoints)
     assert all(
         endpoint.guard_required and endpoint.receipt_header == "x-litellm-model-id"
         for endpoint in contract.endpoints
@@ -422,6 +410,46 @@ def test_pinned_stack_launcher_materializes_exact_isolated_contract(tmp_path: Pa
     assert set(inference["allowed_routes"]) == set(contract.service_keys.inference.allowed_routes)
     assert set(discovery["allowed_routes"]) == set(contract.service_keys.discovery.allowed_routes)
     assert discovery["key_type"] == inference["key_type"] == "default"
+
+
+def test_recreate_re_resolves_random_host_port(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    launcher = runpy.run_path(str(Path(__file__).parent / "pinned_stack.py"))
+    stack = launcher["materialize_stack"](tmp_path)
+    published_ports = iter(("41001", "41002"))
+    ready_urls: list[str] = []
+
+    def compose(_material: Any, *args: str, **_kwargs: Any) -> SimpleNamespace:
+        stdout = f"127.0.0.1:{next(published_ports)}\n" if args[0] == "port" else ""
+        return SimpleNamespace(stdout=stdout)
+
+    recreate = launcher["_recreate_litellm"]
+    monkeypatch.setitem(recreate.__globals__, "_compose", compose)
+    monkeypatch.setitem(recreate.__globals__, "_wait_ready", ready_urls.append)
+    monkeypatch.setitem(recreate.__globals__, "_wait_guard_last", lambda *_args: None)
+    first = recreate(stack, "master", "guard")
+    second = recreate(stack, "master", "guard")
+
+    assert (first, second) == (
+        "http://127.0.0.1:41001",
+        "http://127.0.0.1:41002",
+    )
+    assert ready_urls == [first, second]
+
+
+def test_launcher_treats_connection_reset_as_transient_not_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    launcher = runpy.run_path(str(Path(__file__).parent / "pinned_stack.py"))
+    request = launcher["_request"]
+
+    def reset(*_args: Any, **_kwargs: Any) -> None:
+        raise ConnectionResetError
+
+    monkeypatch.setattr(request.__globals__["urllib"].request, "urlopen", reset)
+    assert request("http://127.0.0.1:1", "GET", "/health/readiness", "unused") == (0, {})
 
 
 def test_fixture_payloads_are_redacted_and_container_evidence_is_honestly_pending() -> None:

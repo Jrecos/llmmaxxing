@@ -32,7 +32,7 @@ class GuardConfigurationError(RuntimeError):
 _CERTIFIED_EXECUTION_NORMALIZERS: dict[str, dict[str, str]] = {
     "chat": {},
     "text": {},
-    "messages": {"model": "provider_prefix_removed"},
+    "messages": {},
     "embeddings": {},
     "rerank": {},
     "audio_speech": {},
@@ -41,20 +41,6 @@ _CERTIFIED_EXECUTION_NORMALIZERS: dict[str, dict[str, str]] = {
 }
 
 
-def _expected_execution(
-    value: Any,
-    normalizer: str | None,
-    execution: Mapping[str, Any],
-) -> Any:
-    if normalizer is None:
-        return value
-    if normalizer == "provider_prefix_removed":
-        provider = execution.get("custom_llm_provider")
-        if not isinstance(value, str) or not isinstance(provider, str) or not provider:
-            raise GuardViolation("normalized execution field is not a certified string")
-        prefix = provider + "/"
-        return value.removeprefix(prefix) if value.startswith(prefix) else value
-    raise GuardViolation("uncertified execution normalizer")
 
 
 class GuardViolation(RuntimeError):
@@ -322,10 +308,7 @@ class LLMMaxxingGuard(CustomLogger):
         normalizers = _CERTIFIED_EXECUTION_NORMALIZERS.get(endpoint)
         if normalizers is None:
             raise GuardViolation("uncertified endpoint fence")
-        expected_execution = {
-            name: _expected_execution(value, normalizers.get(name), projection["execution"])
-            for name, value in projection["execution"].items()
-        }
+        expected_execution = dict(projection["execution"])
         credential_value = _resolved_credential(kwargs.get(expected["credential_field"]))
         actual_fingerprint = credential_fingerprint(self._hmac_key, credential_value)
         if not hmac.compare_digest(
@@ -351,8 +334,26 @@ class LLMMaxxingGuard(CustomLogger):
             **dict(projection),
             "execution": expected_execution,
         }
-        if _freeze(current_projection) != expected_projection:
-            raise GuardViolation("selected deployment semantic execution projection mismatch")
+        frozen_current = _freeze(current_projection)
+        mismatches = [
+            field
+            for field in expected_projection
+            if frozen_current[field] != expected_projection[field]
+        ]
+        if "execution" in mismatches:
+            execution_mismatches = [
+                field
+                for field in expected_execution
+                if frozen_current["execution"][field] != expected_execution[field]
+            ]
+            mismatches[mismatches.index("execution")] = (
+                "execution(" + ",".join(execution_mismatches) + ")"
+            )
+        if mismatches:
+            raise GuardViolation(
+                "selected deployment semantic execution projection mismatch: "
+                + ",".join(mismatches)
+            )
         return kwargs
 
 

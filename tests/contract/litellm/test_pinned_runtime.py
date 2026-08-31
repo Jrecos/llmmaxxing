@@ -221,19 +221,19 @@ def test_pinned_build_complete_discovery_key_isolation_and_native_receipts() -> 
         )
         selected = selector_fixtures[endpoint.name]
         before = _provider_count()
-        content_type, raw = _endpoint_request(
-            prepared,
-            selected,
-            prepared.trusted_metadata,
-        )
-        status, headers, response_body = _http(
-            prepared.method,
-            prepared.path,
-            INFERENCE_KEY,
-            body=raw,
-            content_type=content_type,
-        )
         if EXPECT_SECRET_SWAP:
+            content_type, raw = _endpoint_request(
+                prepared,
+                selected,
+                prepared.trusted_metadata,
+            )
+            status, _, response_body = _http(
+                prepared.method,
+                prepared.path,
+                INFERENCE_KEY,
+                body=raw,
+                content_type=content_type,
+            )
             assert not 200 <= status < 300, (endpoint.name, status, response_body[:1000])
             assert _provider_count() == before
             continue
@@ -262,6 +262,18 @@ def test_pinned_build_complete_discovery_key_isolation_and_native_receipts() -> 
         assert not 200 <= stale_status < 300, (endpoint.name, stale_status)
         assert _provider_count() == before
 
+        content_type, raw = _endpoint_request(
+            prepared,
+            selected,
+            prepared.trusted_metadata,
+        )
+        status, headers, response_body = _http(
+            prepared.method,
+            prepared.path,
+            INFERENCE_KEY,
+            body=raw,
+            content_type=content_type,
+        )
         assert status == 200, (endpoint.name, status, response_body[:1000])
         assert _provider_count() == before + 1
         receipt = adapter.reconcile_dispatch(

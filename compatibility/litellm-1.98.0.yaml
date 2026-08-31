@@ -14,7 +14,7 @@
   "guard": {
     "mount_path": "deploy/litellm/llmmaxxing_guard.py",
     "callback_name": "llmmaxxing_guard",
-    "digest": "sha256:2b37e05efb17d890e77550099a521a098150f8800bc9217bcc9b30d23b39498c",
+    "digest": "sha256:d3e550112c0fac90865f25f214c86655125e38f7d02d0b93a7669c60eae07455",
     "registration": "last",
     "hook": "async_pre_call_deployment_hook",
     "dynamic_credential_lists": "unsupported",
@@ -120,7 +120,7 @@
   "endpoints": [
     {"name": "chat", "method": "POST", "path": "/v1/chat/completions", "model_locator": "json.model", "fence_locator": "json.metadata", "execution_normalizers": {}, "receipt_header": "x-litellm-model-id", "guard_required": true},
     {"name": "text", "method": "POST", "path": "/v1/completions", "model_locator": "json.model", "fence_locator": "json.metadata", "execution_normalizers": {}, "receipt_header": "x-litellm-model-id", "guard_required": true},
-    {"name": "messages", "method": "POST", "path": "/v1/messages", "model_locator": "json.model", "fence_locator": "json.litellm_metadata", "execution_normalizers": {"model": "provider_prefix_removed"}, "receipt_header": "x-litellm-model-id", "guard_required": true},
+    {"name": "messages", "method": "POST", "path": "/v1/messages", "model_locator": "json.model", "fence_locator": "json.litellm_metadata", "execution_normalizers": {}, "receipt_header": "x-litellm-model-id", "guard_required": true},
     {"name": "embeddings", "method": "POST", "path": "/v1/embeddings", "model_locator": "json.model", "fence_locator": "json.metadata", "execution_normalizers": {}, "receipt_header": "x-litellm-model-id", "guard_required": true},
     {"name": "rerank", "method": "POST", "path": "/v1/rerank", "model_locator": "json.model", "fence_locator": "json.metadata", "execution_normalizers": {}, "receipt_header": "x-litellm-model-id", "guard_required": true},
     {"name": "audio_speech", "method": "POST", "path": "/v1/audio/speech", "model_locator": "json.model", "fence_locator": "json.metadata", "execution_normalizers": {}, "receipt_header": "x-litellm-model-id", "guard_required": true},

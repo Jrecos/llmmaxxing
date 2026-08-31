@@ -121,31 +121,16 @@ def test_guard_accepts_identical_metadata_copy_but_rejects_conflicting_copy() ->
         asyncio.run(guard.async_pre_call_deployment_hook(kwargs, None))
 
 
-def test_messages_strips_only_the_certified_expected_provider_prefix() -> None:
+def test_messages_compares_raw_provider_qualified_model_exactly() -> None:
     module, guard, manifest, secret = make_guard()
     kwargs = request_kwargs(manifest, secret)
     kwargs["metadata"]["llmmaxxing_guard"]["endpoint"] = "messages"
-    kwargs["model"] = "electron-v1"
     assert asyncio.run(guard.async_pre_call_deployment_hook(kwargs, None)) is kwargs
 
-    kwargs["model"] = "other/electron-v1"
-    with pytest.raises(module.GuardViolation, match="execution"):
-        asyncio.run(guard.async_pre_call_deployment_hook(kwargs, None))
-
-    wrong_manifest = deepcopy(manifest)
-    wrong_manifest["deployments"]["lmx/electron-v1"]["projection"]["execution"]["model"] = (
-        "other/electron-v1"
-    )
-    wrong_guard = module.LLMMaxxingGuard(
-        manifest=wrong_manifest,
-        hmac_key=b"unit-test-guard-fingerprint-key",
-        guard_digest=hashlib.sha256(GUARD_PATH.read_bytes()).hexdigest(),
-    )
-    kwargs = request_kwargs(wrong_manifest, secret)
-    kwargs["metadata"]["llmmaxxing_guard"]["endpoint"] = "messages"
-    kwargs["model"] = "electron-v1"
-    with pytest.raises(module.GuardViolation, match="execution"):
-        asyncio.run(wrong_guard.async_pre_call_deployment_hook(kwargs, None))
+    for model in ("other/electron-v1", "electron/electron-v2", "electron-v1"):
+        kwargs["model"] = model
+        with pytest.raises(module.GuardViolation, match="execution"):
+            asyncio.run(guard.async_pre_call_deployment_hook(kwargs, None))
 
 
 @pytest.mark.parametrize(
