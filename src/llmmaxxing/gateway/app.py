@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Mapping
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -68,8 +69,8 @@ from llmmaxxing.gateway.streaming import (
     DownstreamStreamError,
     PermitClass,
     ProcessHTTPClient,
-    drain_raw_response,
     UpstreamStreamError,
+    drain_raw_response,
     read_prestart_error,
     relay_buffered_response,
     relay_raw_response,
@@ -539,10 +540,8 @@ class GatewayApp:
                 else TerminalOutcome.CLIENT_CANCELLED
             )
             if lifecycle is not None and not final_recorded:
-                try:
+                with suppress(Exception):
                     await _shielded(lifecycle.finished(outcome))
-                except Exception:
-                    pass
                 final_recorded = True
             if deadline is not None and deadline.expired:
                 if not deadline.response_started:
@@ -551,10 +550,8 @@ class GatewayApp:
             raise
         except Exception:
             if lifecycle is not None and not final_recorded:
-                try:
+                with suppress(Exception):
                     await lifecycle.finished(TerminalOutcome.UPSTREAM_FAILED)
-                except Exception:
-                    pass
                 final_recorded = True
             if deadline is None or not deadline.response_started:
                 await _send_error(send, 500, "gateway_failure")
@@ -571,17 +568,11 @@ class GatewayApp:
             if lifecycle is not None:
                 try:
                     if not final_recorded:
-                        try:
-                            await _shielded(
-                                lifecycle.finished(TerminalOutcome.UPSTREAM_FAILED)
-                            )
-                        except Exception:
-                            pass
+                        with suppress(Exception):
+                            await _shielded(lifecycle.finished(TerminalOutcome.UPSTREAM_FAILED))
                 finally:
-                    try:
+                    with suppress(Exception):
                         await _shielded(lifecycle.release())
-                    except Exception:
-                        pass
 
     @staticmethod
     def _authorization_has_alternate(
@@ -625,9 +616,7 @@ class GatewayApp:
             nonlocal attempt_event_recorded
             if attempt_event_recorded:
                 return
-            await _shielded(
-                lifecycle.attempt_finished(dispatch, outcome, uncertain=uncertain)
-            )
+            await _shielded(lifecycle.attempt_finished(dispatch, outcome, uncertain=uncertain))
             attempt_event_recorded = True
 
         try:
@@ -667,12 +656,8 @@ class GatewayApp:
                     uncertain=False,
                 )
                 fallback_cause = DispatchCause.FAILURE
-                if self._authorization_has_alternate(
-                    dispatch, fallback_cause, authorization
-                ):
-                    return _AttemptResult(
-                        False, TerminalOutcome.UPSTREAM_FAILED, fallback_cause
-                    )
+                if self._authorization_has_alternate(dispatch, fallback_cause, authorization):
+                    return _AttemptResult(False, TerminalOutcome.UPSTREAM_FAILED, fallback_cause)
                 await _send_error(send, 502, "upstream_connect_failure")
                 return _AttemptResult(True, TerminalOutcome.UPSTREAM_FAILED)
             except (httpx.HTTPError, OSError):
@@ -893,15 +878,13 @@ class GatewayApp:
                 else:
                     await _shielded(dispatch.fail_before_send())
             if not attempt_event_recorded:
-                try:
+                with suppress(Exception):
                     await _shielded(
                         record_attempt(
                             TerminalOutcome.UPSTREAM_FAILED,
                             uncertain=provider_send_started,
                         )
                     )
-                except Exception:
-                    pass
             raise
         finally:
             if response is not None:
@@ -933,9 +916,7 @@ class GatewayApp:
             nonlocal event_recorded
             if dispatch is None or event_recorded:
                 return
-            await _shielded(
-                lifecycle.attempt_finished(dispatch, outcome, uncertain=uncertain)
-            )
+            await _shielded(lifecycle.attempt_finished(dispatch, outcome, uncertain=uncertain))
             event_recorded = True
 
         try:
@@ -1039,9 +1020,7 @@ class GatewayApp:
                 else:
                     await _shielded(dispatch.fail_before_send())
                 if not event_recorded:
-                    await _shielded(
-                        record(outcome, uncertain=provider_send_started)
-                    )
+                    await _shielded(record(outcome, uncertain=provider_send_started))
             raise
         except BaseException:
             if dispatch is not None and not dispatch.terminal:
@@ -1057,15 +1036,13 @@ class GatewayApp:
                 else:
                     await _shielded(dispatch.fail_before_send())
             if dispatch is not None and not event_recorded:
-                try:
+                with suppress(Exception):
                     await _shielded(
                         record(
                             TerminalOutcome.UPSTREAM_FAILED,
                             uncertain=provider_send_started,
                         )
                     )
-                except Exception:
-                    pass
         finally:
             if response is not None:
                 await _shielded(response.aclose())

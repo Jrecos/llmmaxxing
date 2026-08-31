@@ -34,9 +34,9 @@ from llmmaxxing.gateway.ingress import (
     IngressError,
     IngressLimits,
     IngressResources,
+    RetainedBody,
     read_retained_body,
     validate_http_request,
-    RetainedBody,
 )
 from support.fake_litellm import FaultMode, FaultPlan
 from support.gateway_stack import (
@@ -543,9 +543,7 @@ def test_multipart_rewrite_strips_all_reserved_litellm_controls(tmp_path) -> Non
         )
         chunks = [
             (
-                f"--{boundary}\r\n"
-                f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
-                f"{value}\r\n"
+                f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'
             ).encode()
             for name, value in fields
         ]
@@ -634,9 +632,7 @@ def test_post_auth_deadline_covers_slow_body_and_releases_every_resource(tmp_pat
             response = await call_app(
                 stack.app,
                 stack.token,
-                receive_messages=[
-                    {"type": "http.request", "body": b"{", "more_body": True}
-                ],
+                receive_messages=[{"type": "http.request", "body": b"{", "more_body": True}],
             )
             assert response.status == 504
             assert time.monotonic() - started < 0.5

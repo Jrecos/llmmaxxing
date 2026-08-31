@@ -128,7 +128,10 @@ class Lifecycle(RequestLifecycle):
         self.events.append(("queued", None))
 
     async def attempt_started(
-        self, lease, *, shadow: bool  # type: ignore[no-untyped-def]
+        self,
+        lease,
+        *,
+        shadow: bool,  # type: ignore[no-untyped-def]
     ) -> None:
         if self.fail_attempt_started:
             raise OSError("lifecycle attempt-start failure")
@@ -223,8 +226,6 @@ FALLBACK_DEPLOYMENT = DEPLOYMENT.model_copy(
     }
 )
 FALLBACK_GENERATION = deployment_generation(FALLBACK_DEPLOYMENT, CONTRACT)
-
-
 
 
 @dataclass(frozen=True, slots=True)
