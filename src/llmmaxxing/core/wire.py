@@ -615,6 +615,35 @@ def seal_gateway_ack(ack: GatewayAckV1, signer: ChannelSigner) -> GatewayAckV1:
     return _seal_model(ack, signer, GatewayAckV1)
 
 
+def verify_gateway_ack(
+    ack: GatewayAckV1,
+    channel_trust: ChannelTrustSet,
+    *,
+    command: GatewayCommandV1,
+) -> GatewayAckV1:
+    if ack.installation_id != channel_trust.installation_id:
+        raise CommandInstallationMismatch("acknowledgement names another installation")
+    if ack.security_epoch != channel_trust.security_epoch:
+        raise StaleSecurityEpoch("acknowledgement security epoch is not current")
+    if (
+        ack.command_id != command.command_id
+        or ack.command_digest != gateway_command_digest(command)
+        or ack.channel_epoch != command.channel_epoch
+        or ack.boot_id != command.boot_id
+        or ack.sequence != command.sequence
+    ):
+        raise SignatureVerificationError("acknowledgement does not bind the exact command")
+    key = _channel_key(ack.channel_seal, ack.channel_epoch, channel_trust)
+    try:
+        key.verify(
+            bytes.fromhex(ack.channel_seal.signature),
+            _ACK_DOMAIN + canonical_json_bytes(_blanked(ack)),
+        )
+    except (InvalidSignature, ValueError) as error:
+        raise SignatureVerificationError("invalid acknowledgement signature") from error
+    return ack
+
+
 def seal_fence_receipt(
     receipt: FenceReceiptV1,
     signer: ChannelSigner,
