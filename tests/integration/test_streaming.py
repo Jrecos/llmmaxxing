@@ -559,18 +559,14 @@ def test_deadline_during_upstream_response_start_never_suppresses_or_double_star
             deadline_ms=1_000,
             read_timeout_s=2,
         )
-        task = asyncio.create_task(
-            call_app(stack.app, stack.token, send_hook=block_first_start)
-        )
+        task = asyncio.create_task(call_app(stack.app, stack.token, send_hook=block_first_start))
         try:
             await asyncio.wait_for(entered.wait(), timeout=2)
             await asyncio.sleep(1.05)
             release.set()
             response = await task
             starts = [
-                message
-                for message in response.messages
-                if message["type"] == "http.response.start"
+                message for message in response.messages if message["type"] == "http.response.start"
             ]
             assert len(starts) == 1
             assert response.status == 200
@@ -610,9 +606,7 @@ def test_deadline_during_local_error_start_keeps_the_actual_first_status(tmp_pat
             release.set()
             response = await task
             starts = [
-                message
-                for message in response.messages
-                if message["type"] == "http.response.start"
+                message for message in response.messages if message["type"] == "http.response.start"
             ]
             assert len(starts) == 1
             assert response.status == 422

@@ -771,10 +771,7 @@ def test_cancelled_profile_offloads_hold_both_slots_until_work_really_finishes(
 
         monkeypatch.setattr(RetainedBody, "_read_sync", blocked_read)
         stack = await make_stack(tmp_path, deadline_ms=30)
-        tasks = [
-            asyncio.create_task(call_app(stack.app, stack.token))
-            for _ in range(2)
-        ]
+        tasks = [asyncio.create_task(call_app(stack.app, stack.token)) for _ in range(2)]
         try:
             assert await asyncio.to_thread(two_entered.wait, 1)
             await asyncio.sleep(0.05)

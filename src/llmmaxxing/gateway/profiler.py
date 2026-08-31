@@ -637,9 +637,7 @@ class ProfileExecutor:
                 raw = await _await_completion(body.read())
                 if endpoint.model_locator == "json.model":
                     try:
-                        await _await_completion(
-                            asyncio.to_thread(_prescan_json_limits, raw)
-                        )
+                        await _await_completion(asyncio.to_thread(_prescan_json_limits, raw))
                     except ValueError as error:
                         raise ProfileError(422, str(error)) from None
                 result = await _await_completion(

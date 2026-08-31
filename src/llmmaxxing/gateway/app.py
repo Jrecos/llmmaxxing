@@ -673,9 +673,7 @@ class GatewayApp:
                 fallback_cause = DispatchCause.FAILURE
                 if self._authorization_has_alternate(dispatch, fallback_cause, authorization):
                     return _AttemptResult(False, TerminalOutcome.UPSTREAM_FAILED, fallback_cause)
-                await _send_error(
-                    send, 502, "upstream_connect_failure", deadline.response_start
-                )
+                await _send_error(send, 502, "upstream_connect_failure", deadline.response_start)
                 return _AttemptResult(True, TerminalOutcome.UPSTREAM_FAILED)
             except (httpx.HTTPError, OSError):
                 pending_outcome = TerminalOutcome.UPSTREAM_FAILED
@@ -690,9 +688,7 @@ class GatewayApp:
                     TerminalOutcome.UPSTREAM_FAILED,
                     uncertain=True,
                 )
-                await _send_error(
-                    send, 502, "upstream_transport_failure", deadline.response_start
-                )
+                await _send_error(send, 502, "upstream_transport_failure", deadline.response_start)
                 return _AttemptResult(True, TerminalOutcome.UPSTREAM_FAILED)
             except (DispatchError, ProfileError, ValueError, RuntimeError):
                 pending_outcome = TerminalOutcome.UPSTREAM_FAILED
@@ -701,9 +697,7 @@ class GatewayApp:
                     TerminalOutcome.UPSTREAM_FAILED,
                     uncertain=False,
                 )
-                await _send_error(
-                    send, 502, "dispatch_preparation_failed", deadline.response_start
-                )
+                await _send_error(send, 502, "dispatch_preparation_failed", deadline.response_start)
                 return _AttemptResult(True, TerminalOutcome.UPSTREAM_FAILED)
 
             if not 200 <= response.status_code < 300:
@@ -792,9 +786,7 @@ class GatewayApp:
                     TerminalOutcome.UPSTREAM_FAILED,
                     uncertain=False,
                 )
-                await _send_error(
-                    send, 502, "deployment_receipt_mismatch", deadline.response_start
-                )
+                await _send_error(send, 502, "deployment_receipt_mismatch", deadline.response_start)
                 return _AttemptResult(True, TerminalOutcome.UPSTREAM_FAILED)
 
             if not shadow.decided:
