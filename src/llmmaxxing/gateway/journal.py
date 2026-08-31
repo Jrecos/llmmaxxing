@@ -504,7 +504,6 @@ class AttemptJournal:
     def records_until_checkpoint(self) -> int:
         return max(0, self._checkpoint_every_records - self._records_since_checkpoint)
 
-
     @property
     def health(self) -> JournalHealth:
         if self._closed:

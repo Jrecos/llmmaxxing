@@ -478,6 +478,7 @@ def test_circuit_cas_is_operational_state_not_publication_authority(
     finally:
         journal.close()
 
+
 def test_local_parallel_ceiling_is_independent_of_provider_limit(
     tmp_path: Path, clock: FakeClock
 ) -> None:
@@ -501,12 +502,8 @@ def test_oversized_tpm_and_undercharged_quota_are_typed_denials(
     try:
         oversized = state.try_reserve(request(provider_account, clock, tokens=11, quota_units=3))
         assert oversized == ReservationDenied(ReservationDenialReason.TPM_EXHAUSTED)
-        undercharged = state.try_reserve(
-            request(provider_account, clock, tokens=1, quota_units=2)
-        )
-        assert undercharged == ReservationDenied(
-            ReservationDenialReason.INVALID_QUOTA_CHARGE
-        )
+        undercharged = state.try_reserve(request(provider_account, clock, tokens=1, quota_units=2))
+        assert undercharged == ReservationDenied(ReservationDenialReason.INVALID_QUOTA_CHARGE)
     finally:
         journal.close()
 
@@ -545,9 +542,7 @@ def test_publication_is_atomic_and_omissions_become_non_serving(
         journal.close()
 
 
-def test_window_increase_retains_previously_expired_start(
-    tmp_path: Path, clock: FakeClock
-) -> None:
+def test_window_increase_retains_previously_expired_start(tmp_path: Path, clock: FakeClock) -> None:
     provider_account = account(tpm=10, tpm_window_seconds=10)
     journal, state = open_view(tmp_path, provider_account, clock)
     try:
@@ -570,9 +565,7 @@ def test_window_increase_retains_previously_expired_start(
         journal.close()
 
 
-def test_binding_digest_is_unambiguous_for_embedded_nuls(
-    tmp_path: Path, clock: FakeClock
-) -> None:
+def test_binding_digest_is_unambiguous_for_embedded_nuls(tmp_path: Path, clock: FakeClock) -> None:
     first = account(connection="a\0b", provider_token="c", binding_ref="d")
     second = account(connection="a", provider_token="b\0c", binding_ref="d")
     journal = AttemptJournal.create(tmp_path / "journal", clock=clock, group_commit_delay_ms=0)
@@ -582,17 +575,13 @@ def test_binding_digest_is_unambiguous_for_embedded_nuls(
         journal.close()
 
 
-def test_authoritative_active_count_keeps_oldest_attempt(
-    tmp_path: Path, clock: FakeClock
-) -> None:
+def test_authoritative_active_count_keeps_oldest_attempt(tmp_path: Path, clock: FakeClock) -> None:
     provider_account = account(parallel=2)
     journal, state = open_view(tmp_path, provider_account, clock)
     older_id = AttemptId("att_ffffffff-ffff-4fff-8fff-ffffffffffff")
     newer_id = AttemptId("att_00000000-0000-4000-8000-000000000000")
     try:
-        older = state.try_reserve(
-            request(provider_account, clock, attempt_id=older_id)
-        )
+        older = state.try_reserve(request(provider_account, clock, attempt_id=older_id))
         assert isinstance(older, ReservationGranted)
         older.lease.finish(
             AttemptResolution(
@@ -604,9 +593,7 @@ def test_authoritative_active_count_keeps_oldest_attempt(
             )
         )
         clock.advance(1)
-        newer = state.try_reserve(
-            request(provider_account, clock, attempt_id=newer_id)
-        )
+        newer = state.try_reserve(request(provider_account, clock, attempt_id=newer_id))
         assert isinstance(newer, ReservationGranted)
         newer.lease.finish(
             AttemptResolution(
@@ -623,9 +610,7 @@ def test_authoritative_active_count_keeps_oldest_attempt(
         journal.close()
 
 
-def test_monthly_refund_never_changes_a_new_reset_epoch(
-    tmp_path: Path, clock: FakeClock
-) -> None:
+def test_monthly_refund_never_changes_a_new_reset_epoch(tmp_path: Path, clock: FakeClock) -> None:
     reset_at = clock.now_ms() + 1_000
     provider_account = account(monthly=100, monthly_reset_at_ms=reset_at)
     journal, state = open_view(tmp_path, provider_account, clock)
@@ -649,9 +634,7 @@ def test_monthly_refund_never_changes_a_new_reset_epoch(
         journal.close()
 
 
-def test_half_open_probe_token_is_consumed_once(
-    tmp_path: Path, clock: FakeClock
-) -> None:
+def test_half_open_probe_token_is_consumed_once(tmp_path: Path, clock: FakeClock) -> None:
     provider_account = account(parallel=3)
     journal, state = open_view(tmp_path, provider_account, clock)
     runtime = state.account_runtime(provider_account.account_id)
@@ -669,24 +652,18 @@ def test_half_open_probe_token_is_consumed_once(
     try:
         assert runtime.compare_and_swap_account_circuit(CircuitValue.closed(), half_open)
         first = state.try_reserve(
-            request(provider_account, clock).model_copy(
-                update={"account_circuit": half_open}
-            )
+            request(provider_account, clock).model_copy(update={"account_circuit": half_open})
         )
         assert isinstance(first, ReservationGranted)
         second = state.try_reserve(
-            request(provider_account, clock).model_copy(
-                update={"account_circuit": half_open}
-            )
+            request(provider_account, clock).model_copy(update={"account_circuit": half_open})
         )
         assert second == ReservationDenied(ReservationDenialReason.CIRCUIT_UNAVAILABLE)
     finally:
         journal.close()
 
 
-def test_terminal_ledger_stops_before_snapshot_bound(
-    tmp_path: Path, clock: FakeClock
-) -> None:
+def test_terminal_ledger_stops_before_snapshot_bound(tmp_path: Path, clock: FakeClock) -> None:
     provider_account = account(parallel=2)
     journal = AttemptJournal.create(tmp_path / "journal", clock=clock, group_commit_delay_ms=0)
     state = RuntimeState(

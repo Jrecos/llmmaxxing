@@ -1,9 +1,9 @@
 """Durable reservation, segmented journal, checkpoint, and recovery contract."""
 
 from __future__ import annotations
+
 import asyncio
 import threading
-
 from pathlib import Path
 from uuid import uuid4
 
@@ -633,6 +633,7 @@ def test_journal_and_checkpoints_never_store_provider_or_request_secrets(tmp_pat
     ):
         assert forbidden not in durable
 
+
 def test_writer_failure_rejects_every_queued_waiter(tmp_path: Path) -> None:
     clock = FakeClock(1_800_000_000_000)
     entered = threading.Event()
@@ -718,9 +719,7 @@ def test_async_cancel_reconciles_a_durable_no_send(tmp_path: Path) -> None:
     state = RuntimeState((provider_account,), journal=journal, clock=clock)
 
     async def exercise() -> None:
-        task = asyncio.create_task(
-            state.try_reserve_async(request(provider_account, clock))
-        )
+        task = asyncio.create_task(state.try_reserve_async(request(provider_account, clock)))
         assert await asyncio.to_thread(entered.wait, 1)
         task.cancel()
         release.set()

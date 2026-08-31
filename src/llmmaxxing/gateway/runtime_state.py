@@ -378,9 +378,7 @@ class AccountRuntime:
                 return ReservationDenied(ReservationDenialReason.ACCOUNT_NOT_FOUND)
             if self.account.state is not AccountState.ACTIVE:
                 return ReservationDenied(ReservationDenialReason.ACCOUNT_NOT_ACTIVE)
-            unresolved = sum(
-                attempt_id not in self._resolutions for attempt_id in self._attempts
-            )
+            unresolved = sum(attempt_id not in self._resolutions for attempt_id in self._attempts)
             if len(self._resolutions) + unresolved >= self._resolution_ledger_limit:
                 return ReservationDenied(ReservationDenialReason.JOURNAL_CAPACITY_STOP)
             if request.quota_units < self.account.quota_units_per_attempt:
@@ -1435,9 +1433,7 @@ class RuntimeState:
                 profile_digest=cast(str, payload["profile_digest"]),
                 circuit_epoch=cast(int, payload["circuit_epoch"]),
                 circuit_probe_id=cast(str | None, payload["circuit_probe_id"]),
-                account_circuit_probe_id=cast(
-                    str | None, payload["account_circuit_probe_id"]
-                ),
+                account_circuit_probe_id=cast(str | None, payload["account_circuit_probe_id"]),
                 monthly_reset_at_ms=reset_at,
                 started_at_ms=cast(int, payload["started_at_ms"]),
                 reserved_tokens=cast(int, payload["reserved_tokens"]),
