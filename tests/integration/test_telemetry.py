@@ -101,6 +101,7 @@ class FakeExporter(SpanExporter):
     def force_flush(self, timeout_millis: int = 30_000) -> bool:
         return True
 
+
 @dataclass(frozen=True, slots=True)
 class HungExporter(SpanExporter):
     entered: threading.Event
@@ -324,7 +325,9 @@ def test_production_lifecycle_reserves_exact_budget_and_one_terminal(tmp_path: P
         resolved = [event for event in events if event.kind is LifecycleEventKind.ATTEMPT_RESOLVED]
         assert all(event.headers_at_ms is not None for event in resolved)
         assert all(event.first_byte_at_ms is not None for event in resolved)
-        assert all(event.timings_ms is not None and event.timings_ms.ttft_ms == 2 for event in resolved)
+        assert all(
+            event.timings_ms is not None and event.timings_ms.ttft_ms == 2 for event in resolved
+        )
         assert all(len(canonical_event_bytes(event)) <= MAX_EVENT_BYTES for event in events)
     finally:
         reopened.close()
@@ -452,6 +455,7 @@ def test_replay_is_at_least_once_deduped_and_ack_is_strict(tmp_path: Path) -> No
     assert tuple(writer.replay(AckCursor.origin())), "a lost ACK must redeliver"
     writer.close()
 
+
 def test_replay_and_ack_decode_incrementally_outside_hot_accounting_lock(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -542,6 +546,7 @@ def test_complete_corruption_fails_closed_instead_of_becoming_a_gap(tmp_path: Pa
     with pytest.raises(SpoolCorruptionError):
         LifecycleSpool.open(tmp_path, max_bytes=512 * 4096)
 
+
 def test_recovery_rejects_missing_manifest_segment_and_forward_ack(tmp_path: Path) -> None:
     missing = spool(tmp_path / "missing", segment_bytes=900)
     reservation = missing.try_reserve(4)
@@ -599,6 +604,7 @@ def test_writer_failure_stops_admission_but_records_one_live_terminal(tmp_path: 
     fatal = (tmp_path / "fatal.jsonl").read_text()
     assert "writer_io_failure" in fatal
     assert "raw disk error" not in fatal
+
 
 @pytest.mark.parametrize("batch_records", (1, 256))
 def test_writer_failure_preserves_terminal_from_failing_batch_or_drained_queue(
@@ -686,6 +692,7 @@ def test_spool_sizing_rejects_below_floor_formula_or_physical_volume() -> None:
             max_bytes=MIN_SPOOL_BYTES - 1,
             physical_bytes=MIN_SPOOL_BYTES,
         )
+
 
 def test_writer_activity_updates_prometheus_after_async_idle(tmp_path: Path) -> None:
     metrics = TelemetryMetrics(account_ids=(ACCOUNT_ID,), route_group_ids=(ROUTE_ID,))

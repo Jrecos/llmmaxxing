@@ -651,9 +651,7 @@ class LifecycleSpool:
                 raise SpoolCorruptionError("clean spool contains an unlisted segment")
             self._ack_cursor = self._read_ack()
 
-        partial, last_sequence, last_digest = self._scan_segments(
-            repair_tail=not was_clean
-        )
+        partial, last_sequence, last_digest = self._scan_segments(repair_tail=not was_clean)
         self._last_sequence = last_sequence
         self._last_digest = last_digest
         self._physical_bytes = sum(segment.bytes for segment in self._segments)
@@ -773,10 +771,8 @@ class LifecycleSpool:
     def _notify(callback: Callable[..., None] | None, *args: object) -> None:
         if callback is None:
             return
-        try:
+        with contextlib.suppress(Exception):
             callback(*args)
-        except Exception:
-            pass
 
     def _append_event(self, event: LifecycleEventV1) -> None:
         document = json.loads(canonical_event_bytes(event))
