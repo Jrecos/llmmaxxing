@@ -15,6 +15,7 @@ dependencies = [
     "cryptography>=44,<47",
     "httpx>=0.28,<1",
     "pydantic>=2.9,<3",
+    "uvicorn>=0.35,<1",
 ]
 
 [project.scripts]

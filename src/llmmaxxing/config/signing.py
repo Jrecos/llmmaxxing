@@ -5,14 +5,14 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Annotated, Literal, Self
+from typing import Self
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PrivateKey,
     Ed25519PublicKey,
 )
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import ValidationError
 
 from llmmaxxing.config.plan import ImpactPlan
 from llmmaxxing.core.canonical import (
@@ -20,45 +20,21 @@ from llmmaxxing.core.canonical import (
     canonical_bundle_bytes,
     canonical_json_bytes,
 )
-from llmmaxxing.core.ids import BundleHash
+from llmmaxxing.core.wire import (
+    GENESIS_BASE_BUNDLE_HASH,
+    ActivationEnvelope as WireActivationEnvelope,
+    SignatureVerificationError,
+    UnknownSigningKey,
+    UnknownTrustEpoch,
+)
 from llmmaxxing.core.key_lifecycle import (
     exact_policy_reassignments,
     validate_key_record_set_delta,
 )
 from llmmaxxing.core.models import PolicyBundleV1
 
-_HEX64 = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
-_SIGNER_ID = Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")]
-
-
-class SignatureVerificationError(ValueError):
-    """An activation payload is malformed, noncanonical, or has an invalid signature."""
-
-
-class UnknownTrustEpoch(SignatureVerificationError):
-    """The activation names an epoch absent from the verifier's trust set."""
-
-
-class UnknownSigningKey(SignatureVerificationError):
-    """The activation names a key absent from its trusted epoch."""
-
-
-class ActivationEnvelope(BaseModel):
-    """Secret-free activation intent authenticated by an epoch-scoped signer."""
-
-    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
-
-    schema_version: Literal[1] = 1
-    trust_epoch: int = Field(ge=1)
-    signer_key_id: _SIGNER_ID
-    base_generation: int = Field(ge=1)
-    base_bundle_hash: BundleHash
-    target_generation: int = Field(ge=1)
-    target_content_hash: BundleHash
-    source_fingerprint: _HEX64
-    security_fence: _HEX64
-    key_set_fence: _HEX64
-    impact_hash: _HEX64
+class ActivationEnvelope(WireActivationEnvelope):
+    """Activation claims plus the Task-3 impact-plan constructor."""
 
     @classmethod
     def from_plan(
@@ -94,28 +70,38 @@ def sign_activation(
     envelope: ActivationEnvelope,
     private_key: Ed25519PrivateKey,
     *,
-    base_bundle: PolicyBundleV1,
+    base_bundle: PolicyBundleV1 | None,
     target_bundle: PolicyBundleV1,
 ) -> SignedActivation:
     """Validate exact key lifecycle and return a canonical detached signature."""
     envelope = ActivationEnvelope.model_validate(envelope.model_dump(mode="python"))
-    base_bundle = PolicyBundleV1.model_validate(base_bundle.model_dump(mode="python"))
     target_bundle = PolicyBundleV1.model_validate(target_bundle.model_dump(mode="python"))
-    validate_key_record_set_delta(
-        base_bundle.keys,
-        target_bundle.keys,
-        policy_reassignments=exact_policy_reassignments(
+    if base_bundle is None:
+        if (
+            envelope.base_generation != 0
+            or envelope.base_bundle_hash != GENESIS_BASE_BUNDLE_HASH
+        ):
+            raise ValueError("genesis activation requires an explicit absent base")
+    else:
+        base_bundle = PolicyBundleV1.model_validate(base_bundle.model_dump(mode="python"))
+        validate_key_record_set_delta(
             base_bundle.keys,
             target_bundle.keys,
-        ),
-    )
+            policy_reassignments=exact_policy_reassignments(
+                base_bundle.keys,
+                target_bundle.keys,
+            ),
+        )
+        if (
+            envelope.base_generation != base_bundle.generation
+            or envelope.base_bundle_hash != bundle_hash(canonical_bundle_bytes(base_bundle))
+        ):
+            raise ValueError("activation envelope does not match exact base bundle")
     if (
-        envelope.base_generation != base_bundle.generation
-        or envelope.base_bundle_hash != bundle_hash(canonical_bundle_bytes(base_bundle))
-        or envelope.target_generation != target_bundle.generation
+        envelope.target_generation != target_bundle.generation
         or envelope.target_content_hash != bundle_hash(canonical_bundle_bytes(target_bundle))
     ):
-        raise ValueError("activation envelope does not match exact base and target bundles")
+        raise ValueError("activation envelope does not match exact target bundle")
     payload = canonical_json_bytes(envelope.model_dump(mode="json"))
     return SignedActivation(
         payload=payload,

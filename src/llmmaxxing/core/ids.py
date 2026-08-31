@@ -133,6 +133,27 @@ class InstallationId(_UuidId):
     _prefix = "inst_"
 
 
+class CommandId(_UuidId):
+    """Identity of one authenticated Control-to-Gateway command."""
+
+    __slots__ = ()
+    _prefix = "cmd_"
+
+
+class AckId(_UuidId):
+    """Identity of one durable Gateway acknowledgement."""
+
+    __slots__ = ()
+    _prefix = "ack_"
+
+
+class AuthLeaseId(_UuidId):
+    """Identity of one bundle-bound, nonauthorizing status lease."""
+
+    __slots__ = ()
+    _prefix = "al_"
+
+
 class ProbeToken(_UuidId):
     """Unique durable token for one serialized capacity/circuit probe."""
 
