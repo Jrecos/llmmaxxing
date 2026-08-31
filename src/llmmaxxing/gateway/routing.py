@@ -135,7 +135,9 @@ class FailureRule:
     def __post_init__(self) -> None:
         if self.cause is FailureCause.UNKNOWN or self.scope is FailureScope.UNKNOWN:
             raise ValueError("classifier rules must prove a known cause and scope")
-        if not self.status_codes or any(status < 100 or status > 599 for status in self.status_codes):
+        if not self.status_codes or any(
+            status < 100 or status > 599 for status in self.status_codes
+        ):
             raise ValueError("classifier rule requires bounded HTTP statuses")
         if any(not value or len(value) > 160 for value in self.error_codes):
             raise ValueError("classifier error code is empty or oversized")
@@ -428,9 +430,7 @@ class RouteEngine:
             profile.endpoint in capabilities.endpoints
             and profile.modality in capabilities.modalities
             and (
-                profile.input_tokens_max
-                + profile.output_tokens_max
-                + profile.reasoning_tokens_max
+                profile.input_tokens_max + profile.output_tokens_max + profile.reasoning_tokens_max
                 <= capabilities.context_tokens
             )
             and (profile.tools_count == 0 or capabilities.tools)
@@ -486,9 +486,7 @@ class RouteEngine:
             )
         ):
             return False
-        return context.now_ms < context.deadline_at_ms and self._operationally_available(
-            leg, view
-        )
+        return context.now_ms < context.deadline_at_ms and self._operationally_available(leg, view)
 
     def primary_capacity_unavailable(
         self,
@@ -527,8 +525,7 @@ class RouteEngine:
                 CircuitValue.closed(),
             )
             deployment_capacity = (
-                deployment.state is CircuitState.OPEN
-                and deployment.cause is CircuitCause.CAPACITY
+                deployment.state is CircuitState.OPEN and deployment.cause is CircuitCause.CAPACITY
             )
             if not (account_capacity or account_circuit or deployment_capacity):
                 return False
@@ -648,7 +645,11 @@ class CircuitController:
                 return current
             step = min(current.backoff_step + (current.state is CircuitState.HALF_OPEN), 2)
             replacement = self._replacement(current, classification, now_ms=now_ms, step=step)
-            return replacement if runtime.compare_and_swap_account_circuit(current, replacement) else None
+            return (
+                replacement
+                if runtime.compare_and_swap_account_circuit(current, replacement)
+                else None
+            )
         if classification.scope is FailureScope.DEPLOYMENT:
             current = runtime.circuit_value(generation_id)
             if current.state is CircuitState.OPEN:
@@ -673,9 +674,7 @@ class CircuitController:
         account = runtime.account_circuit_value()
         deployment = runtime.circuit_value(generation_id)
         scope = (
-            FailureScope.ACCOUNT
-            if account.state is CircuitState.OPEN
-            else FailureScope.DEPLOYMENT
+            FailureScope.ACCOUNT if account.state is CircuitState.OPEN else FailureScope.DEPLOYMENT
         )
         current = account if scope is FailureScope.ACCOUNT else deployment
         if current.state is not CircuitState.OPEN or now_ms < current.retry_at_ms:
@@ -695,20 +694,14 @@ class CircuitController:
             if scope is FailureScope.ACCOUNT
             else runtime.compare_and_swap_circuit(generation_id, current, replacement)
         )
-        return (
-            CircuitProbe(scope, account_id, generation_id, replacement)
-            if swapped
-            else None
-        )
+        return CircuitProbe(scope, account_id, generation_id, replacement) if swapped else None
 
     def probe_succeeded(self, probe: CircuitProbe) -> bool:
         runtime = self._runtime.account_runtime(probe.account_id)
         replacement = CircuitValue.closed(epoch=probe.value.epoch)
         if probe.scope is FailureScope.ACCOUNT:
             return runtime.compare_and_swap_account_circuit(probe.value, replacement)
-        return runtime.compare_and_swap_circuit(
-            probe.generation_id, probe.value, replacement
-        )
+        return runtime.compare_and_swap_circuit(probe.generation_id, probe.value, replacement)
 
     def probe_failed(
         self,
@@ -717,10 +710,7 @@ class CircuitController:
         *,
         now_ms: int,
     ) -> CircuitValue | None:
-        if (
-            classification.cause is FailureCause.UNKNOWN
-            or classification.scope is not probe.scope
-        ):
+        if classification.cause is FailureCause.UNKNOWN or classification.scope is not probe.scope:
             return None
         runtime = self._runtime.account_runtime(probe.account_id)
         replacement = self._replacement(
@@ -732,8 +722,6 @@ class CircuitController:
         swapped = (
             runtime.compare_and_swap_account_circuit(probe.value, replacement)
             if probe.scope is FailureScope.ACCOUNT
-            else runtime.compare_and_swap_circuit(
-                probe.generation_id, probe.value, replacement
-            )
+            else runtime.compare_and_swap_circuit(probe.generation_id, probe.value, replacement)
         )
         return replacement if swapped else None

@@ -235,9 +235,7 @@ def _effective_key_projection(
             if granted is None:
                 continue
             projected_leg = leg.model_dump(mode="json")
-            projected_leg["triggers"] = [
-                trigger.value for trigger in granted.allowed_triggers
-            ]
+            projected_leg["triggers"] = [trigger.value for trigger in granted.allowed_triggers]
             projected_leg["capabilities"] = granted.capabilities.model_dump(mode="json")
             legs.append(
                 {

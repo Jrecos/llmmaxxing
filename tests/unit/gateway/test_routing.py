@@ -280,7 +280,9 @@ def profile(**updates: object) -> RequestProfile:
     return RequestProfile.model_validate(values)
 
 
-def context(*, emergency: EmergencyActivation | None = None, deadline_at_ms: int | None = None) -> RoutingContext:
+def context(
+    *, emergency: EmergencyActivation | None = None, deadline_at_ms: int | None = None
+) -> RoutingContext:
     return RoutingContext(
         now_ms=NOW,
         deadline_at_ms=deadline_at_ms or NOW + 120_000,
@@ -343,7 +345,9 @@ def test_authorized_leg_intersection_is_exact_and_expansions_never_enter_queue()
                     }
                 ),
                 # Same leg id with a changed deployment identity is not authorization.
-                spill.model_copy(update={"generation_id": DeploymentGenerationId.from_digest("9" * 64)}),
+                spill.model_copy(
+                    update={"generation_id": DeploymentGenerationId.from_digest("9" * 64)}
+                ),
             )
         }
     )
@@ -396,18 +400,25 @@ def test_primary_capacity_failure_and_quota_causes_never_cross_activate(tmp_path
     journal, state = runtime(tmp_path, bundle)
     try:
         view = state.operational_view()
-        assert engine.select(ceiling, profile(), DispatchCause.PRIMARY, view, context()).leg_id == PRIMARY_LEG
+        assert (
+            engine.select(ceiling, profile(), DispatchCause.PRIMARY, view, context()).leg_id
+            == PRIMARY_LEG
+        )
         for cause in (DispatchCause.CAPACITY, DispatchCause.FAILURE, DispatchCause.QUOTA):
             assert engine.select(ceiling, profile(), cause, view, context()).leg_id == SPILL_LEG
 
         full_nan = replace(view.accounts[0], active_attempts=view.accounts[0].parallel_limit)
         full_view = replace(view, accounts=(full_nan, *view.accounts[1:]))
-        assert engine.select(ceiling, profile(), DispatchCause.PRIMARY, full_view, context()) is None
-        assert engine.select(ceiling, profile(), DispatchCause.CAPACITY, full_view, context()).leg_id == SPILL_LEG
+        assert (
+            engine.select(ceiling, profile(), DispatchCause.PRIMARY, full_view, context()) is None
+        )
+        assert (
+            engine.select(ceiling, profile(), DispatchCause.CAPACITY, full_view, context()).leg_id
+            == SPILL_LEG
+        )
         assert engine.primary_capacity_unavailable(ceiling, profile(), full_view)
     finally:
         journal.close()
-
 
 
 def test_shadow_capability_and_trigger_are_never_serving(tmp_path: Path) -> None:
@@ -628,9 +639,7 @@ def test_deployment_probe_cannot_mutate_account_scope(tmp_path: Path) -> None:
     journal, state = runtime(tmp_path, bundle)
     circuits = CircuitController(
         state,
-        probe_factory=lambda: ProbeToken(
-            "probe_bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
-        ),
+        probe_factory=lambda: ProbeToken("probe_bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
     )
     transient = classifier().classify(
         FailureObservation(
@@ -661,7 +670,9 @@ def test_deployment_probe_cannot_mutate_account_scope(tmp_path: Path) -> None:
         journal.close()
 
 
-def test_attempt_budget_is_three_sends_distinct_generation_or_named_probe_and_no_post_byte() -> None:
+def test_attempt_budget_is_three_sends_distinct_generation_or_named_probe_and_no_post_byte() -> (
+    None
+):
     bundle = make_bundle()
     engine = RouteEngine(bundle)
     ceiling = engine.authorize(client(bundle), profile())
@@ -769,9 +780,9 @@ def test_attempt_budget_restores_terminal_sends_from_the_durable_runtime(
                 actual_quota_units=1,
             )
         )
-        assert not AttemptBudget.from_runtime(
-            request_id, state.operational_view()
-        ).can_send(candidate)
+        assert not AttemptBudget.from_runtime(request_id, state.operational_view()).can_send(
+            candidate
+        )
     journal.close()
 
     reopened = AttemptJournal.open(tmp_path, clock=clock)

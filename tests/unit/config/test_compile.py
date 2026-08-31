@@ -250,9 +250,10 @@ def test_labels_are_compile_time_only_and_exact_lists_are_sorted() -> None:
         policy for policy in compiled.policies if policy.policy_id == SELECTED_POLICY_ID
     )
     assert {leg.account_id for leg in selected.authorized_legs} == {NAN_ID, ARLIAI_ID}
-    assert {
-        trigger for leg in selected.authorized_legs for trigger in leg.allowed_triggers
-    } == {RouteTrigger.CAPACITY_SPILL, RouteTrigger.PRIMARY}
+    assert {trigger for leg in selected.authorized_legs for trigger in leg.allowed_triggers} == {
+        RouteTrigger.CAPACITY_SPILL,
+        RouteTrigger.PRIMARY,
+    }
     assert compiled.generation == 8
 
     found.labels[ELECTRON_ID]["billing"] = "unlimited"

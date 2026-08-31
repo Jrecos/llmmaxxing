@@ -425,9 +425,7 @@ class AccountRuntime:
             request_id=_require_str(value["request_id"]),
             attempt_id=_require_str(value["attempt_id"]),
             leg_id=_require_str(value["leg_id"]),
-            deployment_generation_id=_require_str(
-                value["deployment_generation_id"]
-            ),
+            deployment_generation_id=_require_str(value["deployment_generation_id"]),
             circuit_epoch=_require_int(value["circuit_epoch"]),
             account_circuit_epoch=_require_int(value["account_circuit_epoch"]),
             circuit_probe_id=(
@@ -1045,9 +1043,7 @@ class AccountRuntime:
                                 resolved.dispatch.deployment_generation_id
                             ),
                             "circuit_epoch": resolved.dispatch.circuit_epoch,
-                            "account_circuit_epoch": (
-                                resolved.dispatch.account_circuit_epoch
-                            ),
+                            "account_circuit_epoch": (resolved.dispatch.account_circuit_epoch),
                             "circuit_probe_id": resolved.dispatch.circuit_probe_id,
                             "account_circuit_probe_id": (
                                 resolved.dispatch.account_circuit_probe_id

@@ -210,9 +210,7 @@ class AuthorizedLeg(_Frozen):
 
     @field_validator("allowed_triggers")
     @classmethod
-    def _triggers_unique(
-        cls, value: tuple[RouteTrigger, ...]
-    ) -> tuple[RouteTrigger, ...]:
+    def _triggers_unique(cls, value: tuple[RouteTrigger, ...]) -> tuple[RouteTrigger, ...]:
         if len(set(value)) != len(value):
             raise ValueError("duplicate authorized leg trigger")
         return value
@@ -307,18 +305,14 @@ class KeyPolicyRevision(_Frozen):
 
     @field_validator("route_group_ids")
     @classmethod
-    def _route_groups_unique(
-        cls, value: tuple[RouteGroupId, ...]
-    ) -> tuple[RouteGroupId, ...]:
+    def _route_groups_unique(cls, value: tuple[RouteGroupId, ...]) -> tuple[RouteGroupId, ...]:
         if len(set(value)) != len(value):
             raise ValueError("duplicate policy route group")
         return value
 
     @field_validator("authorized_legs")
     @classmethod
-    def _authorized_legs_unique(
-        cls, value: tuple[AuthorizedLeg, ...]
-    ) -> tuple[AuthorizedLeg, ...]:
+    def _authorized_legs_unique(cls, value: tuple[AuthorizedLeg, ...]) -> tuple[AuthorizedLeg, ...]:
         if len({leg.leg_id for leg in value}) != len(value):
             raise ValueError("duplicate policy authorized leg")
         return tuple(sorted(value, key=lambda leg: (leg.order, str(leg.leg_id))))
@@ -429,9 +423,7 @@ class RequestAuthorizationCeiling(_Frozen):
 
     @field_validator("authorized_legs")
     @classmethod
-    def _ceiling_legs_unique(
-        cls, value: tuple[AuthorizedLeg, ...]
-    ) -> tuple[AuthorizedLeg, ...]:
+    def _ceiling_legs_unique(cls, value: tuple[AuthorizedLeg, ...]) -> tuple[AuthorizedLeg, ...]:
         if len({leg.leg_id for leg in value}) != len(value):
             raise ValueError("duplicate authorization ceiling leg")
         return tuple(sorted(value, key=lambda leg: (leg.order, str(leg.leg_id))))
@@ -507,13 +499,9 @@ class PolicyBundleV1(_Frozen):
         groups_by_id = {group.route_group_id: group for group in self.route_groups}
         groups = frozenset(groups_by_id)
         policies = {p.policy_id for p in self.policies}
-        legs_by_id = {
-            leg.leg_id: leg for group in self.route_groups for leg in group.legs
-        }
+        legs_by_id = {leg.leg_id: leg for group in self.route_groups for leg in group.legs}
         leg_groups = {
-            leg.leg_id: group.route_group_id
-            for group in self.route_groups
-            for leg in group.legs
+            leg.leg_id: group.route_group_id for group in self.route_groups for leg in group.legs
         }
 
         for label, seen in (
@@ -558,8 +546,7 @@ class PolicyBundleV1(_Frozen):
             for authorized in pol.authorized_legs:
                 if authorized.account_id not in accounts:
                     raise ValueError(
-                        f"policy {pol.policy_id} grants unknown account "
-                        f"{authorized.account_id}"
+                        f"policy {pol.policy_id} grants unknown account {authorized.account_id}"
                     )
                 actual = legs_by_id.get(authorized.leg_id)
                 if actual is None:

@@ -74,6 +74,7 @@ def _account() -> ProviderAccount:
         state=AccountState.ACTIVE,
     )
 
+
 def _capabilities() -> LegCapabilities:
     return LegCapabilities(
         endpoints=(EndpointKind.CHAT,),
@@ -309,7 +310,6 @@ def test_affected_keys_use_each_policy_effective_authorized_leg_projection() -> 
             max_waiters=4,
             deadline_ms=60_000,
         )
-
 
     def bundle(generation: int, spill_digest: str) -> PolicyBundleV1:
         route = group(spill_digest)

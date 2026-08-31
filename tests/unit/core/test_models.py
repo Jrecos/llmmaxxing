@@ -71,6 +71,7 @@ def account(name: str = "nan", **overrides: object) -> ProviderAccount:
     fields.update(overrides)
     return ProviderAccount.model_validate(fields)
 
+
 def leg_capabilities() -> LegCapabilities:
     return LegCapabilities(
         endpoints=(EndpointKind.CHAT,),
@@ -356,9 +357,7 @@ def test_required_features_schema_and_pydantic_share_closed_unique_vectors():
 def test_policy_must_reference_existing_route_group():
     p = parts()
     existing = p["policies"][0]
-    p["policies"] = (
-        existing.model_copy(update={"route_group_ids": (RouteGroupId.new(),)}),
-    )
+    p["policies"] = (existing.model_copy(update={"route_group_ids": (RouteGroupId.new(),)}),)
     with pytest.raises(ValidationError, match="route_group"):
         bundle(**p)
 
@@ -661,9 +660,7 @@ def test_ceiling_intersection_only_contracts():
     full = ceiling()
     first = full.authorized_legs[0]
     current = ceiling(
-        authorized_legs=(
-            first.model_copy(update={"allowed_triggers": (RouteTrigger.PRIMARY,)}),
-        ),
+        authorized_legs=(first.model_copy(update={"allowed_triggers": (RouteTrigger.PRIMARY,)}),),
         queue_weight=4,
         queue_tier=2,
         max_concurrency=2,

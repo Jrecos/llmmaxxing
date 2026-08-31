@@ -99,11 +99,7 @@ def _materialize_policy(
         inherited_triggers = (
             tuple(
                 sorted(
-                    {
-                        trigger
-                        for leg in source.authorized_legs
-                        for trigger in leg.allowed_triggers
-                    },
+                    {trigger for leg in source.authorized_legs for trigger in leg.allowed_triggers},
                     key=lambda trigger: trigger.value,
                 )
             )
@@ -124,9 +120,7 @@ def _materialize_policy(
                 None,
             )
             if account is None:
-                raise ValueError(
-                    f"policy {spec.policy_id} grants unknown account {account_id}"
-                )
+                raise ValueError(f"policy {spec.policy_id} grants unknown account {account_id}")
             state = account.state
             if state is not AccountState.ACTIVE:
                 raise ValueError(
@@ -139,9 +133,7 @@ def _materialize_policy(
             if group is None:
                 raise ValueError(f"policy {spec.policy_id} grants unknown route group {group_id}")
             for leg in group.legs:
-                triggers = tuple(
-                    trigger for trigger in leg.triggers if trigger in allowed_triggers
-                )
+                triggers = tuple(trigger for trigger in leg.triggers if trigger in allowed_triggers)
                 if leg.account_id in allowed_accounts and triggers:
                     projected.append(
                         AuthorizedLeg(
@@ -180,9 +172,7 @@ def _validate_runtime_routes(
     accounts = {account.account_id: account for account in base.accounts}
     groups = {group.route_group_id: group for group in base.route_groups}
     leg_groups = {
-        leg.leg_id: group.route_group_id
-        for group in base.route_groups
-        for leg in group.legs
+        leg.leg_id: group.route_group_id for group in base.route_groups for leg in group.legs
     }
 
     for authorized in policy.authorized_legs:

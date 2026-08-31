@@ -53,6 +53,7 @@ class RouteStrategy(_Closed):
 
     ORDERED_CAPACITY = "ordered_capacity"
 
+
 @final
 class EndpointKind(_Closed):
     """Certified V1 inference endpoints; unsupported paths never coerce."""

@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-
 from contextlib import asynccontextmanager
-from dataclasses import replace
 
 import pytest
 
@@ -247,10 +245,7 @@ def test_snapshot_restore_replays_the_same_grant_order_and_caps_deficits() -> No
     assert [grant(queue).request_id for _ in range(40)] == [
         grant(restored).request_id for _ in range(40)
     ]
-    assert all(
-        deficit <= 8 * quantum
-        for deficit, quantum in restored.deficits_with_quanta()
-    )
+    assert all(deficit <= 8 * quantum for deficit, quantum in restored.deficits_with_quanta())
 
 
 def test_scarce_waiters_protect_their_only_account_from_flexible_work() -> None:
@@ -409,7 +404,7 @@ def test_admission_controller_requires_gate_and_persists_dispatched_inside_it() 
 
         async def try_reserve_async(self, reservation: object) -> ReservationGranted:
             assert inside_gate
-            assert getattr(reservation, "leg_id") == authorized_leg.leg_id
+            assert reservation.leg_id == authorized_leg.leg_id
             events.append("task6-reserve")
             return ReservationGranted(DurableLease())  # type: ignore[arg-type]
 

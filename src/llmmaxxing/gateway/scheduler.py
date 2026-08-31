@@ -114,7 +114,9 @@ class WDRRQueue:
 
     @property
     def entries(self) -> tuple[QueueEntry, ...]:
-        return tuple(item.entry for item in sorted(self._queued.values(), key=lambda item: item.sequence))
+        return tuple(
+            item.entry for item in sorted(self._queued.values(), key=lambda item: item.sequence)
+        )
 
     @property
     def fairness_state(self) -> FairnessState:
@@ -189,10 +191,7 @@ class WDRRQueue:
                 (tier, scarcity, key_id): value
                 for tier, scarcity, key_id, value in state.key_deficits
             },
-            {
-                (tier, scarcity): key_id
-                for tier, scarcity, key_id in state.key_cursors
-            },
+            {(tier, scarcity): key_id for tier, scarcity, key_id in state.key_cursors},
         )
 
     @staticmethod
@@ -247,11 +246,7 @@ class WDRRQueue:
         tiers = sorted({item.entry.tier for item in available})
         top_tier = tiers[0]
         lower = [item for item in available if item.entry.tier > top_tier]
-        if (
-            lower
-            and self._fairness.higher_grant_streak
-            >= self.max_consecutive_higher_grants
-        ):
+        if lower and self._fairness.higher_grant_streak >= self.max_consecutive_higher_grants:
             tier = self._oldest(lower).entry.tier
         else:
             tier = top_tier
@@ -265,9 +260,7 @@ class WDRRQueue:
         for _ in range(2):
             if scarcity in active_classes:
                 break
-            scarcity = (
-                Scarcity.FLEXIBLE if scarcity is Scarcity.SCARCE else Scarcity.SCARCE
-            )
+            scarcity = Scarcity.FLEXIBLE if scarcity is Scarcity.SCARCE else Scarcity.SCARCE
         quantum = 2 if scarcity is Scarcity.SCARCE else 1
         class_key = (tier, scarcity)
         class_deficit = class_deficits.get(class_key, 0)
@@ -291,27 +284,17 @@ class WDRRQueue:
         key_deficit = key_deficits.get(key_key, 0)
         if key_deficit <= 0:
             key_deficit = min(key_deficit + key_quantum, 8 * key_quantum)
-        selected = self._oldest(
-            [item for item in class_items if item.entry.key_id == key_id]
-        )
+        selected = self._oldest([item for item in class_items if item.entry.key_id == key_id])
 
         class_deficit -= 1
         key_deficit -= 1
         class_deficits[class_key] = class_deficit
         key_deficits[key_key] = key_deficit
-        other_class = (
-            Scarcity.FLEXIBLE if scarcity is Scarcity.SCARCE else Scarcity.SCARCE
-        )
+        other_class = Scarcity.FLEXIBLE if scarcity is Scarcity.SCARCE else Scarcity.SCARCE
         class_cursors[tier] = other_class if class_deficit == 0 else scarcity
         key_index = keys.index(key_id)
-        key_cursors[class_key] = (
-            keys[(key_index + 1) % len(keys)] if key_deficit == 0 else key_id
-        )
-        streak = (
-            self._fairness.higher_grant_streak + 1
-            if lower and tier == top_tier
-            else 0
-        )
+        key_cursors[class_key] = keys[(key_index + 1) % len(keys)] if key_deficit == 0 else key_id
+        streak = self._fairness.higher_grant_streak + 1 if lower and tier == top_tier else 0
         return QueueSelection(
             entry=selected.entry,
             queue_version=self._version,
@@ -350,9 +333,7 @@ class WDRRQueue:
             (item.entry.tier, item.entry.scarcity, item.entry.key_id): item.entry.weight
             for item in self._queued.values()
         }
-        values.extend(
-            (value, weights.get(key, 64)) for key, value in key_deficits.items()
-        )
+        values.extend((value, weights.get(key, 64)) for key, value in key_deficits.items())
         return tuple(values)
 
     def protected_scarce_accounts(
@@ -388,9 +369,7 @@ class WDRRQueue:
 
     @classmethod
     def restore(cls, snapshot: QueueSnapshot) -> Self:
-        queue = cls(
-            max_consecutive_higher_grants=snapshot.max_consecutive_higher_grants
-        )
+        queue = cls(max_consecutive_higher_grants=snapshot.max_consecutive_higher_grants)
         if len({item.entry.request_id for item in snapshot.queued}) != len(snapshot.queued):
             raise ValueError("scheduler snapshot has duplicate requests")
         queue._queued = {item.entry.request_id: item for item in snapshot.queued}
@@ -594,9 +573,7 @@ class AdmissionController:
         )
         if key_waiters >= request.authorization_ceiling.max_waiters:
             raise AdmissionUnavailable("key waiter bound reached")
-        future: asyncio.Future[DispatchLease] = (
-            asyncio.get_running_loop().create_future()
-        )
+        future: asyncio.Future[DispatchLease] = asyncio.get_running_loop().create_future()
         waiter = _Waiter(request, future, request.cause)
         self._waiters[request.request_id] = waiter
         self._queue.enqueue(
@@ -646,8 +623,16 @@ class AdmissionController:
             excluded: set[RequestId] = set()
             while self._waiters:
                 previews = self._previews()
+                eligible_request_ids = frozenset(previews)
+
+                def eligible(
+                    entry: QueueEntry,
+                    request_ids: frozenset[RequestId] = eligible_request_ids,
+                ) -> bool:
+                    return entry.request_id in request_ids
+
                 selection = self._queue.propose(
-                    lambda entry: entry.request_id in previews,
+                    eligible,
                     excluded=frozenset(excluded),
                 )
                 if selection is None:
@@ -669,9 +654,7 @@ class AdmissionController:
                     excluded.add(selection.entry.request_id)
                     continue
 
-                async with self._activation_gate.hold_dispatch(
-                    waiter.request.request_id
-                ):
+                async with self._activation_gate.hold_dispatch(waiter.request.request_id):
                     try:
                         authorization = self._current_authorization(waiter.request)
                     except ValueError:
@@ -713,9 +696,7 @@ class AdmissionController:
                         input_tokens_upper_bound=waiter.request.profile.input_tokens_max,
                         max_output_tokens=waiter.request.profile.output_tokens_max,
                         max_reasoning_tokens=waiter.request.profile.reasoning_tokens_max,
-                        quota_units=self._route_engine.quota_units(
-                            candidate.account_id
-                        ),
+                        quota_units=self._route_engine.quota_units(candidate.account_id),
                         account_circuit=candidate.account_circuit,
                         circuit=candidate.deployment_circuit,
                     )
