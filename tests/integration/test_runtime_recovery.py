@@ -18,9 +18,10 @@ from llmmaxxing.core.ids import (
     InstallationId,
     RequestId,
     RouteGroupId,
+    RouteLegId,
 )
 from llmmaxxing.core.models import ProviderAccount, QuotaDimension, RequestProfile
-from llmmaxxing.core.reasons import Modality, TerminalOutcome
+from llmmaxxing.core.reasons import EndpointKind, Modality, TerminalOutcome
 from llmmaxxing.core.state_machines import AccountState
 from llmmaxxing.gateway.journal import (
     AttemptJournal,
@@ -96,12 +97,14 @@ def request(
     request_profile = RequestProfile(
         route_group_id=RouteGroupId.new(),
         model_alias="deepseek-v4-flash",
+        endpoint=EndpointKind.CHAT,
         modality=Modality.CHAT,
         stream=False,
         input_tokens_max=tokens,
         output_tokens_max=0,
         reasoning_tokens_max=0,
         tools_count=0,
+        forced_tool_required=False,
         response_schema_present=False,
         history_turns=0,
         deadline_ms=60_000,
@@ -110,6 +113,7 @@ def request(
         request_id=RequestId.new(),
         attempt_id=AttemptId.new(),
         account_id=provider_account.account_id,
+        leg_id=RouteLegId.new(),
         deployment_generation_id=DeploymentGenerationId.from_digest("b" * 64),
         runtime_identity=RuntimeIdentity(
             installation_id=InstallationId.new(),
@@ -657,6 +661,7 @@ def test_writer_failure_rejects_every_queued_waiter(tmp_path: Path) -> None:
             request_id=str(RequestId.new()),
             attempt_id=str(attempt),
             account_id=str(AccountId.new()),
+            leg_id=str(RouteLegId.new()),
             deployment_generation_id=str(DeploymentGenerationId.from_digest("d" * 64)),
             installation_id=str(InstallationId.new()),
             bundle_generation=1,
@@ -670,6 +675,7 @@ def test_writer_failure_rejects_every_queued_waiter(tmp_path: Path) -> None:
             quota_units=1,
             monthly_reset_at_ms=2_000_000_000_000,
             circuit_epoch=0,
+            account_circuit_epoch=0,
             circuit_probe_id=None,
             account_circuit_probe_id=None,
         )

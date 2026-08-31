@@ -14,9 +14,11 @@ from llmmaxxing.core.ids import (
     RouteLegId,
 )
 from llmmaxxing.core.models import (
+    AuthorizedLeg,
     ClientCredentialVerifier,
     ClientKeyRecord,
     KeyPolicyRevision,
+    LegCapabilities,
     PolicyBundleV1,
     ProviderAccount,
     QuotaDimension,
@@ -27,6 +29,7 @@ from llmmaxxing.core.models import (
 )
 from llmmaxxing.core.reasons import (
     V1_FEATURES,
+    EndpointKind,
     Modality,
     QuotaDimensionStatus,
     RouteStrategy,
@@ -68,6 +71,17 @@ def account(name: str = "nan", **overrides: object) -> ProviderAccount:
     fields.update(overrides)
     return ProviderAccount.model_validate(fields)
 
+def leg_capabilities() -> LegCapabilities:
+    return LegCapabilities(
+        endpoints=(EndpointKind.CHAT,),
+        modalities=(Modality.TEXT,),
+        context_tokens=32_768,
+        tools=True,
+        forced_tool=True,
+        response_schema=True,
+        shadow=False,
+    )
+
 
 def leg(
     account_id: AccountId,
@@ -81,6 +95,7 @@ def leg(
         triggers=triggers,
         account_id=account_id,
         generation_id=DeploymentGenerationId.from_digest("a" * 64),
+        capabilities=leg_capabilities(),
     )
 
 
@@ -100,19 +115,36 @@ def route_group(
 
 
 def policy(
-    route_group_ids: tuple[RouteGroupId, ...],
+    route_groups: tuple[RouteGroupRevision, ...],
     account_ids: tuple[AccountId, ...],
     *,
     policy_id: PolicyRevisionId | None = None,
     name: str = "default",
     triggers: tuple[RouteTrigger, ...] = (RouteTrigger.PRIMARY, RouteTrigger.CAPACITY_SPILL),
 ) -> KeyPolicyRevision:
+    allowed_accounts = frozenset(account_ids)
+    allowed_triggers = frozenset(triggers)
+    authorized_legs = tuple(
+        AuthorizedLeg(
+            leg_id=route_leg.leg_id,
+            account_id=route_leg.account_id,
+            generation_id=route_leg.generation_id,
+            order=route_leg.order,
+            allowed_triggers=tuple(
+                trigger for trigger in route_leg.triggers if trigger in allowed_triggers
+            ),
+            capabilities=route_leg.capabilities,
+        )
+        for group in route_groups
+        for route_leg in group.legs
+        if route_leg.account_id in allowed_accounts
+        and any(trigger in allowed_triggers for trigger in route_leg.triggers)
+    )
     return KeyPolicyRevision(
         policy_id=policy_id or PolicyRevisionId.new(),
         name=name,
-        route_group_ids=route_group_ids,
-        allowed_account_ids=account_ids,
-        allowed_triggers=triggers,
+        route_group_ids=tuple(group.route_group_id for group in route_groups),
+        authorized_legs=authorized_legs,
         queue_tier=1,
         queue_weight=8,
         max_concurrency=4,
@@ -161,7 +193,7 @@ def parts() -> dict[str, object]:
             leg(spill.account_id, 20, (RouteTrigger.CAPACITY_SPILL,)),
         )
     )
-    pol = policy((group.route_group_id,), (primary.account_id, spill.account_id))
+    pol = policy((group,), (primary.account_id, spill.account_id))
     return {
         "accounts": (primary, spill),
         "route_groups": (group,),
@@ -187,12 +219,14 @@ def profile_fields() -> dict[str, object]:
     return {
         "route_group_id": RouteGroupId.new(),
         "model_alias": "dsv4",
+        "endpoint": "chat",
         "modality": "chat",
         "stream": True,
         "input_tokens_max": 4096,
         "output_tokens_max": 8192,
         "reasoning_tokens_max": 0,
         "tools_count": 2,
+        "forced_tool_required": False,
         "response_schema_present": False,
         "history_turns": 12,
         "deadline_ms": 60_000,
@@ -321,21 +355,28 @@ def test_required_features_schema_and_pydantic_share_closed_unique_vectors():
 
 def test_policy_must_reference_existing_route_group():
     p = parts()
-    p["policies"] = (policy((RouteGroupId.new(),), tuple(a.account_id for a in p["accounts"])),)
+    existing = p["policies"][0]
+    p["policies"] = (
+        existing.model_copy(update={"route_group_ids": (RouteGroupId.new(),)}),
+    )
     with pytest.raises(ValidationError, match="route_group"):
         bundle(**p)
 
 
 def test_policy_cannot_grant_unknown_account():
     p = parts()
-    b = bundle(**p)
+    existing = p["policies"][0]
+    first = existing.authorized_legs[0]
     p["policies"] = (
-        policy(
-            tuple(g.route_group_id for g in b.route_groups),
-            tuple(a.account_id for a in b.accounts) + (AccountId.new(),),
+        existing.model_copy(
+            update={
+                "authorized_legs": (
+                    first.model_copy(update={"account_id": AccountId.new()}),
+                    *existing.authorized_legs[1:],
+                )
+            }
         ),
     )
-    p["keys"] = (key_record(b.policies[0].policy_id),)
     with pytest.raises(ValidationError, match="account"):
         bundle(**p)
 
@@ -411,7 +452,7 @@ def test_empty_binding_triples_do_not_collide():
             leg(second.account_id, 20, (RouteTrigger.CAPACITY_SPILL,)),
         )
     )
-    pol = policy((group.route_group_id,), (first.account_id, second.account_id))
+    pol = policy((group,), (first.account_id, second.account_id))
 
     result = bundle(
         accounts=(first, second),
@@ -491,12 +532,15 @@ def test_unknown_required_feature_is_rejected():
 
 def test_duplicate_policy_triggers_are_rejected():
     p = parts()
+    granted = p["policies"][0].authorized_legs[0]
     with pytest.raises(ValidationError, match="duplicate"):
-        policy(
-            p["policies"][0].route_group_ids,
-            p["policies"][0].allowed_account_ids,
-            policy_id=p["policies"][0].policy_id,
-            triggers=(RouteTrigger.PRIMARY, RouteTrigger.PRIMARY),
+        AuthorizedLeg(
+            leg_id=granted.leg_id,
+            account_id=granted.account_id,
+            generation_id=granted.generation_id,
+            order=granted.order,
+            allowed_triggers=(RouteTrigger.PRIMARY, RouteTrigger.PRIMARY),
+            capabilities=granted.capabilities,
         )
 
 
@@ -602,9 +646,7 @@ def ceiling(**overrides: object) -> RequestAuthorizationCeiling:
         "bundle_generation": b.generation,
         "bundle_hash": BundleHash.from_digest("d" * 64),
         "route_group_id": b.route_groups[0].route_group_id,
-        "allowed_account_ids": tuple(a.account_id for a in b.accounts),
-        "allowed_triggers": (RouteTrigger.PRIMARY, RouteTrigger.CAPACITY_SPILL),
-        "leg_ids": tuple(lg.leg_id for lg in b.route_groups[0].legs),
+        "authorized_legs": b.policies[0].authorized_legs,
         "queue_tier": 0,
         "queue_weight": 8,
         "max_concurrency": 4,
@@ -617,10 +659,11 @@ def ceiling(**overrides: object) -> RequestAuthorizationCeiling:
 
 def test_ceiling_intersection_only_contracts():
     full = ceiling()
+    first = full.authorized_legs[0]
     current = ceiling(
-        allowed_account_ids=(full.allowed_account_ids[0],),
-        leg_ids=(full.leg_ids[0],),
-        allowed_triggers=(RouteTrigger.PRIMARY,),
+        authorized_legs=(
+            first.model_copy(update={"allowed_triggers": (RouteTrigger.PRIMARY,)}),
+        ),
         queue_weight=4,
         queue_tier=2,
         max_concurrency=2,
@@ -628,9 +671,8 @@ def test_ceiling_intersection_only_contracts():
         deadline_ms=60_000,
     )
     merged = full.intersection(current)
-    assert merged.allowed_account_ids == (full.allowed_account_ids[0],)
-    assert merged.leg_ids == (full.leg_ids[0],)
-    assert merged.allowed_triggers == (RouteTrigger.PRIMARY,)
+    assert tuple(leg.leg_id for leg in merged.authorized_legs) == (first.leg_id,)
+    assert merged.authorized_legs[0].allowed_triggers == (RouteTrigger.PRIMARY,)
     assert merged.queue_weight == 4
     assert full.queue_tier == 0
     assert merged.queue_tier == 2  # higher numeric tier is worse and cannot improve
@@ -652,12 +694,13 @@ def test_ceiling_intersection_rejects_foreign_identity():
 
 def test_ceiling_can_contract_to_empty_sets():
     full = ceiling()
-    foreign = ceiling(
-        allowed_account_ids=(AccountId.new(),),
-        leg_ids=(RouteLegId.new(),),
-        allowed_triggers=(RouteTrigger.QUOTA_FALLBACK,),
+    foreign_leg = full.authorized_legs[0].model_copy(
+        update={
+            "leg_id": RouteLegId.new(),
+            "account_id": AccountId.new(),
+            "generation_id": DeploymentGenerationId.from_digest("f" * 64),
+            "allowed_triggers": (RouteTrigger.QUOTA_FALLBACK,),
+        }
     )
-    merged = full.intersection(foreign)
-    assert merged.allowed_account_ids == ()
-    assert merged.leg_ids == ()
-    assert merged.allowed_triggers == ()
+    merged = full.intersection(ceiling(authorized_legs=(foreign_leg,)))
+    assert merged.authorized_legs == ()

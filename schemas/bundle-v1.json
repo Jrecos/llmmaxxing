@@ -11,6 +11,53 @@
       "title": "AccountState",
       "type": "string"
     },
+    "AuthorizedLeg": {
+      "additionalProperties": false,
+      "description": "Exact per-leg authority; parallel ID/trigger lists cannot drift apart.",
+      "properties": {
+        "account_id": {
+          "pattern": "^acc_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+          "title": "AccountId",
+          "type": "string"
+        },
+        "allowed_triggers": {
+          "items": {
+            "$ref": "#/$defs/RouteTrigger"
+          },
+          "minItems": 1,
+          "title": "Allowed Triggers",
+          "type": "array"
+        },
+        "capabilities": {
+          "$ref": "#/$defs/LegCapabilities"
+        },
+        "generation_id": {
+          "pattern": "^dg1_[0-9a-f]{64}$",
+          "title": "DeploymentGenerationId",
+          "type": "string"
+        },
+        "leg_id": {
+          "pattern": "^leg_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+          "title": "RouteLegId",
+          "type": "string"
+        },
+        "order": {
+          "minimum": 1,
+          "title": "Order",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "leg_id",
+        "account_id",
+        "generation_id",
+        "order",
+        "allowed_triggers",
+        "capabilities"
+      ],
+      "title": "AuthorizedLeg",
+      "type": "object"
+    },
     "ClientCredentialVerifier": {
       "additionalProperties": false,
       "description": "One immutable verifier generation; plaintext key material never enters bundles.",
@@ -126,6 +173,20 @@
       "title": "CredentialVerifierStatus",
       "type": "string"
     },
+    "EndpointKind": {
+      "description": "Certified V1 inference endpoints; unsupported paths never coerce.",
+      "enum": [
+        "chat",
+        "text",
+        "embeddings",
+        "rerank",
+        "audio_speech",
+        "audio_transcription",
+        "image"
+      ],
+      "title": "EndpointKind",
+      "type": "string"
+    },
     "KeyLifecycleState": {
       "description": "Client-key lifecycle: DRAFT → ENABLED ↔ SUSPENDED → REVOKED.",
       "enum": [
@@ -141,22 +202,12 @@
       "additionalProperties": false,
       "description": "One complete immutable policy revision bound to client keys.",
       "properties": {
-        "allowed_account_ids": {
+        "authorized_legs": {
           "items": {
-            "pattern": "^acc_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
-            "title": "AccountId",
-            "type": "string"
+            "$ref": "#/$defs/AuthorizedLeg"
           },
           "minItems": 1,
-          "title": "Allowed Account Ids",
-          "type": "array"
-        },
-        "allowed_triggers": {
-          "items": {
-            "$ref": "#/$defs/RouteTrigger"
-          },
-          "minItems": 1,
-          "title": "Allowed Triggers",
+          "title": "Authorized Legs",
           "type": "array"
         },
         "deadline_ms": {
@@ -212,8 +263,7 @@
         "policy_id",
         "name",
         "route_group_ids",
-        "allowed_account_ids",
-        "allowed_triggers",
+        "authorized_legs",
         "queue_tier",
         "queue_weight",
         "max_concurrency",
@@ -222,6 +272,77 @@
       ],
       "title": "KeyPolicyRevision",
       "type": "object"
+    },
+    "LegCapabilities": {
+      "additionalProperties": false,
+      "description": "Closed serving shape copied into every immutable authorization ceiling.",
+      "properties": {
+        "context_tokens": {
+          "exclusiveMinimum": 0,
+          "title": "Context Tokens",
+          "type": "integer"
+        },
+        "endpoints": {
+          "items": {
+            "$ref": "#/$defs/EndpointKind"
+          },
+          "minItems": 1,
+          "title": "Endpoints",
+          "type": "array"
+        },
+        "forced_tool": {
+          "title": "Forced Tool",
+          "type": "boolean"
+        },
+        "modalities": {
+          "items": {
+            "$ref": "#/$defs/Modality"
+          },
+          "minItems": 1,
+          "title": "Modalities",
+          "type": "array"
+        },
+        "response_schema": {
+          "title": "Response Schema",
+          "type": "boolean"
+        },
+        "shadow": {
+          "title": "Shadow",
+          "type": "boolean"
+        },
+        "tools": {
+          "title": "Tools",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "endpoints",
+        "modalities",
+        "context_tokens",
+        "tools",
+        "forced_tool",
+        "response_schema",
+        "shadow"
+      ],
+      "title": "LegCapabilities",
+      "type": "object"
+    },
+    "Modality": {
+      "description": "Request modality accepted by the V1 profiler.",
+      "enum": [
+        "chat",
+        "text",
+        "responses",
+        "messages",
+        "embedding",
+        "rerank",
+        "audio_speech",
+        "audio_transcription",
+        "audio_translation",
+        "image"
+      ],
+      "title": "Modality",
+      "type": "string"
     },
     "ProviderAccount": {
       "additionalProperties": false,
@@ -452,6 +573,9 @@
           "title": "AccountId",
           "type": "string"
         },
+        "capabilities": {
+          "$ref": "#/$defs/LegCapabilities"
+        },
         "generation_id": {
           "pattern": "^dg1_[0-9a-f]{64}$",
           "title": "DeploymentGenerationId",
@@ -481,7 +605,8 @@
         "order",
         "triggers",
         "account_id",
-        "generation_id"
+        "generation_id",
+        "capabilities"
       ],
       "title": "RouteLeg",
       "type": "object"

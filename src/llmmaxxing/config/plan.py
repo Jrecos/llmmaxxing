@@ -225,24 +225,24 @@ def _effective_key_projection(
     groups = {group.route_group_id: group for group in bundle.route_groups}
     accounts = {account.account_id: account for account in bundle.accounts}
     policy = policies[key.policy_id]
-    allowed_accounts = frozenset(policy.allowed_account_ids)
-    allowed_triggers = frozenset(policy.allowed_triggers)
+    authorized = {leg.leg_id: leg for leg in policy.authorized_legs}
     effective_groups = []
     for group_id in policy.route_group_ids:
         group = groups[group_id]
         legs = []
         for leg in group.legs:
-            projected_triggers = tuple(
-                trigger for trigger in leg.triggers if trigger in allowed_triggers
-            )
-            if leg.account_id not in allowed_accounts or not projected_triggers:
+            granted = authorized.get(leg.leg_id)
+            if granted is None:
                 continue
             projected_leg = leg.model_dump(mode="json")
-            projected_leg["triggers"] = [trigger.value for trigger in projected_triggers]
+            projected_leg["triggers"] = [
+                trigger.value for trigger in granted.allowed_triggers
+            ]
+            projected_leg["capabilities"] = granted.capabilities.model_dump(mode="json")
             legs.append(
                 {
                     "leg": projected_leg,
-                    "account": accounts[leg.account_id].model_dump(mode="json"),
+                    "account": accounts[granted.account_id].model_dump(mode="json"),
                 }
             )
         effective_groups.append(

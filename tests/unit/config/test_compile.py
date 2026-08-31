@@ -23,16 +23,24 @@ from llmmaxxing.core.ids import (
     RouteLegId,
 )
 from llmmaxxing.core.models import (
+    AuthorizedLeg,
     ClientCredentialVerifier,
     ClientKeyRecord,
     KeyPolicyRevision,
+    LegCapabilities,
     PolicyBundleV1,
     ProviderAccount,
     QuotaDimension,
     RouteGroupRevision,
     RouteLeg,
 )
-from llmmaxxing.core.reasons import QuotaDimensionStatus, RouteStrategy, RouteTrigger
+from llmmaxxing.core.reasons import (
+    EndpointKind,
+    Modality,
+    QuotaDimensionStatus,
+    RouteStrategy,
+    RouteTrigger,
+)
 from llmmaxxing.core.state_machines import (
     AccountState,
     CredentialVerifierStatus,
@@ -90,16 +98,36 @@ def _leg(
         triggers=triggers,
         account_id=account_id,
         generation_id=DeploymentGenerationId.from_digest(f"{order // 10}" * 64),
+        capabilities=LegCapabilities(
+            endpoints=(EndpointKind.CHAT,),
+            modalities=(Modality.TEXT,),
+            context_tokens=32_768,
+            tools=True,
+            forced_tool=True,
+            response_schema=True,
+            shadow=False,
+        ),
     )
 
 
-def _policy(policy_id: PolicyRevisionId = BASE_POLICY_ID) -> KeyPolicyRevision:
+def _policy(
+    group: RouteGroupRevision, policy_id: PolicyRevisionId = BASE_POLICY_ID
+) -> KeyPolicyRevision:
     return KeyPolicyRevision(
         policy_id=policy_id,
         name="base",
-        route_group_ids=(GROUP_ID,),
-        allowed_account_ids=(NAN_ID, ARLIAI_ID),
-        allowed_triggers=(RouteTrigger.PRIMARY, RouteTrigger.CAPACITY_SPILL),
+        route_group_ids=(group.route_group_id,),
+        authorized_legs=tuple(
+            AuthorizedLeg(
+                leg_id=leg.leg_id,
+                account_id=leg.account_id,
+                generation_id=leg.generation_id,
+                order=leg.order,
+                allowed_triggers=leg.triggers,
+                capabilities=leg.capabilities,
+            )
+            for leg in group.legs
+        ),
         queue_tier=10,
         queue_weight=4,
         max_concurrency=4,
@@ -172,7 +200,7 @@ def base_bundle() -> PolicyBundleV1:
         min_reader="1.0",
         required_features=("ordered_capacity", "weighted_fair_queue"),
         keys=(_key(KEY_A), _key(KEY_B)),
-        policies=(_policy(),),
+        policies=(_policy(pooled),),
         accounts=(nan, arli, electron),
         route_groups=(pooled, electron_only),
         backend_manifest_hash="e" * 64,
@@ -221,13 +249,15 @@ def test_labels_are_compile_time_only_and_exact_lists_are_sorted() -> None:
     selected = next(
         policy for policy in compiled.policies if policy.policy_id == SELECTED_POLICY_ID
     )
-    assert selected.allowed_account_ids == (NAN_ID, ARLIAI_ID)
-    assert selected.allowed_triggers == (RouteTrigger.CAPACITY_SPILL, RouteTrigger.PRIMARY)
+    assert {leg.account_id for leg in selected.authorized_legs} == {NAN_ID, ARLIAI_ID}
+    assert {
+        trigger for leg in selected.authorized_legs for trigger in leg.allowed_triggers
+    } == {RouteTrigger.CAPACITY_SPILL, RouteTrigger.PRIMARY}
     assert compiled.generation == 8
 
     found.labels[ELECTRON_ID]["billing"] = "unlimited"
     found.labels[ELECTRON_ID]["trust"] = "approved"
-    assert selected.allowed_account_ids == (NAN_ID, ARLIAI_ID)
+    assert {leg.account_id for leg in selected.authorized_legs} == {NAN_ID, ARLIAI_ID}
     runtime_json = compiled.model_dump_json()
     assert "selector" not in runtime_json
     assert "labels" not in runtime_json
@@ -237,7 +267,7 @@ def test_labels_are_compile_time_only_and_exact_lists_are_sorted() -> None:
     exact = next(
         policy for policy in explicit_bundle.policies if policy.policy_id == SELECTED_POLICY_ID
     )
-    assert exact.allowed_account_ids == (NAN_ID, ARLIAI_ID)
+    assert {leg.account_id for leg in exact.authorized_legs} == {NAN_ID, ARLIAI_ID}
 
 
 def test_shared_rebind_is_exact_clone_copies_no_keys_and_macro_expands() -> None:
@@ -273,7 +303,7 @@ def test_shared_rebind_is_exact_clone_copies_no_keys_and_macro_expands() -> None
     assert not any(key.policy_id == CLONE_POLICY_ID for key in compiled.keys)
     clone = next(policy for policy in compiled.policies if policy.policy_id == CLONE_POLICY_ID)
     assert (clone.queue_tier, clone.queue_weight, clone.deadline_ms) == (3, 8, 90_000)
-    assert clone.allowed_account_ids == (NAN_ID, ARLIAI_ID)
+    assert {leg.account_id for leg in clone.authorized_legs} == {NAN_ID, ARLIAI_ID}
 
 
 @pytest.mark.parametrize(

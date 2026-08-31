@@ -17,12 +17,22 @@ from llmmaxxing.control.keys import (
     suspend_key,
     validate_key_record_delta,
 )
-from llmmaxxing.core.ids import BundleHash, PolicyRevisionId, RouteGroupId
+from llmmaxxing.core.ids import (
+    AccountId,
+    BundleHash,
+    DeploymentGenerationId,
+    PolicyRevisionId,
+    RouteGroupId,
+    RouteLegId,
+)
 from llmmaxxing.core.models import (
+    AuthorizedLeg,
     ClientCredentialVerifier,
     ClientKeyRecord,
     KeyPolicyRevision,
+    LegCapabilities,
 )
+from llmmaxxing.core.reasons import EndpointKind, Modality, RouteTrigger
 from llmmaxxing.core.state_machines import CredentialVerifierStatus, KeyLifecycleState
 from llmmaxxing.gateway.auth import (
     ClientAuthenticationError,
@@ -44,8 +54,24 @@ def policy(policy_id: PolicyRevisionId = POLICY_ID) -> KeyPolicyRevision:
         policy_id=policy_id,
         name="client",
         route_group_ids=(RouteGroupId("rg_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),),
-        allowed_account_ids=("acc_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",),
-        allowed_triggers=("primary",),
+        authorized_legs=(
+            AuthorizedLeg(
+                leg_id=RouteLegId("leg_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+                account_id=AccountId("acc_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+                generation_id=DeploymentGenerationId.from_digest("b" * 64),
+                order=1,
+                allowed_triggers=(RouteTrigger.PRIMARY,),
+                capabilities=LegCapabilities(
+                    endpoints=(EndpointKind.CHAT,),
+                    modalities=(Modality.TEXT,),
+                    context_tokens=8192,
+                    tools=True,
+                    forced_tool=True,
+                    response_schema=True,
+                    shadow=False,
+                ),
+            ),
+        ),
         queue_tier=20,
         queue_weight=2,
         max_concurrency=2,

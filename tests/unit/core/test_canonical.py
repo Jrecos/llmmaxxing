@@ -42,15 +42,16 @@ def bundle_fixture(order: str = "forward") -> PolicyBundleV1:
             leg_id=RouteLegId("leg_55555555-5555-4555-9555-555555555555"),
         ),
     )
+    group = route_group(legs, group_id=group_id)
     pol = policy(
-        (group_id,),
+        (group,),
         (primary.account_id, spill.account_id),
         policy_id=PolicyRevisionId("pol_66666666-6666-4666-8666-666666666666"),
     )
     if order == "forward":
         return bundle(
             accounts=(primary, spill),
-            route_groups=(route_group(legs, group_id=group_id),),
+            route_groups=(group,),
             policies=(pol,),
             keys=(key_record(pol.policy_id),),
         )
@@ -146,7 +147,7 @@ def test_semantic_change_changes_hash() -> None:
     base = canonical_bundle_bytes(bundle_fixture())
     acc = account(name="other")
     group = route_group((leg(acc.account_id, 10, (RouteTrigger.PRIMARY,)),))
-    pol = policy((group.route_group_id,), (acc.account_id,))
+    pol = policy((group,), (acc.account_id,))
     alt = bundle(
         accounts=(acc,),
         route_groups=(group,),

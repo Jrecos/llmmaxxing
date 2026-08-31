@@ -24,16 +24,18 @@ from llmmaxxing.core.ids import (
     RouteLegId,
 )
 from llmmaxxing.core.models import (
+    AuthorizedLeg,
     ClientCredentialVerifier,
     ClientKeyRecord,
     KeyPolicyRevision,
+    LegCapabilities,
     PolicyBundleV1,
     ProviderAccount,
     QuotaDimension,
     RouteGroupRevision,
     RouteLeg,
 )
-from llmmaxxing.core.reasons import RouteStrategy, RouteTrigger
+from llmmaxxing.core.reasons import EndpointKind, Modality, RouteStrategy, RouteTrigger
 from llmmaxxing.core.state_machines import (
     AccountState,
     CredentialVerifierStatus,
@@ -72,6 +74,17 @@ def _account() -> ProviderAccount:
         state=AccountState.ACTIVE,
     )
 
+def _capabilities() -> LegCapabilities:
+    return LegCapabilities(
+        endpoints=(EndpointKind.CHAT,),
+        modalities=(Modality.TEXT,),
+        context_tokens=32_768,
+        tools=True,
+        forced_tool=True,
+        response_schema=True,
+        shadow=False,
+    )
+
 
 def _group() -> RouteGroupRevision:
     return RouteGroupRevision(
@@ -85,18 +98,28 @@ def _group() -> RouteGroupRevision:
                 triggers=(RouteTrigger.PRIMARY,),
                 account_id=ACCOUNT_ID,
                 generation_id=DeploymentGenerationId.from_digest("4" * 64),
+                capabilities=_capabilities(),
             ),
         ),
     )
 
 
 def _policy(policy_id: PolicyRevisionId, *, weight: int = 2) -> KeyPolicyRevision:
+    route_leg = _group().legs[0]
     return KeyPolicyRevision(
         policy_id=policy_id,
         name="policy",
         route_group_ids=(GROUP_ID,),
-        allowed_account_ids=(ACCOUNT_ID,),
-        allowed_triggers=(RouteTrigger.PRIMARY,),
+        authorized_legs=(
+            AuthorizedLeg(
+                leg_id=route_leg.leg_id,
+                account_id=route_leg.account_id,
+                generation_id=route_leg.generation_id,
+                order=route_leg.order,
+                allowed_triggers=(RouteTrigger.PRIMARY,),
+                capabilities=route_leg.capabilities,
+            ),
+        ),
         queue_tier=20,
         queue_weight=weight,
         max_concurrency=2,
@@ -245,6 +268,7 @@ def test_affected_keys_use_each_policy_effective_authorized_leg_projection() -> 
                     triggers=(RouteTrigger.PRIMARY,),
                     account_id=ACCOUNT_ID,
                     generation_id=DeploymentGenerationId.from_digest("4" * 64),
+                    capabilities=_capabilities(),
                 ),
                 RouteLeg(
                     leg_id=spill_leg_id,
@@ -252,17 +276,33 @@ def test_affected_keys_use_each_policy_effective_authorized_leg_projection() -> 
                     triggers=(RouteTrigger.CAPACITY_SPILL,),
                     account_id=spill_account_id,
                     generation_id=DeploymentGenerationId.from_digest(spill_digest * 64),
+                    capabilities=_capabilities(),
                 ),
             ),
         )
 
-    def trigger_policy(policy_id: PolicyRevisionId, trigger: RouteTrigger) -> KeyPolicyRevision:
+    def trigger_policy(
+        policy_id: PolicyRevisionId,
+        trigger: RouteTrigger,
+        route: RouteGroupRevision,
+    ) -> KeyPolicyRevision:
+        authorized_legs = tuple(
+            AuthorizedLeg(
+                leg_id=route_leg.leg_id,
+                account_id=route_leg.account_id,
+                generation_id=route_leg.generation_id,
+                order=route_leg.order,
+                allowed_triggers=(trigger,),
+                capabilities=route_leg.capabilities,
+            )
+            for route_leg in route.legs
+            if trigger in route_leg.triggers
+        )
         return KeyPolicyRevision(
             policy_id=policy_id,
             name=f"{trigger.value}-only",
             route_group_ids=(GROUP_ID,),
-            allowed_account_ids=(ACCOUNT_ID, spill_account_id),
-            allowed_triggers=(trigger,),
+            authorized_legs=authorized_legs,
             queue_tier=20,
             queue_weight=2,
             max_concurrency=2,
@@ -270,12 +310,13 @@ def test_affected_keys_use_each_policy_effective_authorized_leg_projection() -> 
             deadline_ms=60_000,
         )
 
-    policies = (
-        trigger_policy(OLD_POLICY_ID, RouteTrigger.PRIMARY),
-        trigger_policy(NEW_POLICY_ID, RouteTrigger.CAPACITY_SPILL),
-    )
 
     def bundle(generation: int, spill_digest: str) -> PolicyBundleV1:
+        route = group(spill_digest)
+        routed_policies = (
+            trigger_policy(OLD_POLICY_ID, RouteTrigger.PRIMARY, route),
+            trigger_policy(NEW_POLICY_ID, RouteTrigger.CAPACITY_SPILL, route),
+        )
         return PolicyBundleV1(
             schema_version=1,
             generation=generation,
@@ -285,9 +326,9 @@ def test_affected_keys_use_each_policy_effective_authorized_leg_projection() -> 
                 _key(KEY_A, OLD_POLICY_ID, "5"),
                 _key(KEY_B, NEW_POLICY_ID, "6"),
             ),
-            policies=policies,
+            policies=routed_policies,
             accounts=(primary, spill),
-            route_groups=(group(spill_digest),),
+            route_groups=(route,),
             backend_manifest_hash="7" * 64,
         )
 

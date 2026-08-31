@@ -26,7 +26,7 @@ _MANIFEST = "manifest.json"
 _VERSION = 1
 _SAFE_KEY = re.compile(r"^[a-z0-9_.:-]{1,180}$")
 _SAFE_ID = re.compile(
-    r"^(?:acc|att|boot|inst|probe|req)_[0-9a-f-]{32,36}$"
+    r"^(?:acc|att|boot|inst|leg|probe|req)_[0-9a-f-]{32,36}$"
     r"|^dg1_[0-9a-f]{64}$|^bh_[0-9a-f]{64}$"
 )
 _SAFE_DIGEST = re.compile(r"^(?:sha256:)?[0-9a-f]{64}$")
@@ -78,6 +78,7 @@ _RECORD_FIELDS: dict[str, frozenset[str]] = {
             "request_id",
             "attempt_id",
             "account_id",
+            "leg_id",
             "installation_id",
             "deployment_generation_id",
             "bundle_generation",
@@ -91,10 +92,12 @@ _RECORD_FIELDS: dict[str, frozenset[str]] = {
             "quota_units",
             "monthly_reset_at_ms",
             "circuit_epoch",
+            "account_circuit_epoch",
             "circuit_probe_id",
             "account_circuit_probe_id",
         }
     ),
+    "attempt_dispatched": frozenset({"attempt_id", "dispatched_at_ms"}),
     "attempt_uncertain": frozenset({"attempt_id", "reason"}),
     "attempt_resolved": frozenset(
         {
@@ -208,6 +211,7 @@ class DurableReservation:
     request_id: str
     attempt_id: str
     account_id: str
+    leg_id: str
     deployment_generation_id: str
     installation_id: str
     bundle_generation: int
@@ -221,6 +225,7 @@ class DurableReservation:
     quota_units: int
     monthly_reset_at_ms: int
     circuit_epoch: int
+    account_circuit_epoch: int
     circuit_probe_id: str | None
     account_circuit_probe_id: str | None
 
@@ -561,6 +566,14 @@ class AttemptJournal:
         record = self._append(
             "attempt_reserved",
             payload,
+            boundary="reservation",
+        )
+        return JournalReceipt(record.sequence, record.digest)
+
+    def record_dispatch(self, *, attempt_id: str, dispatched_at_ms: int) -> JournalReceipt:
+        record = self._append(
+            "attempt_dispatched",
+            {"attempt_id": attempt_id, "dispatched_at_ms": dispatched_at_ms},
             boundary="reservation",
         )
         return JournalReceipt(record.sequence, record.digest)

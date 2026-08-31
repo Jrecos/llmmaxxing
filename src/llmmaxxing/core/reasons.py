@@ -53,6 +53,48 @@ class RouteStrategy(_Closed):
 
     ORDERED_CAPACITY = "ordered_capacity"
 
+@final
+class EndpointKind(_Closed):
+    """Certified V1 inference endpoints; unsupported paths never coerce."""
+
+    CHAT = "chat"
+    TEXT = "text"
+    EMBEDDINGS = "embeddings"
+    RERANK = "rerank"
+    AUDIO_SPEECH = "audio_speech"
+    AUDIO_TRANSCRIPTION = "audio_transcription"
+    IMAGE = "image"
+
+
+@final
+class DispatchCause(_Closed):
+    """One serving cause selected before a provider attempt."""
+
+    PRIMARY = "primary"
+    CAPACITY = "capacity"
+    FAILURE = "failure"
+    QUOTA = "quota"
+    MANUAL_EMERGENCY = "manual_emergency"
+
+
+@final
+class FailureCause(_Closed):
+    """Result of the single provider-failure classifier."""
+
+    CAPACITY = "capacity"
+    TRANSIENT_FAILURE = "transient_failure"
+    QUOTA = "quota"
+    UNKNOWN = "unknown"
+
+
+@final
+class FailureScope(_Closed):
+    """Circuit boundary proven by normalized provider evidence."""
+
+    ACCOUNT = "account"
+    DEPLOYMENT = "deployment"
+    UNKNOWN = "unknown"
+
 
 @final
 class Modality(_Closed):

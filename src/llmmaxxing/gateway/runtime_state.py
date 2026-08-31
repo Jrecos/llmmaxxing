@@ -21,6 +21,7 @@ from llmmaxxing.core.ids import (
     GatewayBootId,
     InstallationId,
     RequestId,
+    RouteLegId,
 )
 from llmmaxxing.core.models import ProviderAccount, RequestProfile
 from llmmaxxing.core.reasons import QuotaDimensionStatus, TerminalOutcome
@@ -181,6 +182,7 @@ class ReservationRequest(_Frozen):
     request_id: RequestId
     attempt_id: AttemptId
     account_id: AccountId
+    leg_id: RouteLegId
     deployment_generation_id: DeploymentGenerationId
     runtime_identity: RuntimeIdentity
     deadline_at_ms: int = Field(ge=1, le=_MAX_INT)
@@ -238,6 +240,7 @@ class ReservationDenied:
 @dataclass(frozen=True, slots=True)
 class AccountCapacity:
     account_id: AccountId
+    state: AccountState
     parallel_limit: int
     active_attempts: int
     uncertain_attempts: int
@@ -262,6 +265,7 @@ class _Start:
 class _Attempt:
     attempt_id: str
     request_id: str
+    leg_id: str
     deployment_generation_id: str
     installation_id: str
     bundle_generation: int
@@ -271,13 +275,29 @@ class _Attempt:
     deadline_at_ms: int
     profile_digest: str
     circuit_epoch: int
+    account_circuit_epoch: int
     circuit_probe_id: str | None
     account_circuit_probe_id: str | None
     monthly_reset_at_ms: int
     started_at_ms: int
+    dispatched_at_ms: int | None
+    dispatch_receipt: JournalReceipt | None
     reserved_tokens: int
     quota_units: int
     state: str
+
+
+@dataclass(frozen=True, slots=True)
+class _Dispatch:
+    request_id: str
+    attempt_id: str
+    leg_id: str
+    deployment_generation_id: str
+    circuit_epoch: int
+    account_circuit_epoch: int
+    circuit_probe_id: str | None
+    account_circuit_probe_id: str | None
+    dispatched_at_ms: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -285,6 +305,7 @@ class _ResolvedAttempt:
     resolution_digest: str
     receipt: JournalReceipt
     resolved_at_ms: int
+    dispatch: _Dispatch | None
 
 
 class AccountBindingConflict(ValueError):
@@ -317,6 +338,17 @@ class Lease:
     @property
     def terminal(self) -> bool:
         return self.request.attempt_id in self._runtime._resolutions
+
+    @property
+    def dispatched(self) -> bool:
+        attempt = self._runtime._attempts.get(self.request.attempt_id)
+        return attempt is not None and attempt.dispatched_at_ms is not None
+
+    def mark_dispatched(self) -> JournalReceipt:
+        return self._runtime._mark_dispatched(self.request.attempt_id)
+
+    async def mark_dispatched_async(self) -> JournalReceipt:
+        return await asyncio.to_thread(self.mark_dispatched)
 
     def provider_send_completed(self) -> None:
         self._runtime._provider_send_completed(self.request.attempt_id)
@@ -366,6 +398,50 @@ class AccountRuntime:
         self._monthly_reset_at_ms = self._next_monthly_reset(self._time_high_water_ms)
         self._external_uncertain_holds = 0
         self._recovery_probe_id: str | None = None
+
+    @staticmethod
+    def _dispatch(attempt: _Attempt) -> _Dispatch | None:
+        if attempt.dispatched_at_ms is None:
+            return None
+        return _Dispatch(
+            request_id=attempt.request_id,
+            attempt_id=attempt.attempt_id,
+            leg_id=attempt.leg_id,
+            deployment_generation_id=attempt.deployment_generation_id,
+            circuit_epoch=attempt.circuit_epoch,
+            account_circuit_epoch=attempt.account_circuit_epoch,
+            circuit_probe_id=attempt.circuit_probe_id,
+            account_circuit_probe_id=attempt.account_circuit_probe_id,
+            dispatched_at_ms=attempt.dispatched_at_ms,
+        )
+
+    @staticmethod
+    def _restore_dispatch(value: object) -> _Dispatch | None:
+        if value is None:
+            return None
+        if not isinstance(value, Mapping):
+            raise ValueError("recovered dispatch ledger value is invalid")
+        return _Dispatch(
+            request_id=_require_str(value["request_id"]),
+            attempt_id=_require_str(value["attempt_id"]),
+            leg_id=_require_str(value["leg_id"]),
+            deployment_generation_id=_require_str(
+                value["deployment_generation_id"]
+            ),
+            circuit_epoch=_require_int(value["circuit_epoch"]),
+            account_circuit_epoch=_require_int(value["account_circuit_epoch"]),
+            circuit_probe_id=(
+                None
+                if value["circuit_probe_id"] is None
+                else _require_str(value["circuit_probe_id"])
+            ),
+            account_circuit_probe_id=(
+                None
+                if value["account_circuit_probe_id"] is None
+                else _require_str(value["account_circuit_probe_id"])
+            ),
+            dispatched_at_ms=_require_int(value["dispatched_at_ms"]),
+        )
 
     def update_account(self, account: ProviderAccount) -> None:
         if account.account_id != self.account.account_id:
@@ -492,6 +568,7 @@ class AccountRuntime:
                 request_id=str(request.request_id),
                 attempt_id=str(request.attempt_id),
                 account_id=str(request.account_id),
+                leg_id=str(request.leg_id),
                 deployment_generation_id=str(request.deployment_generation_id),
                 installation_id=str(request.runtime_identity.installation_id),
                 bundle_generation=request.runtime_identity.bundle_generation,
@@ -505,6 +582,7 @@ class AccountRuntime:
                 quota_units=request.quota_units,
                 monthly_reset_at_ms=self._monthly_reset_at_ms,
                 circuit_epoch=request.circuit.epoch,
+                account_circuit_epoch=request.account_circuit.epoch,
                 circuit_probe_id=request.circuit.probe_id,
                 account_circuit_probe_id=(
                     self._account_circuit.probe_id
@@ -527,6 +605,7 @@ class AccountRuntime:
             self._attempts[request.attempt_id] = _Attempt(
                 attempt_id=str(request.attempt_id),
                 request_id=str(request.request_id),
+                leg_id=str(request.leg_id),
                 deployment_generation_id=str(request.deployment_generation_id),
                 installation_id=str(request.runtime_identity.installation_id),
                 bundle_generation=request.runtime_identity.bundle_generation,
@@ -536,6 +615,7 @@ class AccountRuntime:
                 deadline_at_ms=request.deadline_at_ms,
                 profile_digest=request.profile_digest,
                 circuit_epoch=request.circuit.epoch,
+                account_circuit_epoch=request.account_circuit.epoch,
                 circuit_probe_id=request.circuit.probe_id,
                 account_circuit_probe_id=(
                     self._account_circuit.probe_id
@@ -544,6 +624,8 @@ class AccountRuntime:
                 ),
                 monthly_reset_at_ms=self._monthly_reset_at_ms,
                 started_at_ms=now_ms,
+                dispatched_at_ms=None,
+                dispatch_receipt=None,
                 reserved_tokens=request.total_token_upper_bound,
                 quota_units=request.quota_units,
                 state="active",
@@ -657,6 +739,7 @@ class AccountRuntime:
             self._roll_monthly(now_ms)
             return AccountCapacity(
                 account_id=self.account.account_id,
+                state=self.account.state or AccountState.DRAFT,
                 parallel_limit=self.account.enforced_max_in_flight,
                 active_attempts=self._active_count,
                 uncertain_attempts=self._uncertain_count,
@@ -716,6 +799,25 @@ class AccountRuntime:
         with self._lock:
             return attempt_id in self._attempts and attempt_id not in self._resolutions
 
+    def _mark_dispatched(self, attempt_id: str) -> JournalReceipt:
+        with self._lock:
+            attempt = self._attempts.get(attempt_id)
+            if attempt is None or attempt_id in self._resolutions:
+                raise InvalidLeaseTransition("unknown or terminal attempt cannot dispatch")
+            if attempt.dispatch_receipt is not None:
+                return attempt.dispatch_receipt
+            dispatched_at_ms = self._now_ms()
+            if dispatched_at_ms >= attempt.deadline_at_ms:
+                raise InvalidLeaseTransition("attempt deadline elapsed before dispatch")
+            receipt = self._journal.record_dispatch(
+                attempt_id=attempt_id,
+                dispatched_at_ms=dispatched_at_ms,
+            )
+            attempt.dispatched_at_ms = dispatched_at_ms
+            attempt.dispatch_receipt = receipt
+            self._maybe_checkpoint_locked()
+            return receipt
+
     def _provider_send_completed(self, attempt_id: str) -> None:
         with self._lock:
             if attempt_id not in self._attempts or attempt_id in self._resolutions:
@@ -770,7 +872,10 @@ class AccountRuntime:
             else:
                 attempt.state = "uncertain"
             self._resolutions[attempt_id] = _ResolvedAttempt(
-                resolution.digest, receipt, resolved_at_ms
+                resolution.digest,
+                receipt,
+                resolved_at_ms,
+                self._dispatch(attempt),
             )
             self._maybe_checkpoint_locked()
             return receipt
@@ -891,6 +996,7 @@ class AccountRuntime:
             "attempts": {
                 attempt_id: {
                     "request_id": attempt.request_id,
+                    "leg_id": attempt.leg_id,
                     "deployment_generation_id": attempt.deployment_generation_id,
                     "installation_id": attempt.installation_id,
                     "bundle_generation": attempt.bundle_generation,
@@ -900,10 +1006,22 @@ class AccountRuntime:
                     "deadline_at_ms": attempt.deadline_at_ms,
                     "profile_digest": attempt.profile_digest,
                     "circuit_epoch": attempt.circuit_epoch,
+                    "account_circuit_epoch": attempt.account_circuit_epoch,
                     "circuit_probe_id": attempt.circuit_probe_id,
                     "account_circuit_probe_id": attempt.account_circuit_probe_id,
                     "monthly_reset_at_ms": attempt.monthly_reset_at_ms,
                     "started_at_ms": attempt.started_at_ms,
+                    "dispatched_at_ms": attempt.dispatched_at_ms,
+                    "dispatch_lsn": (
+                        None
+                        if attempt.dispatch_receipt is None
+                        else attempt.dispatch_receipt.durable_lsn
+                    ),
+                    "dispatch_digest": (
+                        None
+                        if attempt.dispatch_receipt is None
+                        else attempt.dispatch_receipt.record_digest
+                    ),
                     "reserved_tokens": attempt.reserved_tokens,
                     "quota_units": attempt.quota_units,
                     "state": attempt.state,
@@ -916,6 +1034,27 @@ class AccountRuntime:
                     "durable_lsn": resolved.receipt.durable_lsn,
                     "record_digest": resolved.receipt.record_digest,
                     "resolved_at_ms": resolved.resolved_at_ms,
+                    "dispatch": (
+                        None
+                        if resolved.dispatch is None
+                        else {
+                            "request_id": resolved.dispatch.request_id,
+                            "attempt_id": resolved.dispatch.attempt_id,
+                            "leg_id": resolved.dispatch.leg_id,
+                            "deployment_generation_id": (
+                                resolved.dispatch.deployment_generation_id
+                            ),
+                            "circuit_epoch": resolved.dispatch.circuit_epoch,
+                            "account_circuit_epoch": (
+                                resolved.dispatch.account_circuit_epoch
+                            ),
+                            "circuit_probe_id": resolved.dispatch.circuit_probe_id,
+                            "account_circuit_probe_id": (
+                                resolved.dispatch.account_circuit_probe_id
+                            ),
+                            "dispatched_at_ms": resolved.dispatch.dispatched_at_ms,
+                        }
+                    ),
                 }
                 for attempt_id, resolved in sorted(self._resolutions.items())
             },
@@ -978,6 +1117,7 @@ class AccountRuntime:
             attempt_id: _Attempt(
                 attempt_id=attempt_id,
                 request_id=_require_str(item["request_id"]),
+                leg_id=_require_str(item["leg_id"]),
                 deployment_generation_id=_require_str(item["deployment_generation_id"]),
                 installation_id=_require_str(item["installation_id"]),
                 bundle_generation=_require_int(item["bundle_generation"]),
@@ -987,6 +1127,7 @@ class AccountRuntime:
                 deadline_at_ms=_require_int(item["deadline_at_ms"]),
                 profile_digest=_require_str(item["profile_digest"]),
                 circuit_epoch=_require_int(item["circuit_epoch"]),
+                account_circuit_epoch=_require_int(item["account_circuit_epoch"]),
                 circuit_probe_id=(
                     None
                     if item["circuit_probe_id"] is None
@@ -999,6 +1140,19 @@ class AccountRuntime:
                 ),
                 monthly_reset_at_ms=_require_int(item["monthly_reset_at_ms"]),
                 started_at_ms=_require_int(item["started_at_ms"]),
+                dispatched_at_ms=(
+                    None
+                    if item["dispatched_at_ms"] is None
+                    else _require_int(item["dispatched_at_ms"])
+                ),
+                dispatch_receipt=(
+                    None
+                    if item["dispatch_lsn"] is None
+                    else JournalReceipt(
+                        _require_int(item["dispatch_lsn"]),
+                        _require_str(item["dispatch_digest"]),
+                    )
+                ),
                 reserved_tokens=_require_int(item["reserved_tokens"]),
                 quota_units=_require_int(item["quota_units"]),
                 state=_require_str(item["state"]),
@@ -1014,6 +1168,7 @@ class AccountRuntime:
                     _require_str(item["record_digest"]),
                 ),
                 _require_int(item["resolved_at_ms"]),
+                self._restore_dispatch(item["dispatch"]),
             )
             for attempt_id, item in resolutions.items()
         }
@@ -1074,6 +1229,7 @@ class AttemptOperationalValue:
     account_id: AccountId
     request_id: RequestId
     attempt_id: AttemptId
+    leg_id: RouteLegId
     deployment_generation_id: DeploymentGenerationId
     installation_id: InstallationId
     bundle_generation: int
@@ -1082,7 +1238,26 @@ class AttemptOperationalValue:
     boot_id: GatewayBootId
     deadline_at_ms: int
     profile_digest: str
+    circuit_epoch: int
+    account_circuit_epoch: int
+    circuit_probe_id: str | None
+    account_circuit_probe_id: str | None
+    dispatched_at_ms: int | None
     state: str
+
+
+@dataclass(frozen=True, slots=True)
+class DispatchOperationalValue:
+    account_id: AccountId
+    request_id: RequestId
+    attempt_id: AttemptId
+    leg_id: RouteLegId
+    deployment_generation_id: DeploymentGenerationId
+    circuit_epoch: int
+    account_circuit_epoch: int
+    circuit_probe_id: str | None
+    account_circuit_probe_id: str | None
+    dispatched_at_ms: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -1102,6 +1277,7 @@ class OperationalRuntimeView:
     time_high_water_ms: int
     accounts: tuple[AccountCapacity, ...]
     attempts: tuple[AttemptOperationalValue, ...]
+    dispatches: tuple[DispatchOperationalValue, ...]
     circuits: tuple[CircuitOperationalValue, ...]
 
 
@@ -1170,6 +1346,7 @@ class RuntimeState:
                     account_id=account_id,
                     request_id=RequestId(attempt.request_id),
                     attempt_id=AttemptId(attempt.attempt_id),
+                    leg_id=RouteLegId(attempt.leg_id),
                     deployment_generation_id=DeploymentGenerationId(
                         attempt.deployment_generation_id
                     ),
@@ -1180,12 +1357,51 @@ class RuntimeState:
                     boot_id=GatewayBootId(attempt.boot_id),
                     deadline_at_ms=attempt.deadline_at_ms,
                     profile_digest=attempt.profile_digest,
+                    circuit_epoch=attempt.circuit_epoch,
+                    account_circuit_epoch=attempt.account_circuit_epoch,
+                    circuit_probe_id=attempt.circuit_probe_id,
+                    account_circuit_probe_id=attempt.account_circuit_probe_id,
+                    dispatched_at_ms=attempt.dispatched_at_ms,
                     state=attempt.state,
                 )
                 for account_id, runtime in sorted(
                     self._runtimes.items(), key=lambda item: str(item[0])
                 )
                 for attempt in sorted(runtime._attempts.values(), key=lambda item: item.attempt_id)
+            )
+            dispatch_by_attempt: dict[AttemptId, DispatchOperationalValue] = {}
+            for account_id, runtime in self._runtimes.items():
+                dispatched = tuple(
+                    dispatch
+                    for attempt in runtime._attempts.values()
+                    if (dispatch := runtime._dispatch(attempt)) is not None
+                ) + tuple(
+                    resolved.dispatch
+                    for resolved in runtime._resolutions.values()
+                    if resolved.dispatch is not None
+                )
+                for dispatch in dispatched:
+                    assert dispatch is not None
+                    attempt_id = AttemptId(dispatch.attempt_id)
+                    dispatch_by_attempt[attempt_id] = DispatchOperationalValue(
+                        account_id=account_id,
+                        request_id=RequestId(dispatch.request_id),
+                        attempt_id=attempt_id,
+                        leg_id=RouteLegId(dispatch.leg_id),
+                        deployment_generation_id=DeploymentGenerationId(
+                            dispatch.deployment_generation_id
+                        ),
+                        circuit_epoch=dispatch.circuit_epoch,
+                        account_circuit_epoch=dispatch.account_circuit_epoch,
+                        circuit_probe_id=dispatch.circuit_probe_id,
+                        account_circuit_probe_id=dispatch.account_circuit_probe_id,
+                        dispatched_at_ms=dispatch.dispatched_at_ms,
+                    )
+            dispatches = tuple(
+                sorted(
+                    dispatch_by_attempt.values(),
+                    key=lambda value: (value.dispatched_at_ms, str(value.attempt_id)),
+                )
             )
             circuits = tuple(
                 CircuitOperationalValue(account_id, generation, value)
@@ -1207,6 +1423,7 @@ class RuntimeState:
                 ),
                 accounts=accounts,
                 attempts=attempts,
+                dispatches=dispatches,
                 circuits=circuits,
             )
 
@@ -1483,6 +1700,7 @@ class RuntimeState:
             runtime._attempts[attempt_id] = _Attempt(
                 attempt_id=attempt_id,
                 request_id=cast(str, payload["request_id"]),
+                leg_id=cast(str, payload["leg_id"]),
                 deployment_generation_id=cast(str, payload["deployment_generation_id"]),
                 installation_id=cast(str, payload["installation_id"]),
                 bundle_generation=cast(int, payload["bundle_generation"]),
@@ -1492,10 +1710,13 @@ class RuntimeState:
                 deadline_at_ms=cast(int, payload["deadline_at_ms"]),
                 profile_digest=cast(str, payload["profile_digest"]),
                 circuit_epoch=cast(int, payload["circuit_epoch"]),
+                account_circuit_epoch=cast(int, payload["account_circuit_epoch"]),
                 circuit_probe_id=cast(str | None, payload["circuit_probe_id"]),
                 account_circuit_probe_id=cast(str | None, payload["account_circuit_probe_id"]),
                 monthly_reset_at_ms=reset_at,
                 started_at_ms=cast(int, payload["started_at_ms"]),
+                dispatched_at_ms=None,
+                dispatch_receipt=None,
                 reserved_tokens=cast(int, payload["reserved_tokens"]),
                 quota_units=cast(int, payload["quota_units"]),
                 state="active",
@@ -1507,6 +1728,22 @@ class RuntimeState:
                 if probe_id is not None:
                     runtime._consumed_circuit_probes[probe_id] = attempt_id
             runtime._monthly_used += cast(int, payload["quota_units"])
+        elif record.kind == "attempt_dispatched":
+            attempt_id = cast(str, payload["attempt_id"])
+            attempt = runtime._attempts.get(attempt_id)
+            if attempt is None:
+                raise InvalidLeaseTransition("dispatch has no durable reservation")
+            dispatched_at_ms = cast(int, payload["dispatched_at_ms"])
+            receipt = JournalReceipt(record.sequence, record.digest)
+            if attempt.dispatch_receipt is not None:
+                if (
+                    attempt.dispatched_at_ms != dispatched_at_ms
+                    or attempt.dispatch_receipt != receipt
+                ):
+                    raise InvalidLeaseTransition("conflicting durable dispatch")
+                return
+            attempt.dispatched_at_ms = dispatched_at_ms
+            attempt.dispatch_receipt = receipt
         elif record.kind == "attempt_resolved":
             attempt_id = cast(str, payload["attempt_id"])
             resolution_digest = cast(str, payload["resolution_digest"])
@@ -1541,6 +1778,7 @@ class RuntimeState:
                 resolution_digest,
                 JournalReceipt(record.sequence, record.digest),
                 cast(int, payload["resolved_at_ms"]),
+                runtime._dispatch(attempt),
             )
         elif record.kind == "attempt_uncertain":
             attempt = runtime._attempts.get(cast(str, payload["attempt_id"]))

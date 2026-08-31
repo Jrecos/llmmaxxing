@@ -22,6 +22,7 @@ from llmmaxxing.core.ids import (
 )
 from llmmaxxing.core.reasons import (
     MAX_MIN_READER,
+    EndpointKind,
     Modality,
     QuotaDimensionStatus,
     RequiredFeature,
@@ -156,6 +157,93 @@ class ProviderAccount(_Frozen):
         return self
 
 
+class LegCapabilities(_Frozen):
+    """Closed serving shape copied into every immutable authorization ceiling."""
+
+    endpoints: tuple[EndpointKind, ...] = Field(min_length=1)
+    modalities: tuple[Modality, ...] = Field(min_length=1)
+    context_tokens: int = Field(gt=0)
+    tools: bool
+    forced_tool: bool
+    response_schema: bool
+    shadow: bool
+
+    @field_validator("endpoints", "modalities")
+    @classmethod
+    def _members_unique(cls, value: tuple[object, ...]) -> tuple[object, ...]:
+        if len(set(value)) != len(value):
+            raise ValueError("duplicate leg capability value")
+        return value
+
+    @model_validator(mode="after")
+    def _forced_tool_requires_tools(self) -> Self:
+        if self.forced_tool and not self.tools:
+            raise ValueError("forced-tool capability requires tool capability")
+        return self
+
+    def intersection(self, other: Self) -> Self | None:
+        endpoints = tuple(item for item in self.endpoints if item in frozenset(other.endpoints))
+        modalities = tuple(item for item in self.modalities if item in frozenset(other.modalities))
+        if not endpoints or not modalities:
+            return None
+        tools = self.tools and other.tools
+        return type(self)(
+            endpoints=endpoints,
+            modalities=modalities,
+            context_tokens=min(self.context_tokens, other.context_tokens),
+            tools=tools,
+            forced_tool=tools and self.forced_tool and other.forced_tool,
+            response_schema=self.response_schema and other.response_schema,
+            shadow=self.shadow or other.shadow,
+        )
+
+
+class AuthorizedLeg(_Frozen):
+    """Exact per-leg authority; parallel ID/trigger lists cannot drift apart."""
+
+    leg_id: RouteLegId
+    account_id: AccountId
+    generation_id: DeploymentGenerationId
+    order: int = Field(ge=1)
+    allowed_triggers: tuple[RouteTrigger, ...] = Field(min_length=1)
+    capabilities: LegCapabilities
+
+    @field_validator("allowed_triggers")
+    @classmethod
+    def _triggers_unique(
+        cls, value: tuple[RouteTrigger, ...]
+    ) -> tuple[RouteTrigger, ...]:
+        if len(set(value)) != len(value):
+            raise ValueError("duplicate authorized leg trigger")
+        return value
+
+    @property
+    def identity(
+        self,
+    ) -> tuple[RouteLegId, AccountId, DeploymentGenerationId, int]:
+        return (self.leg_id, self.account_id, self.generation_id, self.order)
+
+    def intersection(self, other: Self) -> Self | None:
+        if self.identity != other.identity:
+            return None
+        triggers = tuple(
+            trigger
+            for trigger in self.allowed_triggers
+            if trigger in frozenset(other.allowed_triggers)
+        )
+        capabilities = self.capabilities.intersection(other.capabilities)
+        if not triggers or capabilities is None:
+            return None
+        return type(self)(
+            leg_id=self.leg_id,
+            account_id=self.account_id,
+            generation_id=self.generation_id,
+            order=self.order,
+            allowed_triggers=triggers,
+            capabilities=capabilities,
+        )
+
+
 class RouteLeg(_Frozen):
     """One ordered candidate leg inside a Route Group revision."""
 
@@ -164,6 +252,7 @@ class RouteLeg(_Frozen):
     triggers: tuple[RouteTrigger, ...] = Field(min_length=1)
     account_id: AccountId
     generation_id: DeploymentGenerationId
+    capabilities: LegCapabilities
 
     @field_validator("triggers")
     @classmethod
@@ -171,6 +260,15 @@ class RouteLeg(_Frozen):
         if len(set(v)) != len(v):
             raise ValueError("duplicate leg trigger")
         return v
+
+    @model_validator(mode="after")
+    def _shadow_is_never_a_serving_mode(self) -> Self:
+        shadow_trigger = RouteTrigger.SHADOW in self.triggers
+        if self.capabilities.shadow != shadow_trigger:
+            raise ValueError("shadow capability and trigger must agree")
+        if shadow_trigger and self.triggers != (RouteTrigger.SHADOW,):
+            raise ValueError("a shadow leg cannot carry serving triggers")
+        return self
 
 
 class RouteGroupRevision(_Frozen):
@@ -200,20 +298,30 @@ class KeyPolicyRevision(_Frozen):
     policy_id: PolicyRevisionId
     name: str = Field(min_length=1, max_length=120)
     route_group_ids: tuple[RouteGroupId, ...] = Field(min_length=1)
-    allowed_account_ids: tuple[AccountId, ...] = Field(min_length=1)
-    allowed_triggers: tuple[RouteTrigger, ...] = Field(min_length=1)
+    authorized_legs: tuple[AuthorizedLeg, ...] = Field(min_length=1)
     queue_tier: int = Field(ge=0)
     queue_weight: int = Field(ge=1, le=64)
     max_concurrency: int = Field(ge=1)
     max_waiters: int = Field(ge=0)
     deadline_ms: int = Field(ge=1, le=_MAX_DEADLINE_MS)
 
-    @field_validator("route_group_ids", "allowed_account_ids", "allowed_triggers")
+    @field_validator("route_group_ids")
     @classmethod
-    def _no_duplicates(cls, v: tuple[object, ...]) -> tuple[object, ...]:
-        if len(set(v)) != len(v):
-            raise ValueError("duplicate policy membership value")
-        return v
+    def _route_groups_unique(
+        cls, value: tuple[RouteGroupId, ...]
+    ) -> tuple[RouteGroupId, ...]:
+        if len(set(value)) != len(value):
+            raise ValueError("duplicate policy route group")
+        return value
+
+    @field_validator("authorized_legs")
+    @classmethod
+    def _authorized_legs_unique(
+        cls, value: tuple[AuthorizedLeg, ...]
+    ) -> tuple[AuthorizedLeg, ...]:
+        if len({leg.leg_id for leg in value}) != len(value):
+            raise ValueError("duplicate policy authorized leg")
+        return tuple(sorted(value, key=lambda leg: (leg.order, str(leg.leg_id))))
 
 
 class ClientCredentialVerifier(_Frozen):
@@ -290,23 +398,21 @@ class RequestProfile(_Frozen):
 
     route_group_id: RouteGroupId
     model_alias: str = Field(min_length=1, max_length=160)
+    endpoint: EndpointKind
     modality: Modality
     stream: bool
     input_tokens_max: int = Field(ge=0)
     output_tokens_max: int = Field(ge=0)
     reasoning_tokens_max: int = Field(ge=0)
     tools_count: int = Field(ge=0)
+    forced_tool_required: bool
     response_schema_present: bool
     history_turns: int = Field(ge=0)
     deadline_ms: int = Field(ge=1, le=_MAX_DEADLINE_MS)
 
 
 class RequestAuthorizationCeiling(_Frozen):
-    """Admission-time ceiling; queue wakes intersect it with current authority.
-
-    Lower numeric queue tiers are higher priority. Intersection therefore takes
-    the maximum tier while every resource limit takes the minimum.
-    """
+    """Admission authority whose QoS and exact per-leg records only contract."""
 
     key_id: _HEX32
     credential_generation: int = Field(ge=1)
@@ -314,39 +420,51 @@ class RequestAuthorizationCeiling(_Frozen):
     bundle_generation: int = Field(ge=1)
     bundle_hash: BundleHash
     route_group_id: RouteGroupId
-    allowed_account_ids: tuple[AccountId, ...]
-    leg_ids: tuple[RouteLegId, ...]
-    allowed_triggers: tuple[RouteTrigger, ...]
+    authorized_legs: tuple[AuthorizedLeg, ...]
     queue_tier: int = Field(ge=0)
     queue_weight: int = Field(ge=1, le=64)
     max_concurrency: int = Field(ge=1)
     max_waiters: int = Field(ge=0)
     deadline_ms: int = Field(ge=1, le=_MAX_DEADLINE_MS)
 
+    @field_validator("authorized_legs")
+    @classmethod
+    def _ceiling_legs_unique(
+        cls, value: tuple[AuthorizedLeg, ...]
+    ) -> tuple[AuthorizedLeg, ...]:
+        if len({leg.leg_id for leg in value}) != len(value):
+            raise ValueError("duplicate authorization ceiling leg")
+        return tuple(sorted(value, key=lambda leg: (leg.order, str(leg.leg_id))))
+
     def intersection(self, other: Self) -> Self:
         if (
             self.key_id != other.key_id
             or self.credential_generation != other.credential_generation
+            or self.policy_id != other.policy_id
             or self.route_group_id != other.route_group_id
         ):
             raise ValueError("cannot intersect ceilings of different admitted identities")
 
-        def keep(ordered: tuple[object, ...], allowed: frozenset[object]) -> tuple[object, ...]:
-            return tuple(item for item in ordered if item in allowed)
-
-        return self.model_copy(
-            update={
-                "allowed_account_ids": keep(
-                    self.allowed_account_ids, frozenset(other.allowed_account_ids)
-                ),
-                "leg_ids": keep(self.leg_ids, frozenset(other.leg_ids)),
-                "allowed_triggers": keep(self.allowed_triggers, frozenset(other.allowed_triggers)),
-                "queue_tier": max(self.queue_tier, other.queue_tier),
-                "queue_weight": min(self.queue_weight, other.queue_weight),
-                "max_concurrency": min(self.max_concurrency, other.max_concurrency),
-                "max_waiters": min(self.max_waiters, other.max_waiters),
-                "deadline_ms": min(self.deadline_ms, other.deadline_ms),
-            }
+        current = {leg.identity: leg for leg in other.authorized_legs}
+        authorized_legs = tuple(
+            intersection
+            for admitted in self.authorized_legs
+            if (candidate := current.get(admitted.identity)) is not None
+            if (intersection := admitted.intersection(candidate)) is not None
+        )
+        return type(self)(
+            key_id=self.key_id,
+            credential_generation=self.credential_generation,
+            policy_id=self.policy_id,
+            bundle_generation=self.bundle_generation,
+            bundle_hash=self.bundle_hash,
+            route_group_id=self.route_group_id,
+            authorized_legs=authorized_legs,
+            queue_tier=max(self.queue_tier, other.queue_tier),
+            queue_weight=min(self.queue_weight, other.queue_weight),
+            max_concurrency=min(self.max_concurrency, other.max_concurrency),
+            max_waiters=min(self.max_waiters, other.max_waiters),
+            deadline_ms=min(self.deadline_ms, other.deadline_ms),
         )
 
 
@@ -386,8 +504,17 @@ class PolicyBundleV1(_Frozen):
     @model_validator(mode="after")
     def _exact_membership(self) -> Self:
         accounts = {a.account_id for a in self.accounts}
-        groups = {g.route_group_id for g in self.route_groups}
+        groups_by_id = {group.route_group_id: group for group in self.route_groups}
+        groups = frozenset(groups_by_id)
         policies = {p.policy_id for p in self.policies}
+        legs_by_id = {
+            leg.leg_id: leg for group in self.route_groups for leg in group.legs
+        }
+        leg_groups = {
+            leg.leg_id: group.route_group_id
+            for group in self.route_groups
+            for leg in group.legs
+        }
 
         for label, seen in (
             ("account_id", [a.account_id for a in self.accounts]),
@@ -426,10 +553,46 @@ class PolicyBundleV1(_Frozen):
                     f"policy {pol.policy_id} references unknown route_group: "
                     f"{', '.join(str(g) for g in missing_groups)}"
                 )
-            if missing_accounts := [a for a in pol.allowed_account_ids if a not in accounts]:
+            policy_groups = frozenset(pol.route_group_ids)
+            covered_groups: set[RouteGroupId] = set()
+            for authorized in pol.authorized_legs:
+                if authorized.account_id not in accounts:
+                    raise ValueError(
+                        f"policy {pol.policy_id} grants unknown account "
+                        f"{authorized.account_id}"
+                    )
+                actual = legs_by_id.get(authorized.leg_id)
+                if actual is None:
+                    raise ValueError(
+                        f"policy {pol.policy_id} authorizes unknown leg {authorized.leg_id}"
+                    )
+                group_id = leg_groups[authorized.leg_id]
+                if group_id not in policy_groups:
+                    raise ValueError(
+                        f"policy {pol.policy_id} authorizes a leg outside its route groups"
+                    )
+                if authorized.identity != (
+                    actual.leg_id,
+                    actual.account_id,
+                    actual.generation_id,
+                    actual.order,
+                ):
+                    raise ValueError(
+                        f"policy {pol.policy_id} authorized leg identity does not match bundle"
+                    )
+                if not set(authorized.allowed_triggers).issubset(actual.triggers):
+                    raise ValueError(
+                        f"policy {pol.policy_id} grants a trigger absent from its route leg"
+                    )
+                if authorized.capabilities != actual.capabilities:
+                    raise ValueError(
+                        f"policy {pol.policy_id} capabilities do not match its route leg"
+                    )
+                covered_groups.add(group_id)
+            if missing_coverage := policy_groups - covered_groups:
                 raise ValueError(
-                    f"policy {pol.policy_id} grants unknown account: "
-                    f"{', '.join(str(a) for a in missing_accounts)}"
+                    f"policy {pol.policy_id} has no authorized leg for route group: "
+                    f"{', '.join(str(group) for group in sorted(missing_coverage, key=str))}"
                 )
 
         for key in self.keys:

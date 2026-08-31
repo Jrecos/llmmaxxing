@@ -20,9 +20,10 @@ from llmmaxxing.core.ids import (
     InstallationId,
     RequestId,
     RouteGroupId,
+    RouteLegId,
 )
 from llmmaxxing.core.models import ProviderAccount, QuotaDimension, RequestProfile
-from llmmaxxing.core.reasons import Modality, QuotaDimensionStatus, TerminalOutcome
+from llmmaxxing.core.reasons import EndpointKind, Modality, QuotaDimensionStatus, TerminalOutcome
 from llmmaxxing.core.state_machines import AccountState
 from llmmaxxing.gateway.journal import AttemptJournal
 from llmmaxxing.gateway.runtime_state import (
@@ -100,12 +101,14 @@ def profile(*, tokens: int, deadline_ms: int = 60_000) -> RequestProfile:
     return RequestProfile(
         route_group_id=RouteGroupId.new(),
         model_alias="deepseek-v4-flash",
+        endpoint=EndpointKind.CHAT,
         modality=Modality.CHAT,
         stream=False,
         input_tokens_max=tokens,
         output_tokens_max=0,
         reasoning_tokens_max=0,
         tools_count=0,
+        forced_tool_required=False,
         response_schema_present=False,
         history_turns=0,
         deadline_ms=deadline_ms,
@@ -127,6 +130,7 @@ def request(
         request_id=RequestId.new(),
         attempt_id=attempt_id or AttemptId.new(),
         account_id=provider_account.account_id,
+        leg_id=RouteLegId.new(),
         deployment_generation_id=DeploymentGenerationId.from_digest(generation * 64),
         runtime_identity=RuntimeIdentity(
             installation_id=InstallationId.new(),

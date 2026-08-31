@@ -8,7 +8,7 @@ from typing import Any, cast
 
 from llmmaxxing.config.schema import AuthoringConfigV1, AuthoringPolicy, PolicyMacro
 from llmmaxxing.core.ids import AccountId, PolicyRevisionId
-from llmmaxxing.core.models import KeyPolicyRevision, PolicyBundleV1
+from llmmaxxing.core.models import AuthorizedLeg, KeyPolicyRevision, PolicyBundleV1
 from llmmaxxing.core.state_machines import AccountState
 
 _QUEUE_FIELDS = (
@@ -59,7 +59,7 @@ def _selected_accounts(
         if not selected:
             raise ValueError(f"account selector for policy {spec.policy_id} matched no accounts")
     elif source is not None:
-        selected = source.allowed_account_ids
+        selected = tuple({leg.account_id for leg in source.authorized_legs})
     else:
         raise ValueError("direct policy requires account_ids or account_selector")
     return tuple(sorted(selected, key=str))
@@ -70,6 +70,7 @@ def _materialize_policy(
     source: KeyPolicyRevision | None,
     macro: PolicyMacro | None,
     labels: Mapping[AccountId, Mapping[str, str]],
+    base: PolicyBundleV1,
 ) -> KeyPolicyRevision:
     inherited: dict[str, Any] = source.model_dump(mode="python") if source is not None else {}
     route_group_ids = tuple(
@@ -82,22 +83,85 @@ def _materialize_policy(
             key=str,
         )
     )
-    allowed_triggers = tuple(
-        sorted(
-            _pick(
-                spec.allowed_triggers,
-                inherited.get("allowed_triggers"),
-                field="allowed_triggers",
-            ),
-            key=lambda trigger: trigger.value,
+    authorization_changed = any(
+        value is not None
+        for value in (
+            spec.route_group_ids,
+            spec.account_ids,
+            spec.account_selector,
+            spec.allowed_triggers,
         )
     )
+    if source is not None and not authorization_changed:
+        authorized_legs = source.authorized_legs
+    else:
+        allowed_accounts = frozenset(_selected_accounts(spec, source, labels))
+        inherited_triggers = (
+            tuple(
+                sorted(
+                    {
+                        trigger
+                        for leg in source.authorized_legs
+                        for trigger in leg.allowed_triggers
+                    },
+                    key=lambda trigger: trigger.value,
+                )
+            )
+            if source is not None
+            else None
+        )
+        allowed_triggers = frozenset(
+            _pick(
+                spec.allowed_triggers,
+                inherited_triggers,
+                field="allowed_triggers",
+            )
+        )
+        groups = {group.route_group_id: group for group in base.route_groups}
+        for account_id in allowed_accounts:
+            account = next(
+                (item for item in base.accounts if item.account_id == account_id),
+                None,
+            )
+            if account is None:
+                raise ValueError(
+                    f"policy {spec.policy_id} grants unknown account {account_id}"
+                )
+            state = account.state
+            if state is not AccountState.ACTIVE:
+                raise ValueError(
+                    f"policy {spec.policy_id} grants non-active account {account_id} "
+                    f"in state {state.value if state is not None else 'unset'}"
+                )
+        projected: list[AuthorizedLeg] = []
+        for group_id in route_group_ids:
+            group = groups.get(group_id)
+            if group is None:
+                raise ValueError(f"policy {spec.policy_id} grants unknown route group {group_id}")
+            for leg in group.legs:
+                triggers = tuple(
+                    trigger for trigger in leg.triggers if trigger in allowed_triggers
+                )
+                if leg.account_id in allowed_accounts and triggers:
+                    projected.append(
+                        AuthorizedLeg(
+                            leg_id=leg.leg_id,
+                            account_id=leg.account_id,
+                            generation_id=leg.generation_id,
+                            order=leg.order,
+                            allowed_triggers=triggers,
+                            capabilities=leg.capabilities,
+                        )
+                    )
+        authorized_legs = tuple(projected)
+        if not authorized_legs:
+            raise ValueError(f"policy {spec.policy_id} has no usable route")
+
     values: dict[str, object] = {
         "policy_id": spec.policy_id,
         "name": _pick(spec.name, inherited.get("name"), field="name"),
         "route_group_ids": route_group_ids,
-        "allowed_account_ids": _selected_accounts(spec, source, labels),
-        "allowed_triggers": allowed_triggers,
+        "authorized_legs": authorized_legs,
     }
     for field in _QUEUE_FIELDS:
         values[field] = _pick(
@@ -115,30 +179,31 @@ def _validate_runtime_routes(
 ) -> None:
     accounts = {account.account_id: account for account in base.accounts}
     groups = {group.route_group_id: group for group in base.route_groups}
+    leg_groups = {
+        leg.leg_id: group.route_group_id
+        for group in base.route_groups
+        for leg in group.legs
+    }
 
-    for account_id in policy.allowed_account_ids:
-        account = accounts.get(account_id)
+    for authorized in policy.authorized_legs:
+        account = accounts.get(authorized.account_id)
         if account is None:
-            raise ValueError(f"policy {policy.policy_id} grants unknown account {account_id}")
+            raise ValueError(
+                f"policy {policy.policy_id} grants unknown account {authorized.account_id}"
+            )
         state = account.state
         if state is not AccountState.ACTIVE:
             raise ValueError(
-                f"policy {policy.policy_id} grants non-active account {account_id} "
-                f"in state {state.value if state is not None else 'unset'}"
+                f"policy {policy.policy_id} grants non-active account "
+                f"{authorized.account_id} in state "
+                f"{state.value if state is not None else 'unset'}"
             )
 
-    allowed_accounts = frozenset(policy.allowed_account_ids)
-    allowed_triggers = frozenset(policy.allowed_triggers)
+    covered = frozenset(leg_groups[leg.leg_id] for leg in policy.authorized_legs)
     for group_id in policy.route_group_ids:
-        group = groups.get(group_id)
-        if group is None:
+        if group_id not in groups:
             raise ValueError(f"policy {policy.policy_id} grants unknown route group {group_id}")
-        usable = any(
-            leg.account_id in allowed_accounts
-            and any(trigger in allowed_triggers for trigger in leg.triggers)
-            for leg in group.legs
-        )
-        if not usable:
+        if group_id not in covered:
             raise ValueError(
                 f"policy {policy.policy_id} has no usable route for route group {group_id}"
             )
@@ -183,7 +248,7 @@ def compile_authoring(
             if source is None:
                 raise ValueError(f"unknown clone source policy {spec.clone_from_policy_id}")
         macro = config.macros.get(spec.macro) if spec.macro is not None else None
-        materialized = _materialize_policy(spec, source, macro, discovery.labels)
+        materialized = _materialize_policy(spec, source, macro, discovery.labels, base)
         _validate_runtime_routes(materialized, base)
         additions.append(materialized)
         if spec.rebind_shared:
