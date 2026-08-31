@@ -68,6 +68,7 @@ from llmmaxxing.gateway.routing import (
 )
 from llmmaxxing.gateway.runtime_state import (
     AttemptResolution,
+    CircuitOperationalValue,
     CircuitState,
     CircuitValue,
     ReservationGranted,
@@ -96,6 +97,16 @@ class FakeClock:
 
     def now_ms(self) -> int:
         return self.value
+
+
+class GenerationGate:
+    def __init__(self, allowed: bool = True) -> None:
+        self.allowed = allowed
+
+    def permits(self, leg: AuthorizedLeg, backend_manifest_hash: str) -> bool:
+        assert leg.generation_id
+        assert len(backend_manifest_hash) == 64
+        return self.allowed
 
 
 def quota(value: int = 100_000) -> QuotaDimension:
@@ -132,6 +143,9 @@ def capabilities(*, shadow: bool = False, context_tokens: int = 32_768) -> LegCa
         tools=True,
         forced_tool=True,
         response_schema=True,
+        streaming=True,
+        reasoning=True,
+        history_continuation=True,
         shadow=shadow,
     )
 
@@ -298,7 +312,7 @@ def runtime(tmp_path: Path, bundle: PolicyBundleV1) -> tuple[AttemptJournal, Run
 
 def test_authorized_leg_intersection_is_exact_and_expansions_never_enter_queue() -> None:
     bundle = make_bundle()
-    ceiling = RouteEngine(bundle).authorize(client(bundle), profile())
+    ceiling = RouteEngine(bundle, GenerationGate()).authorize(client(bundle), profile())
     primary, spill, _ = ceiling.authorized_legs
 
     expanded = ceiling.model_copy(
@@ -359,7 +373,7 @@ def test_authorized_leg_intersection_is_exact_and_expansions_never_enter_queue()
 
 def test_closed_profile_capability_semantics_reject_each_unsupported_shape(tmp_path: Path) -> None:
     bundle = make_bundle()
-    engine = RouteEngine(bundle)
+    engine = RouteEngine(bundle, GenerationGate())
     ceiling = engine.authorize(client(bundle), profile())
     journal, state = runtime(tmp_path, bundle)
     try:
@@ -373,6 +387,9 @@ def test_closed_profile_capability_semantics_reject_each_unsupported_shape(tmp_p
             profile(tools_count=1),
             profile(tools_count=1, forced_tool_required=True),
             profile(response_schema_present=True),
+            profile(stream=True),
+            profile(reasoning_tokens_max=1),
+            profile(history_turns=1),
         )
         restricted = primary.model_copy(
             update={
@@ -381,6 +398,9 @@ def test_closed_profile_capability_semantics_reject_each_unsupported_shape(tmp_p
                         "tools": False,
                         "forced_tool": False,
                         "response_schema": False,
+                        "streaming": False,
+                        "reasoning": False,
+                        "history_continuation": False,
                     }
                 )
             }
@@ -393,9 +413,31 @@ def test_closed_profile_capability_semantics_reject_each_unsupported_shape(tmp_p
         journal.close()
 
 
+def test_generation_evidence_gate_blocks_before_reservation(tmp_path: Path) -> None:
+    bundle = make_bundle()
+    with pytest.raises(TypeError):
+        RouteEngine(bundle)  # type: ignore[call-arg]
+    engine = RouteEngine(bundle, GenerationGate(allowed=False))
+    ceiling = engine.authorize(client(bundle), profile())
+    journal, state = runtime(tmp_path, bundle)
+    try:
+        assert (
+            engine.filter(
+                ceiling,
+                profile(),
+                DispatchCause.PRIMARY,
+                state.operational_view(),
+                context(),
+            )
+            == ()
+        )
+    finally:
+        journal.close()
+
+
 def test_primary_capacity_failure_and_quota_causes_never_cross_activate(tmp_path: Path) -> None:
     bundle = make_bundle()
-    engine = RouteEngine(bundle)
+    engine = RouteEngine(bundle, GenerationGate())
     ceiling = engine.authorize(client(bundle), profile())
     journal, state = runtime(tmp_path, bundle)
     try:
@@ -406,7 +448,6 @@ def test_primary_capacity_failure_and_quota_causes_never_cross_activate(tmp_path
         )
         for cause in (DispatchCause.CAPACITY, DispatchCause.FAILURE, DispatchCause.QUOTA):
             assert engine.select(ceiling, profile(), cause, view, context()).leg_id == SPILL_LEG
-
         full_nan = replace(view.accounts[0], active_attempts=view.accounts[0].parallel_limit)
         full_view = replace(view, accounts=(full_nan, *view.accounts[1:]))
         assert (
@@ -416,14 +457,52 @@ def test_primary_capacity_failure_and_quota_causes_never_cross_activate(tmp_path
             engine.select(ceiling, profile(), DispatchCause.CAPACITY, full_view, context()).leg_id
             == SPILL_LEG
         )
-        assert engine.primary_capacity_unavailable(ceiling, profile(), full_view)
+        assert (
+            engine.primary_blocking_cause(ceiling, profile(), full_view) is DispatchCause.CAPACITY
+        )
+    finally:
+        journal.close()
+
+
+def test_primary_fallback_requires_agreeing_open_circuit_causes(tmp_path: Path) -> None:
+    bundle = make_bundle()
+    engine = RouteEngine(bundle, GenerationGate())
+    ceiling = engine.authorize(client(bundle), profile())
+    journal, state = runtime(tmp_path, bundle)
+    failure = CircuitValue(
+        state=CircuitState.OPEN,
+        cause="transient_failure",
+        epoch=1,
+        opened_at_ms=NOW,
+        retry_at_ms=NOW + 15_000,
+        backoff_step=0,
+        evidence_digest="sha256:" + "a" * 64,
+        probe_id=None,
+    )
+    quota_circuit = failure.model_copy(
+        update={"cause": "quota", "evidence_digest": "sha256:" + "b" * 64}
+    )
+    try:
+        view = state.operational_view()
+        failed_view = replace(
+            view,
+            accounts=(replace(view.accounts[0], account_circuit=failure), *view.accounts[1:]),
+        )
+        assert (
+            engine.primary_blocking_cause(ceiling, profile(), failed_view) is DispatchCause.FAILURE
+        )
+        mixed = replace(
+            failed_view,
+            circuits=(CircuitOperationalValue(NAN, NAN_GEN, quota_circuit),),
+        )
+        assert engine.primary_blocking_cause(ceiling, profile(), mixed) is None
     finally:
         journal.close()
 
 
 def test_shadow_capability_and_trigger_are_never_serving(tmp_path: Path) -> None:
     bundle = make_bundle(spill=False, shadow=True)
-    engine = RouteEngine(bundle)
+    engine = RouteEngine(bundle, GenerationGate())
     ceiling = engine.authorize(client(bundle), profile())
     journal, state = runtime(tmp_path, bundle)
     try:
@@ -439,7 +518,7 @@ def test_shadow_capability_and_trigger_are_never_serving(tmp_path: Path) -> None
 
 def test_manual_emergency_requires_leg_fence_unexpired_window_and_deadline(tmp_path: Path) -> None:
     bundle = make_bundle()
-    engine = RouteEngine(bundle)
+    engine = RouteEngine(bundle, GenerationGate())
     ceiling = engine.authorize(client(bundle), profile())
     journal, state = runtime(tmp_path, bundle)
     try:
@@ -620,7 +699,7 @@ def test_account_circuit_gates_all_legs_and_stale_probe_cannot_close(tmp_path: P
         opened = circuits.open(NAN, NAN_GEN, classification, now_ms=NOW)
         assert opened is not None and opened.state is CircuitState.OPEN
         view = state.operational_view()
-        engine = RouteEngine(bundle)
+        engine = RouteEngine(bundle, GenerationGate())
         ceiling = engine.authorize(client(bundle), profile())
         assert engine.select(ceiling, profile(), DispatchCause.PRIMARY, view, context()) is None
 
@@ -663,9 +742,11 @@ def test_deployment_probe_cannot_mutate_account_scope(tmp_path: Path) -> None:
         assert state.account_runtime(NAN).account_circuit_value() == CircuitValue.closed()
         probe = circuits.begin_probe(NAN, NAN_GEN, now_ms=opened.retry_at_ms)
         assert probe is not None and probe.scope is FailureScope.DEPLOYMENT
-        assert circuits.probe_failed(probe, capacity, now_ms=opened.retry_at_ms) is None
-        assert circuits.probe_succeeded(probe)
-        assert state.account_runtime(NAN).circuit_value(NAN_GEN).state is CircuitState.CLOSED
+        reopened = circuits.probe_failed(probe, capacity, now_ms=opened.retry_at_ms)
+        assert reopened is not None and reopened.state is CircuitState.OPEN
+        assert reopened.epoch > probe.value.epoch
+        assert not circuits.probe_succeeded(probe)
+        assert state.account_runtime(NAN).circuit_value(NAN_GEN) == reopened
     finally:
         journal.close()
 
@@ -674,7 +755,7 @@ def test_attempt_budget_is_three_sends_distinct_generation_or_named_probe_and_no
     None
 ):
     bundle = make_bundle()
-    engine = RouteEngine(bundle)
+    engine = RouteEngine(bundle, GenerationGate())
     ceiling = engine.authorize(client(bundle), profile())
     primary = engine.candidate(ceiling.authorized_legs[0], DispatchCause.PRIMARY)
     spill = engine.candidate(ceiling.authorized_legs[1], DispatchCause.CAPACITY)
@@ -810,7 +891,7 @@ def test_attempt_budget_restores_terminal_sends_from_the_durable_runtime(
 
 def test_route_engine_authorize_rejects_unbound_route_and_preserves_bundle_identity() -> None:
     bundle = make_bundle()
-    engine = RouteEngine(bundle)
+    engine = RouteEngine(bundle, GenerationGate())
     admitted = client(bundle)
     ceiling = engine.authorize(admitted, profile())
     assert isinstance(ceiling, RequestAuthorizationCeiling)

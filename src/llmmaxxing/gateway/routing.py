@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from typing import Self
+from typing import Protocol, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -108,6 +108,16 @@ class RoutingContext:
     def __post_init__(self) -> None:
         if self.now_ms < 1 or self.deadline_at_ms < 1 or self.dispatcher_fence < 1:
             raise ValueError("routing context values must be positive")
+
+
+class GenerationOperationalGate(Protocol):
+    """Task 5 supplies current presence/evidence/generation/guard authorization."""
+
+    def permits(
+        self,
+        leg: AuthorizedLeg,
+        backend_manifest_hash: str,
+    ) -> bool: ...
 
 
 class FailureObservation(_Frozen):
@@ -335,7 +345,12 @@ class AttemptBudget:
 class RouteEngine:
     """Current complete authorization plus immutable admission-ceiling intersection."""
 
-    def __init__(self, bundle: PolicyBundleV1) -> None:
+    def __init__(
+        self,
+        bundle: PolicyBundleV1,
+        generation_gate: GenerationOperationalGate,
+    ) -> None:
+        self._generation_gate = generation_gate
         self.activate(bundle)
 
     def activate(self, bundle: PolicyBundleV1) -> None:
@@ -436,13 +451,26 @@ class RouteEngine:
             and (profile.tools_count == 0 or capabilities.tools)
             and (not profile.forced_tool_required or capabilities.forced_tool)
             and (not profile.response_schema_present or capabilities.response_schema)
+            and (not profile.stream or capabilities.streaming)
+            and (profile.reasoning_tokens_max == 0 or capabilities.reasoning)
+            and (profile.history_turns == 0 or capabilities.history_continuation)
         )
 
-    @staticmethod
-    def _operationally_available(leg: AuthorizedLeg, view: OperationalRuntimeView) -> bool:
+    def _operationally_available(self, leg: AuthorizedLeg, view: OperationalRuntimeView) -> bool:
+        try:
+            generation_allowed = self._generation_gate.permits(
+                leg, self.bundle.backend_manifest_hash
+            )
+        except Exception:
+            return False
+        if not generation_allowed:
+            return False
         if view.recovery_state is not JournalStatus.HEALTHY:
             return False
-        account = next((item for item in view.accounts if item.account_id == leg.account_id), None)
+        account = next(
+            (item for item in view.accounts if item.account_id == leg.account_id),
+            None,
+        )
         if (
             account is None
             or account.state is not AccountState.ACTIVE
@@ -488,12 +516,12 @@ class RouteEngine:
             return False
         return context.now_ms < context.deadline_at_ms and self._operationally_available(leg, view)
 
-    def primary_capacity_unavailable(
+    def primary_blocking_cause(
         self,
         authorization: RequestAuthorizationCeiling,
         profile: RequestProfile,
         view: OperationalRuntimeView,
-    ) -> bool:
+    ) -> DispatchCause | None:
         primaries = tuple(
             leg
             for leg in authorization.authorized_legs
@@ -502,19 +530,43 @@ class RouteEngine:
             and self._capabilities_allow(leg, profile)
         )
         if not primaries:
-            return False
+            return None
+        causes: set[DispatchCause] = set()
+        circuit_causes = {
+            CircuitCause.CAPACITY: DispatchCause.CAPACITY,
+            CircuitCause.TRANSIENT_FAILURE: DispatchCause.FAILURE,
+            CircuitCause.QUOTA: DispatchCause.QUOTA,
+        }
         for leg in primaries:
             account = next(
                 (value for value in view.accounts if value.account_id == leg.account_id),
                 None,
             )
-            if account is None or account.state is not AccountState.ACTIVE:
-                return False
-            account_capacity = account.active_attempts >= account.parallel_limit
-            account_circuit = (
-                account.account_circuit.state is CircuitState.OPEN
-                and account.account_circuit.cause is CircuitCause.CAPACITY
-            )
+            if (
+                account is None
+                or account.state is not AccountState.ACTIVE
+                or account.recovery_probe_in_flight
+            ):
+                return None
+            try:
+                generation_allowed = self._generation_gate.permits(
+                    leg, self.bundle.backend_manifest_hash
+                )
+            except Exception:
+                return None
+            if not generation_allowed:
+                return None
+            blockers: set[DispatchCause] = set()
+            if account.active_attempts >= account.parallel_limit:
+                blockers.add(DispatchCause.CAPACITY)
+            if account.account_circuit.state is CircuitState.OPEN:
+                circuit_cause = account.account_circuit.cause
+                if circuit_cause is None:
+                    return None
+                cause = circuit_causes.get(circuit_cause)
+                if cause is None:
+                    return None
+                blockers.add(cause)
             deployment = next(
                 (
                     item.value
@@ -524,12 +576,18 @@ class RouteEngine:
                 ),
                 CircuitValue.closed(),
             )
-            deployment_capacity = (
-                deployment.state is CircuitState.OPEN and deployment.cause is CircuitCause.CAPACITY
-            )
-            if not (account_capacity or account_circuit or deployment_capacity):
-                return False
-        return True
+            if deployment.state is CircuitState.OPEN:
+                circuit_cause = deployment.cause
+                if circuit_cause is None:
+                    return None
+                cause = circuit_causes.get(circuit_cause)
+                if cause is None:
+                    return None
+                blockers.add(cause)
+            if len(blockers) != 1:
+                return None
+            causes.update(blockers)
+        return next(iter(causes)) if len(causes) == 1 else None
 
     def filter(
         self,
@@ -710,18 +768,43 @@ class CircuitController:
         *,
         now_ms: int,
     ) -> CircuitValue | None:
-        if classification.cause is FailureCause.UNKNOWN or classification.scope is not probe.scope:
-            return None
         runtime = self._runtime.account_runtime(probe.account_id)
-        replacement = self._replacement(
-            probe.value,
-            classification,
-            now_ms=now_ms,
-            step=min(probe.value.backoff_step + 1, 2),
-        )
+        step = min(probe.value.backoff_step + 1, 2)
+        if classification.cause is not FailureCause.UNKNOWN and classification.scope is probe.scope:
+            replacement = self._replacement(
+                probe.value,
+                classification,
+                now_ms=now_ms,
+                step=step,
+            )
+        else:
+            assert probe.value.cause is not None
+            assert probe.value.evidence_digest is not None
+            replacement = CircuitValue(
+                state=CircuitState.OPEN,
+                cause=probe.value.cause,
+                epoch=probe.value.epoch + 1,
+                opened_at_ms=now_ms,
+                retry_at_ms=now_ms + self._backoff_ms(step, probe.value.evidence_digest),
+                backoff_step=step,
+                evidence_digest=probe.value.evidence_digest,
+                probe_id=None,
+            )
         swapped = (
             runtime.compare_and_swap_account_circuit(probe.value, replacement)
             if probe.scope is FailureScope.ACCOUNT
             else runtime.compare_and_swap_circuit(probe.generation_id, probe.value, replacement)
         )
         return replacement if swapped else None
+
+    def probe_abandoned(self, probe: CircuitProbe, *, now_ms: int) -> CircuitValue | None:
+        return self.probe_failed(
+            probe,
+            FailureClassification(
+                cause=FailureCause.UNKNOWN,
+                scope=FailureScope.UNKNOWN,
+                evidence_digest=probe.value.evidence_digest or "sha256:" + "0" * 64,
+                pre_response_bytes=True,
+            ),
+            now_ms=now_ms,
+        )

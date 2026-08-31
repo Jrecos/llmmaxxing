@@ -294,6 +294,11 @@
           "title": "Forced Tool",
           "type": "boolean"
         },
+        "history_continuation": {
+          "default": false,
+          "title": "History Continuation",
+          "type": "boolean"
+        },
         "modalities": {
           "items": {
             "$ref": "#/$defs/Modality"
@@ -302,12 +307,22 @@
           "title": "Modalities",
           "type": "array"
         },
+        "reasoning": {
+          "default": false,
+          "title": "Reasoning",
+          "type": "boolean"
+        },
         "response_schema": {
           "title": "Response Schema",
           "type": "boolean"
         },
         "shadow": {
           "title": "Shadow",
+          "type": "boolean"
+        },
+        "streaming": {
+          "default": false,
+          "title": "Streaming",
           "type": "boolean"
         },
         "tools": {

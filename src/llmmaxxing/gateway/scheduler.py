@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from collections.abc import Callable, Mapping
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
+from functools import partial
 from typing import Protocol, Self
 
 from llmmaxxing.core.ids import AccountId, AttemptId, RequestId
@@ -16,7 +18,11 @@ from llmmaxxing.core.models import (
     RequestProfile,
 )
 from llmmaxxing.core.reasons import DispatchCause, TerminalOutcome
-from llmmaxxing.gateway.auth import AuthenticatedClient
+from llmmaxxing.gateway.auth import (
+    AuthenticatedClient,
+    AuthRuntimeView,
+    queued_identity_is_authorized,
+)
 from llmmaxxing.gateway.routing import (
     AttemptBudget,
     Candidate,
@@ -125,6 +131,15 @@ class WDRRQueue:
     def entry(self, request_id: RequestId) -> QueueEntry:
         return self._queued[request_id].entry
 
+    def key_position(self, request_id: RequestId) -> int:
+        target = self._queued[request_id]
+        return sum(
+            item.entry.key_id == target.entry.key_id
+            and (item.sequence, str(item.entry.request_id))
+            < (target.sequence, str(target.entry.request_id))
+            for item in self._queued.values()
+        )
+
     def enqueue(self, entry: QueueEntry) -> None:
         if entry.request_id in self._queued:
             raise ValueError("duplicate queued request")
@@ -172,6 +187,20 @@ class WDRRQueue:
         )
         object.__setattr__(updated, "scarcity", old.scarcity)
         self._queued[request_id] = _Queued(updated, queued.sequence)
+        if new_tier == old.tier and new_weight < old.weight:
+            class_deficits, class_cursors, key_deficits, key_cursors = self._decode_state(
+                self._fairness
+            )
+            key = (old.tier, old.scarcity, old.key_id)
+            if key in key_deficits:
+                key_deficits[key] = min(key_deficits[key], 8 * new_weight)
+                self._fairness = self._encode_state(
+                    class_deficits,
+                    class_cursors,
+                    key_deficits,
+                    key_cursors,
+                    self._fairness.higher_grant_streak,
+                )
         self._version += 1
         return updated
 
@@ -263,7 +292,7 @@ class WDRRQueue:
             scarcity = Scarcity.FLEXIBLE if scarcity is Scarcity.SCARCE else Scarcity.SCARCE
         quantum = 2 if scarcity is Scarcity.SCARCE else 1
         class_key = (tier, scarcity)
-        class_deficit = class_deficits.get(class_key, 0)
+        class_deficit = min(class_deficits.get(class_key, 0), 8 * quantum)
         if class_deficit <= 0:
             class_deficit = min(class_deficit + quantum, 8 * quantum)
         class_items = [item for item in tier_items if item.entry.scarcity is scarcity]
@@ -281,7 +310,7 @@ class WDRRQueue:
         weights = [item.entry.weight for item in class_items if item.entry.key_id == key_id]
         key_quantum = min(weights)
         key_key = (tier, scarcity, key_id)
-        key_deficit = key_deficits.get(key_key, 0)
+        key_deficit = min(key_deficits.get(key_key, 0), 8 * key_quantum)
         if key_deficit <= 0:
             key_deficit = min(key_deficit + key_quantum, 8 * key_quantum)
         selected = self._oldest([item for item in class_items if item.entry.key_id == key_id])
@@ -392,6 +421,12 @@ class AdmissionClock(Protocol):
     def now_ms(self) -> int: ...
 
 
+class AuthViewProvider(Protocol):
+    """Task 4/9 supplies the current deny/credential/key authorization view."""
+
+    def current_auth_view(self) -> AuthRuntimeView: ...
+
+
 class AdmissionUnavailable(RuntimeError):
     pass
 
@@ -429,28 +464,62 @@ class AdmissionRequest:
 class _Waiter:
     request: AdmissionRequest
     future: asyncio.Future[DispatchLease]
-    cause: DispatchCause
+    effective_ceiling: RequestAuthorizationCeiling
+    admitted_at_ms: int
+    effective_deadline_at_ms: int
+    fallback_once: DispatchCause | None = None
     state: WaiterState = WaiterState.QUEUED
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class DispatchLease:
-    """Task 6 lease plus the exact durable candidate/send-budget record."""
+    """Task 6 lease plus an idempotently released per-key active permit."""
 
     lease: Lease
     candidate: Candidate
     attempt_id: AttemptId
     attempt_budget: AttemptBudget
+    _release_active: Callable[[], None]
+    _released: bool = False
+    _release_lock: threading.Lock = field(default_factory=threading.Lock)
 
     @property
     def terminal(self) -> bool:
         return self.lease.terminal
 
+    def _release(self) -> None:
+        with self._release_lock:
+            if self._released:
+                return
+            self._released = True
+        self._release_active()
+
     def finish(self, resolution: AttemptResolution) -> object:
-        return self.lease.finish(resolution)
+        result = self.lease.finish(resolution)
+        self._release()
+        return result
 
     async def finish_async(self, resolution: AttemptResolution) -> object:
-        return await self.lease.finish_async(resolution)
+        worker = asyncio.create_task(self.lease.finish_async(resolution))
+        try:
+            result = await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            await asyncio.shield(worker)
+            self._release()
+            raise
+        self._release()
+        return result
+
+    async def cancel_before_send(self) -> object:
+        return await self.finish_async(
+            AttemptResolution(
+                outcome=TerminalOutcome.CLIENT_CANCELLED,
+                release_capacity=True,
+                actual_starts=0,
+                actual_token_units=0,
+                actual_quota_units=0,
+            )
+        )
 
     def mark_response_started(self) -> None:
         self.attempt_budget.mark_response_started()
@@ -464,6 +533,7 @@ class AdmissionController:
         route_engine: RouteEngine,
         runtime: RuntimeState,
         activation_gate: ActivationGate,
+        auth_view_provider: AuthViewProvider,
         *,
         clock: AdmissionClock,
         attempt_id_factory: Callable[[], AttemptId] = AttemptId.new,
@@ -474,34 +544,86 @@ class AdmissionController:
         self._route_engine = route_engine
         self._runtime = runtime
         self._activation_gate = activation_gate
+        self._auth_view_provider = auth_view_provider
         self._clock = clock
         self._attempt_id_factory = attempt_id_factory
         self._max_waiters_global = max_waiters_global
         self._queue = WDRRQueue()
         self._waiters: dict[RequestId, _Waiter] = {}
         self._pump_lock = asyncio.Lock()
+        self._active_lock = threading.Lock()
+        self._active_by_key: dict[str, int] = {}
+        self._loop: asyncio.AbstractEventLoop | None = None
 
-    def _routing_context(self, request: AdmissionRequest) -> RoutingContext:
+    def _active_count(self, key_id: str) -> int:
+        with self._active_lock:
+            return self._active_by_key.get(key_id, 0)
+
+    def _acquire_active(self, key_id: str, maximum: int) -> bool:
+        with self._active_lock:
+            current = self._active_by_key.get(key_id, 0)
+            if current >= maximum:
+                return False
+            self._active_by_key[key_id] = current + 1
+            return True
+
+    def _release_active(self, key_id: str, *, wake: bool = True) -> None:
+        with self._active_lock:
+            current = self._active_by_key.get(key_id, 0)
+            if current <= 1:
+                self._active_by_key.pop(key_id, None)
+            else:
+                self._active_by_key[key_id] = current - 1
+        loop = self._loop
+        if wake and loop is not None and loop.is_running():
+            loop.call_soon_threadsafe(lambda: asyncio.create_task(self.wake()))
+
+    def _routing_context(self, waiter: _Waiter) -> RoutingContext:
         return RoutingContext(
             now_ms=self._clock.now_ms(),
-            deadline_at_ms=request.deadline_at_ms,
-            dispatcher_fence=request.runtime_identity.dispatcher_fence,
-            emergency=request.emergency,
+            deadline_at_ms=waiter.effective_deadline_at_ms,
+            dispatcher_fence=waiter.request.runtime_identity.dispatcher_fence,
+            emergency=waiter.request.emergency,
         )
 
     def _current_authorization(
         self,
-        request: AdmissionRequest,
+        waiter: _Waiter,
     ) -> RequestAuthorizationCeiling:
-        current = self._route_engine.authorize(request.client, request.profile)
-        return request.authorization_ceiling.intersection(current)
+        try:
+            auth_view = self._auth_view_provider.current_auth_view()
+            authorized = queued_identity_is_authorized(
+                waiter.request.client,
+                auth_view,
+            )
+        except Exception as error:
+            raise AdmissionUnavailable("queued authorization state unavailable") from error
+        if not authorized:
+            raise AdmissionUnavailable("queued client authorization is no longer valid")
+        current = self._route_engine.authorize(waiter.request.client, waiter.request.profile)
+        contracted = waiter.effective_ceiling.intersection(current)
+        waiter.effective_ceiling = contracted
+        waiter.effective_deadline_at_ms = min(
+            waiter.effective_deadline_at_ms,
+            waiter.admitted_at_ms + contracted.deadline_ms,
+        )
+        if not contracted.authorized_legs:
+            raise AdmissionUnavailable("queued route authorization contracted to empty")
+        if self._queue.key_position(waiter.request.request_id) >= contracted.max_waiters:
+            raise AdmissionUnavailable("queued key waiter ceiling contracted")
+        return contracted
+
+    def _fail_waiter_locked(self, waiter: _Waiter, error: BaseException) -> None:
+        self._waiters.pop(waiter.request.request_id, None)
+        self._queue.cancel(waiter.request.request_id)
+        if not waiter.future.done():
+            waiter.future.set_exception(error)
 
     def _preview(self, waiter: _Waiter) -> tuple[Candidate, ...]:
         try:
-            authorization = self._current_authorization(waiter.request)
-        except ValueError:
-            return ()
-        if not authorization.authorized_legs:
+            authorization = self._current_authorization(waiter)
+        except AdmissionUnavailable as error:
+            self._fail_waiter_locked(waiter, error)
             return ()
         queued = self._queue.entry(waiter.request.request_id)
         if (
@@ -515,30 +637,35 @@ class AdmissionController:
                 weight=authorization.queue_weight,
                 authorized_legs=authorization.authorized_legs,
             )
+        if self._clock.now_ms() >= waiter.effective_deadline_at_ms:
+            self._fail_waiter_locked(
+                waiter, AdmissionUnavailable("queued request deadline elapsed")
+            )
+            return ()
+        if self._active_count(waiter.request.client.key_id) >= authorization.max_concurrency:
+            return ()
         view = self._runtime.operational_view()
         waiter.request.attempt_budget.sync_runtime(view)
+        cause = waiter.fallback_once or waiter.request.cause
         candidates = self._route_engine.filter(
             authorization,
             waiter.request.profile,
-            waiter.cause,
+            cause,
             view,
-            self._routing_context(waiter.request),
+            self._routing_context(waiter),
         )
-        if (
-            not candidates
-            and waiter.cause is DispatchCause.PRIMARY
-            and self._route_engine.primary_capacity_unavailable(
+        if not candidates and cause is DispatchCause.PRIMARY:
+            fallback = self._route_engine.primary_blocking_cause(
                 authorization, waiter.request.profile, view
             )
-        ):
-            waiter.cause = DispatchCause.CAPACITY
-            candidates = self._route_engine.filter(
-                authorization,
-                waiter.request.profile,
-                waiter.cause,
-                view,
-                self._routing_context(waiter.request),
-            )
+            if fallback is not None:
+                candidates = self._route_engine.filter(
+                    authorization,
+                    waiter.request.profile,
+                    fallback,
+                    view,
+                    self._routing_context(waiter),
+                )
         return tuple(
             candidate
             for candidate in candidates
@@ -557,55 +684,81 @@ class AdmissionController:
         return candidates
 
     async def acquire(self, request: AdmissionRequest) -> DispatchLease:
-        now_ms = self._clock.now_ms()
-        request.attempt_budget.sync_runtime(self._runtime.operational_view())
-        if request.attempt_budget.send_closed:
-            raise AdmissionUnavailable("provider send budget is closed")
-        if request.deadline_at_ms <= now_ms:
-            raise AdmissionUnavailable("request deadline elapsed before queue admission")
-        if request.request_id in self._waiters:
-            raise ValueError("duplicate admission request")
-        if len(self._waiters) >= self._max_waiters_global:
-            raise AdmissionUnavailable("global waiter bound reached")
-        key_waiters = sum(
-            waiter.request.client.key_id == request.client.key_id
-            for waiter in self._waiters.values()
-        )
-        if key_waiters >= request.authorization_ceiling.max_waiters:
-            raise AdmissionUnavailable("key waiter bound reached")
-        future: asyncio.Future[DispatchLease] = asyncio.get_running_loop().create_future()
-        waiter = _Waiter(request, future, request.cause)
-        self._waiters[request.request_id] = waiter
-        self._queue.enqueue(
-            QueueEntry(
-                request_id=request.request_id,
-                key_id=request.client.key_id,
-                tier=request.authorization_ceiling.queue_tier,
-                weight=request.authorization_ceiling.queue_weight,
-                authorized_legs=request.authorization_ceiling.authorized_legs,
-            )
-        )
+        loop = asyncio.get_running_loop()
+        self._loop = loop
+        future: asyncio.Future[DispatchLease] = loop.create_future()
         try:
-            await self._pump()
-            return await future
+            async with self._pump_lock:
+                now_ms = self._clock.now_ms()
+                request.attempt_budget.sync_runtime(self._runtime.operational_view())
+                if request.attempt_budget.send_closed:
+                    raise AdmissionUnavailable("provider send budget is closed")
+                if request.deadline_at_ms <= now_ms:
+                    raise AdmissionUnavailable("request deadline elapsed before queue admission")
+                if request.request_id in self._waiters:
+                    raise ValueError("duplicate admission request")
+                if len(self._waiters) >= self._max_waiters_global:
+                    raise AdmissionUnavailable("global waiter bound reached")
+                key_waiters = sum(
+                    waiter.request.client.key_id == request.client.key_id
+                    for waiter in self._waiters.values()
+                )
+                if key_waiters >= request.authorization_ceiling.max_waiters:
+                    raise AdmissionUnavailable("key waiter bound reached")
+                try:
+                    initially_authorized = queued_identity_is_authorized(
+                        request.client,
+                        self._auth_view_provider.current_auth_view(),
+                    )
+                except Exception as error:
+                    raise AdmissionUnavailable("client authorization state unavailable") from error
+                if not initially_authorized:
+                    raise AdmissionUnavailable(
+                        "client authorization expired before queue admission"
+                    )
+                waiter = _Waiter(
+                    request=request,
+                    future=future,
+                    effective_ceiling=request.authorization_ceiling,
+                    admitted_at_ms=now_ms,
+                    effective_deadline_at_ms=min(
+                        request.deadline_at_ms,
+                        now_ms + request.authorization_ceiling.deadline_ms,
+                    ),
+                )
+                self._waiters[request.request_id] = waiter
+                self._queue.enqueue(
+                    QueueEntry(
+                        request_id=request.request_id,
+                        key_id=request.client.key_id,
+                        tier=request.authorization_ceiling.queue_tier,
+                        weight=request.authorization_ceiling.queue_weight,
+                        authorized_legs=request.authorization_ceiling.authorized_legs,
+                    )
+                )
+                await self._pump_locked()
+            return await asyncio.shield(future)
         except asyncio.CancelledError:
+            dispatch: DispatchLease | None = None
             async with self._pump_lock:
                 queued = self._waiters.pop(request.request_id, None)
                 if queued is not None:
                     queued.state = WaiterState.CANCELLED
                     self._queue.cancel(request.request_id)
-                    if not queued.future.done():
-                        queued.future.cancel()
+                if future.done() and not future.cancelled():
+                    dispatch = future.result()
+                elif not future.done():
+                    future.cancel()
+            if dispatch is not None and not dispatch.terminal:
+                await asyncio.shield(dispatch.cancel_before_send())
             raise
 
     async def wake(self) -> None:
-        await self._pump()
+        async with self._pump_lock:
+            await self._pump_locked()
 
     @staticmethod
-    def _denial_cause(
-        current: DispatchCause,
-        denial: ReservationDenied,
-    ) -> DispatchCause | None:
+    def _denial_cause(denial: ReservationDenied) -> DispatchCause | None:
         if denial.reason in {
             ReservationDenialReason.PARALLEL_EXHAUSTED,
             ReservationDenialReason.RPM_EXHAUSTED,
@@ -616,122 +769,156 @@ class AdmissionController:
             ReservationDenialReason.MONTHLY_QUOTA_EXHAUSTED,
         }:
             return DispatchCause.QUOTA
-        return current
+        return None
 
-    async def _pump(self) -> None:
-        async with self._pump_lock:
-            excluded: set[RequestId] = set()
-            while self._waiters:
-                previews = self._previews()
-                eligible_request_ids = frozenset(previews)
+    async def _pump_locked(self) -> None:
+        for waiter in self._waiters.values():
+            waiter.fallback_once = None
+        excluded: set[RequestId] = set()
+        while self._waiters:
+            previews = self._previews()
+            eligible_request_ids = frozenset(previews)
 
-                def eligible(
-                    entry: QueueEntry,
-                    request_ids: frozenset[RequestId] = eligible_request_ids,
-                ) -> bool:
-                    return entry.request_id in request_ids
+            def eligible(
+                entry: QueueEntry,
+                request_ids: frozenset[RequestId] = eligible_request_ids,
+            ) -> bool:
+                return entry.request_id in request_ids
 
-                selection = self._queue.propose(
-                    eligible,
-                    excluded=frozenset(excluded),
-                )
-                if selection is None:
-                    return
-                waiter = self._waiters[selection.entry.request_id]
-                preview_candidates = previews[selection.entry.request_id]
-                candidate_accounts = {
-                    request_id: tuple(
-                        dict.fromkeys(candidate.account_id for candidate in candidates)
+            selection = self._queue.propose(
+                eligible,
+                excluded=frozenset(excluded),
+            )
+            if selection is None:
+                return
+            waiter = self._waiters[selection.entry.request_id]
+            preview_candidates = previews[selection.entry.request_id]
+            candidate_accounts = {
+                request_id: tuple(dict.fromkeys(candidate.account_id for candidate in candidates))
+                for request_id, candidates in previews.items()
+            }
+            allowed_accounts = self._queue.unprotected_accounts(
+                selection.entry,
+                candidate_accounts[selection.entry.request_id],
+                candidate_accounts,
+            )
+            if not allowed_accounts:
+                excluded.add(selection.entry.request_id)
+                continue
+
+            async with self._activation_gate.hold_dispatch(waiter.request.request_id):
+                try:
+                    authorization = self._current_authorization(waiter)
+                except AdmissionUnavailable as error:
+                    self._fail_waiter_locked(waiter, error)
+                    continue
+                if self._clock.now_ms() >= waiter.effective_deadline_at_ms:
+                    self._fail_waiter_locked(
+                        waiter,
+                        AdmissionUnavailable("queued request deadline elapsed"),
                     )
-                    for request_id, candidates in previews.items()
-                }
-                allowed_accounts = self._queue.unprotected_accounts(
-                    selection.entry,
-                    candidate_accounts[selection.entry.request_id],
-                    candidate_accounts,
+                    continue
+                desired_cause = preview_candidates[0].cause
+                if waiter.fallback_once is desired_cause:
+                    waiter.fallback_once = None
+                view = self._runtime.operational_view()
+                waiter.request.attempt_budget.sync_runtime(view)
+                candidate = self._route_engine.select(
+                    authorization,
+                    waiter.request.profile,
+                    desired_cause,
+                    view,
+                    self._routing_context(waiter),
+                    excluded_accounts=frozenset(
+                        set(candidate_accounts[selection.entry.request_id]) - set(allowed_accounts)
+                    ),
                 )
-                if not allowed_accounts:
+                if (
+                    candidate is None
+                    or all(
+                        candidate.authorized_leg != preview.authorized_leg
+                        for preview in preview_candidates
+                    )
+                    or not waiter.request.attempt_budget.can_send(candidate)
+                ):
                     excluded.add(selection.entry.request_id)
                     continue
-
-                async with self._activation_gate.hold_dispatch(waiter.request.request_id):
-                    try:
-                        authorization = self._current_authorization(waiter.request)
-                    except ValueError:
-                        excluded.add(selection.entry.request_id)
-                        continue
-                    view = self._runtime.operational_view()
-                    waiter.request.attempt_budget.sync_runtime(view)
-                    candidate = self._route_engine.select(
-                        authorization,
-                        waiter.request.profile,
-                        waiter.cause,
-                        view,
-                        self._routing_context(waiter.request),
-                        excluded_accounts=frozenset(
-                            set(candidate_accounts[selection.entry.request_id])
-                            - set(allowed_accounts)
-                        ),
-                    )
-                    if (
-                        candidate is None
-                        or all(
-                            candidate.authorized_leg != preview.authorized_leg
-                            for preview in preview_candidates
-                        )
-                        or not waiter.request.attempt_budget.can_send(candidate)
-                    ):
-                        excluded.add(selection.entry.request_id)
-                        continue
-                    attempt_id = self._attempt_id_factory()
-                    reservation = ReservationRequest(
-                        request_id=waiter.request.request_id,
-                        attempt_id=attempt_id,
-                        account_id=candidate.account_id,
-                        leg_id=candidate.leg_id,
-                        deployment_generation_id=candidate.generation_id,
-                        runtime_identity=waiter.request.runtime_identity,
-                        deadline_at_ms=waiter.request.deadline_at_ms,
-                        profile=waiter.request.profile,
-                        input_tokens_upper_bound=waiter.request.profile.input_tokens_max,
-                        max_output_tokens=waiter.request.profile.output_tokens_max,
-                        max_reasoning_tokens=waiter.request.profile.reasoning_tokens_max,
-                        quota_units=self._route_engine.quota_units(candidate.account_id),
-                        account_circuit=candidate.account_circuit,
-                        circuit=candidate.deployment_circuit,
-                    )
+                key_id = waiter.request.client.key_id
+                if not self._acquire_active(key_id, authorization.max_concurrency):
+                    excluded.add(selection.entry.request_id)
+                    continue
+                attempt_id = self._attempt_id_factory()
+                reservation = ReservationRequest(
+                    request_id=waiter.request.request_id,
+                    attempt_id=attempt_id,
+                    account_id=candidate.account_id,
+                    leg_id=candidate.leg_id,
+                    deployment_generation_id=candidate.generation_id,
+                    runtime_identity=waiter.request.runtime_identity,
+                    deadline_at_ms=waiter.effective_deadline_at_ms,
+                    profile=waiter.request.profile,
+                    input_tokens_upper_bound=waiter.request.profile.input_tokens_max,
+                    max_output_tokens=waiter.request.profile.output_tokens_max,
+                    max_reasoning_tokens=waiter.request.profile.reasoning_tokens_max,
+                    quota_units=self._route_engine.quota_units(candidate.account_id),
+                    account_circuit=candidate.account_circuit,
+                    circuit=candidate.deployment_circuit,
+                )
+                try:
                     granted = await self._runtime.try_reserve_async(reservation)
-                    if isinstance(granted, ReservationDenied):
-                        next_cause = self._denial_cause(waiter.cause, granted)
-                        if next_cause is not None and next_cause is not waiter.cause:
-                            waiter.cause = next_cause
-                            continue
-                        excluded.add(selection.entry.request_id)
+                except BaseException:
+                    self._release_active(key_id, wake=False)
+                    raise
+                if isinstance(granted, ReservationDenied):
+                    self._release_active(key_id, wake=False)
+                    next_cause = self._denial_cause(granted)
+                    if next_cause is not None:
+                        waiter.fallback_once = next_cause
                         continue
-                    assert isinstance(granted, ReservationGranted)
-                    try:
-                        await granted.lease.mark_dispatched_async()
-                        waiter.request.attempt_budget.record_send(candidate, attempt_id)
-                        self._queue.commit(selection)
-                    except BaseException:
-                        await granted.lease.finish_async(
+                    excluded.add(selection.entry.request_id)
+                    continue
+                assert isinstance(granted, ReservationGranted)
+                try:
+                    await granted.lease.mark_dispatched_async()
+                    waiter.request.attempt_budget.record_send(candidate, attempt_id)
+                    self._queue.commit(selection)
+                except asyncio.CancelledError:
+                    await asyncio.shield(
+                        granted.lease.finish_async(
                             AttemptResolution(
-                                outcome=TerminalOutcome.UPSTREAM_FAILED,
+                                outcome=TerminalOutcome.CLIENT_CANCELLED,
                                 release_capacity=True,
                                 actual_starts=0,
                                 actual_token_units=0,
                                 actual_quota_units=0,
                             )
                         )
-                        raise
-                    waiter.state = WaiterState.DISPATCHED
-                    self._waiters.pop(waiter.request.request_id)
-                    dispatch = DispatchLease(
-                        granted.lease,
-                        candidate,
-                        attempt_id,
-                        waiter.request.attempt_budget,
                     )
-                    if not waiter.future.done():
-                        waiter.future.set_result(dispatch)
-                excluded.clear()
+                    self._release_active(key_id, wake=False)
+                    raise
+                except BaseException:
+                    await granted.lease.finish_async(
+                        AttemptResolution(
+                            outcome=TerminalOutcome.UPSTREAM_FAILED,
+                            release_capacity=True,
+                            actual_starts=0,
+                            actual_token_units=0,
+                            actual_quota_units=0,
+                        )
+                    )
+                    self._release_active(key_id, wake=False)
+                    raise
+                waiter.state = WaiterState.DISPATCHED
+                self._waiters.pop(waiter.request.request_id)
+                dispatch = DispatchLease(
+                    granted.lease,
+                    candidate,
+                    attempt_id,
+                    waiter.request.attempt_budget,
+                    partial(self._release_active, key_id),
+                )
+                if waiter.future.cancelled():
+                    await dispatch.cancel_before_send()
+                elif not waiter.future.done():
+                    waiter.future.set_result(dispatch)
+            excluded.clear()

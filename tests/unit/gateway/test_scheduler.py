@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+from dataclasses import replace
 
 import pytest
 
@@ -21,6 +22,8 @@ from llmmaxxing.core.ids import (
 )
 from llmmaxxing.core.models import (
     AuthorizedLeg,
+    ClientCredentialVerifier,
+    ClientKeyRecord,
     LegCapabilities,
     RequestAuthorizationCeiling,
     RequestProfile,
@@ -30,11 +33,16 @@ from llmmaxxing.core.reasons import (
     EndpointKind,
     Modality,
     RouteTrigger,
+    TerminalOutcome,
 )
-from llmmaxxing.core.state_machines import KeyLifecycleState
+from llmmaxxing.core.state_machines import (
+    CredentialVerifierStatus,
+    KeyLifecycleState,
+)
 from llmmaxxing.gateway.auth import AuthenticatedClient
 from llmmaxxing.gateway.routing import AttemptBudget, Candidate
 from llmmaxxing.gateway.runtime_state import (
+    AttemptResolution,
     CircuitValue,
     ReservationGranted,
     RuntimeIdentity,
@@ -228,6 +236,19 @@ def test_activation_contracts_qos_without_deficit_reset_or_expansion() -> None:
         queue.contract(target.request_id, tier=0, weight=8)
 
 
+def test_same_tier_weight_contraction_clamps_retained_deficit() -> None:
+    queue = WDRRQueue()
+    first = entry("heavy", weight=64)
+    remaining = entry("heavy", weight=64)
+    light = entry("light", weight=1)
+    for item in (first, remaining, light):
+        queue.enqueue(item)
+    assert grant(queue) == first
+    assert queue.deficit(remaining) == 63
+    queue.contract(remaining.request_id, weight=1)
+    assert queue.deficit(remaining) <= 8
+
+
 def test_snapshot_restore_replays_the_same_grant_order_and_caps_deficits() -> None:
     queue = WDRRQueue(max_consecutive_higher_grants=7)
     for index in range(80):
@@ -307,7 +328,11 @@ def test_activation_gate_protocol_has_no_default_and_orders_dispatch_critical_se
 
 
 def test_admission_controller_requires_gate_and_persists_dispatched_inside_it() -> None:
-    from llmmaxxing.gateway.scheduler import AdmissionController, AdmissionRequest
+    from llmmaxxing.gateway.scheduler import (
+        AdmissionController,
+        AdmissionRequest,
+        AdmissionUnavailable,
+    )
 
     request_id = RequestId.new()
     route_group_id = RouteGroupId.new()
@@ -323,7 +348,7 @@ def test_admission_controller_requires_gate_and_persists_dispatched_inside_it() 
         authorized_legs=(authorized_leg,),
         queue_tier=10,
         queue_weight=4,
-        max_concurrency=4,
+        max_concurrency=1,
         max_waiters=16,
         deadline_ms=60_000,
     )
@@ -351,6 +376,45 @@ def test_admission_controller_requires_gate_and_persists_dispatched_inside_it() 
         applied_bundle_generation=7,
         applied_bundle_hash=ceiling.bundle_hash,
     )
+    key_record = ClientKeyRecord(
+        key_id=authenticated.key_id,
+        policy_id=policy_id,
+        state=KeyLifecycleState.ENABLED,
+        issued_at_s=1_780_000_000,
+        expires_at_s=1_810_000_000,
+        time_high_water_s=1_800_000_000,
+        generation_high_water=1,
+        credential_verifiers=(
+            ClientCredentialVerifier(
+                generation=1,
+                verifier_hex="d" * 64,
+                pepper_version="p1",
+                not_before_s=1_780_000_000,
+                not_after_s=1_810_000_000,
+                status=CredentialVerifierStatus.ACTIVE,
+            ),
+        ),
+    )
+
+    class AuthView:
+        key_index = {authenticated.key_id: key_record}
+        applied_bundle_generation = 7
+        applied_bundle_hash = ceiling.bundle_hash
+        denied_key_ids: frozenset[str] = frozenset()
+        accepted_peppers = {"p1": b"p" * 32}
+        trusted_now_s = 1_800_000_000
+
+    class AuthProvider:
+        def __init__(self) -> None:
+            self.denied = False
+
+        def current_auth_view(self) -> AuthView:
+            view = AuthView()
+            if self.denied:
+                view.denied_key_ids = frozenset({authenticated.key_id})
+            return view
+
+    current_ceiling = ceiling
     candidate = Candidate(
         authorized_leg=authorized_leg,
         cause=DispatchCause.PRIMARY,
@@ -364,7 +428,7 @@ def test_admission_controller_requires_gate_and_persists_dispatched_inside_it() 
         @asynccontextmanager
         async def hold_dispatch(self, dispatch_request_id: RequestId):  # type: ignore[no-untyped-def]
             nonlocal inside_gate
-            assert dispatch_request_id == request_id
+            assert dispatch_request_id
             inside_gate = True
             events.append("gate-enter")
             yield
@@ -374,7 +438,7 @@ def test_admission_controller_requires_gate_and_persists_dispatched_inside_it() 
     class Engine:
         def authorize(self, *_: object) -> RequestAuthorizationCeiling:
             events.append("reauthorize" if inside_gate else "preview-authorize")
-            return ceiling
+            return current_ceiling
 
         def select(self, *_: object, **__: object) -> Candidate:
             return candidate
@@ -382,8 +446,8 @@ def test_admission_controller_requires_gate_and_persists_dispatched_inside_it() 
         def filter(self, *_: object, **__: object) -> tuple[Candidate, ...]:
             return (candidate,)
 
-        def primary_capacity_unavailable(self, *_: object) -> bool:
-            return False
+        def primary_blocking_cause(self, *_: object) -> None:
+            return None
 
         def quota_units(self, account_id: AccountId) -> int:
             assert account_id == ACCOUNT_A
@@ -393,9 +457,17 @@ def test_admission_controller_requires_gate_and_persists_dispatched_inside_it() 
         dispatches: tuple[()] = ()
 
     class DurableLease:
+        def __init__(self) -> None:
+            self.terminal = False
+
         async def mark_dispatched_async(self) -> object:
             assert inside_gate
             events.append("journal-dispatched")
+            return object()
+
+        async def finish_async(self, resolution: AttemptResolution) -> object:
+            self.terminal = True
+            events.append(f"finish:{resolution.outcome.value}")
             return object()
 
     class Runtime:
@@ -428,15 +500,99 @@ def test_admission_controller_requires_gate_and_persists_dispatched_inside_it() 
         cause=DispatchCause.PRIMARY,
         attempt_budget=AttemptBudget(request_id),
     )
+    auth_provider = AuthProvider()
     with pytest.raises(TypeError):
         AdmissionController(Engine(), Runtime(), clock=Clock())  # type: ignore[call-arg]
-    controller = AdmissionController(Engine(), Runtime(), Gate(), clock=Clock())
-    dispatch = asyncio.run(controller.acquire(admission))
+    controller = AdmissionController(Engine(), Runtime(), Gate(), auth_provider, clock=Clock())
+
+    async def exercise() -> tuple[object, object]:
+        nonlocal current_ceiling
+        first = await controller.acquire(admission)
+        assert events[-5:] == [
+            "gate-enter",
+            "reauthorize",
+            "task6-reserve",
+            "journal-dispatched",
+            "gate-exit",
+        ]
+        second_id = RequestId.new()
+        second_request = replace(
+            admission,
+            request_id=second_id,
+            attempt_budget=AttemptBudget(second_id),
+        )
+        second_task = asyncio.create_task(controller.acquire(second_request))
+        await asyncio.sleep(0)
+        assert not second_task.done()
+        await first.finish_async(
+            AttemptResolution(
+                outcome=TerminalOutcome.COMPLETED,
+                release_capacity=True,
+                actual_starts=1,
+                actual_token_units=20,
+                actual_quota_units=1,
+            )
+        )
+        second = await asyncio.wait_for(second_task, 1)
+
+        third_id = RequestId.new()
+        third_request = replace(
+            admission,
+            request_id=third_id,
+            attempt_budget=AttemptBudget(third_id),
+        )
+        third_task = asyncio.create_task(controller.acquire(third_request))
+        await asyncio.sleep(0)
+        assert not third_task.done()
+        current_ceiling = ceiling.model_copy(update={"authorized_legs": ()})
+        await controller.wake()
+        with pytest.raises(AdmissionUnavailable, match="contracted to empty"):
+            await third_task
+        current_ceiling = ceiling
+
+        fourth_id = RequestId.new()
+        fourth_task = asyncio.create_task(
+            controller.acquire(
+                replace(
+                    admission,
+                    request_id=fourth_id,
+                    attempt_budget=AttemptBudget(fourth_id),
+                )
+            )
+        )
+        await asyncio.sleep(0)
+        auth_provider.denied = True
+        await controller.wake()
+        with pytest.raises(AdmissionUnavailable, match="no longer valid"):
+            await fourth_task
+        auth_provider.denied = False
+
+        fifth_id = RequestId.new()
+        fifth_task = asyncio.create_task(
+            controller.acquire(
+                replace(
+                    admission,
+                    request_id=fifth_id,
+                    attempt_budget=AttemptBudget(fifth_id),
+                )
+            )
+        )
+        await asyncio.sleep(0)
+        fifth_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await fifth_task
+        assert controller._active_count(authenticated.key_id) == 1
+        await second.finish_async(
+            AttemptResolution(
+                outcome=TerminalOutcome.COMPLETED,
+                release_capacity=True,
+                actual_starts=1,
+                actual_token_units=20,
+                actual_quota_units=1,
+            )
+        )
+        return first, second
+
+    dispatch, second_dispatch = asyncio.run(exercise())
     assert dispatch.candidate == candidate
-    assert events[-5:] == [
-        "gate-enter",
-        "reauthorize",
-        "task6-reserve",
-        "journal-dispatched",
-        "gate-exit",
-    ]
+    assert second_dispatch.candidate == candidate

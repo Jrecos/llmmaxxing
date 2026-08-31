@@ -166,6 +166,9 @@ class LegCapabilities(_Frozen):
     tools: bool
     forced_tool: bool
     response_schema: bool
+    streaming: bool = False
+    reasoning: bool = False
+    history_continuation: bool = False
     shadow: bool
 
     @field_validator("endpoints", "modalities")
@@ -194,6 +197,9 @@ class LegCapabilities(_Frozen):
             tools=tools,
             forced_tool=tools and self.forced_tool and other.forced_tool,
             response_schema=self.response_schema and other.response_schema,
+            streaming=self.streaming and other.streaming,
+            reasoning=self.reasoning and other.reasoning,
+            history_continuation=(self.history_continuation and other.history_continuation),
             shadow=self.shadow or other.shadow,
         )
 
