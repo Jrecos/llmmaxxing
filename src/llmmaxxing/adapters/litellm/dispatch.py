@@ -4,8 +4,11 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
+from pydantic import JsonValue
+
 from llmmaxxing.adapters.litellm.contract import (
     AdapterContract,
+    CertifiedErrorCode,
     CertifiedErrorDetail,
     DeploymentGenerationFingerprint,
     DeploymentReceipt,
@@ -22,7 +25,7 @@ class DispatchError(RuntimeError):
 
 
 def _error(
-    code: str,
+    code: CertifiedErrorCode,
     message: str,
     *,
     critical: bool,
@@ -63,7 +66,7 @@ def prepare_dispatch(
             critical=True,
             retryable=False,
         )
-    metadata = {
+    metadata: dict[str, JsonValue] = {
         "alias": deployment.hidden_alias,
         "generation_id": str(generation.generation_id),
         "account_id": str(deployment.account_id),
@@ -73,6 +76,7 @@ def prepare_dispatch(
         "credential_epoch": deployment.credential_epoch,
         "contract_id": contract.contract_id,
     }
+    trusted_metadata: dict[str, JsonValue] = {"llmmaxxing_guard": metadata}
     return PreparedDispatch(
         endpoint=certified.name,
         method=certified.method,
@@ -82,7 +86,7 @@ def prepare_dispatch(
         expected_deployment_id=deployment.runtime_id,
         generation_id=generation.generation_id,
         backend_manifest=backend_manifest,
-        trusted_metadata={"llmmaxxing_guard": metadata},
+        trusted_metadata=trusted_metadata,
     )
 
 

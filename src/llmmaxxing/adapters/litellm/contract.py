@@ -269,8 +269,17 @@ class DeploymentReceipt(_Frozen):
     generation_id: DeploymentGenerationId
 
 
+type CertifiedErrorCode = Literal[
+    "unsupported_endpoint",
+    "generation_mismatch",
+    "receipt_missing",
+    "receipt_mismatch",
+    "upstream_error",
+]
+
+
 class CertifiedErrorDetail(_Frozen):
-    code: Literal["unsupported_endpoint", "generation_mismatch", "receipt_missing", "receipt_mismatch", "upstream_error"]
+    code: CertifiedErrorCode
     message: str
     critical: bool
     retryable: bool

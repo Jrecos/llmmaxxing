@@ -13,7 +13,9 @@ from llmmaxxing.adapters.litellm.contract import (
     BuildProbe,
     CatalogModel,
     DiscoverySnapshot,
+    DeploymentReceipt,
     EffectiveDeployment,
+    PreparedDispatch,
     TransportResponse,
 )
 from llmmaxxing.core.canonical import canonical_json_bytes
@@ -305,12 +307,12 @@ class LiteLLMAdapter:
         self._snapshot = snapshot
         return snapshot
 
-    def prepare_dispatch(self, **kwargs: Any):
+    def prepare_dispatch(self, **kwargs: Any) -> PreparedDispatch:
         from llmmaxxing.adapters.litellm.dispatch import prepare_dispatch
 
         return prepare_dispatch(self.contract, **kwargs)
 
-    def reconcile_dispatch(self, *args: Any, **kwargs: Any):
+    def reconcile_dispatch(self, *args: Any, **kwargs: Any) -> DeploymentReceipt:
         from llmmaxxing.adapters.litellm.dispatch import reconcile_dispatch
 
         return reconcile_dispatch(self.contract, *args, **kwargs)

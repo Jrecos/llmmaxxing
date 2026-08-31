@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import runpy
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Mapping
@@ -295,6 +296,33 @@ def test_unknown_provider_discovers_generates_and_prepares_without_source_enum()
             status_code=200,
             headers={"x-litellm-model-id": "some-other-runtime"},
         )
+
+
+def test_pinned_stack_launcher_materializes_exact_isolated_contract(tmp_path: Path) -> None:
+    launcher = runpy.run_path(str(Path(__file__).parent / "pinned_stack.py"))
+    stack = launcher["materialize_stack"](tmp_path)
+    compose = json.loads(stack.compose_path.read_text())
+    contract = load_contract()
+    assert compose["services"]["litellm"]["image"] == contract.litellm.image
+    assert compose["services"]["fake-provider"]["image"] == contract.litellm.image
+    assert compose["services"]["postgres"]["image"].startswith("postgres@sha256:")
+    assert compose["services"]["litellm"]["depends_on"] == {
+        "fake-provider": {"condition": "service_healthy"},
+        "postgres": {"condition": "service_healthy"},
+    }
+    config = json.loads(stack.config_path.read_text())
+    assert config["litellm_settings"]["callbacks"][-1] == (
+        "llmmaxxing_guard.llmmaxxing_guard"
+    )
+    assert {
+        row["model_name"] for row in config["model_list"]
+    } == {target["alias"] for target in stack.endpoint_targets.values()}
+    inference, discovery = launcher["key_requests"](contract, "inference-user", "discovery-user")
+    assert set(inference["allowed_routes"]) == set(contract.service_keys.inference.allowed_routes)
+    assert set(discovery["allowed_routes"]) == set(contract.service_keys.discovery.allowed_routes)
+    assert discovery["key_type"] == inference["key_type"] == "default"
+
+
 
 
 def test_fixture_payloads_are_redacted_and_container_evidence_is_honestly_pending() -> None:
