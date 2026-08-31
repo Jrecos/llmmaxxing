@@ -11,6 +11,8 @@ import hashlib
 import hmac
 import json
 import os
+import threading
+import time
 from collections.abc import Mapping
 from pathlib import Path
 from types import MappingProxyType
@@ -25,6 +27,29 @@ except ImportError:  # Unit contract tests intentionally do not install LiteLLM.
 
 class GuardConfigurationError(RuntimeError):
     pass
+
+
+_CERTIFIED_EXECUTION_NORMALIZERS: dict[str, dict[str, str]] = {
+    "chat": {},
+    "text": {},
+    "responses": {},
+    "messages": {"model": "provider_prefix_removed"},
+    "embeddings": {},
+    "rerank": {},
+    "audio_speech": {},
+    "audio_transcription": {},
+    "image": {},
+}
+
+
+def _normalize_execution(value: Any, normalizer: str | None) -> Any:
+    if normalizer is None:
+        return value
+    if normalizer == "provider_prefix_removed":
+        if not isinstance(value, str):
+            raise GuardViolation("normalized execution field is not a string")
+        return value.split("/", 1)[1] if "/" in value else value
+    raise GuardViolation("uncertified execution normalizer")
 
 
 class GuardViolation(RuntimeError):
@@ -217,6 +242,7 @@ class LLMMaxxingGuard(CustomLogger):
                 "credential_fingerprint",
                 "credential_epoch",
                 "contract_id",
+                "endpoint",
             },
             "request fence",
             GuardViolation,
@@ -258,14 +284,47 @@ class LLMMaxxingGuard(CustomLogger):
         if credential.get("epoch") != expected["credential_epoch"]:
             raise GuardViolation("selected deployment credential epoch mismatch")
 
+        endpoint = fence["endpoint"]
+        normalizers = _CERTIFIED_EXECUTION_NORMALIZERS.get(endpoint)
+        if normalizers is None:
+            raise GuardViolation("uncertified endpoint fence")
         for name, value in expected["execution"].items():
-            if kwargs.get(name) != value:
+            normalizer = normalizers.get(name)
+            if _normalize_execution(kwargs.get(name), normalizer) != _normalize_execution(
+                value, normalizer
+            ):
                 raise GuardViolation("selected deployment execution projection mismatch")
         credential_value = _resolved_credential(kwargs.get(expected["credential_field"]))
         actual_fingerprint = credential_fingerprint(self._hmac_key, credential_value)
         if not hmac.compare_digest(actual_fingerprint, expected["credential_fingerprint"]):
             raise GuardViolation("resolved provider credential fingerprint mismatch")
         return kwargs
+
+
+def _move_guard_last(callbacks: list[Any], guard: LLMMaxxingGuard) -> None:
+    callbacks[:] = [callback for callback in callbacks if callback is not guard]
+    callbacks.append(guard)
+
+
+def _enforce_last_registration(guard: LLMMaxxingGuard) -> None:
+    def run() -> None:
+        try:
+            import litellm
+        except ImportError:
+            return
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            callbacks = litellm.callbacks
+            if isinstance(callbacks, list) and guard in callbacks:
+                if callbacks.count(guard) != 1 or callbacks[-1] is not guard:
+                    _move_guard_last(callbacks, guard)
+            time.sleep(0.05)
+
+    threading.Thread(
+        target=run,
+        name="llmmaxxing-guard-order",
+        daemon=True,
+    ).start()
 
 
 def _configured_guard() -> LLMMaxxingGuard | None:
@@ -281,4 +340,6 @@ def _configured_guard() -> LLMMaxxingGuard | None:
 
 
 llmmaxxing_guard = _configured_guard()
+if llmmaxxing_guard is not None:
+    _enforce_last_registration(llmmaxxing_guard)
 custom_callback = llmmaxxing_guard

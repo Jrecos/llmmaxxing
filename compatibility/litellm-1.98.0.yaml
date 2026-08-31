@@ -8,7 +8,7 @@
   "guard": {
     "mount_path": "deploy/litellm/llmmaxxing_guard.py",
     "callback_name": "llmmaxxing_guard",
-    "digest": "sha256:9bae8c145440cfeb05a3c2e796f1ba65d94698eb36db8e8a9668559df77b46f6",
+    "digest": "sha256:2999029bc97928d38665f3982378e9436b6697dd87c4a2081e7e9b3a90f539ba",
     "registration": "last",
     "hook": "async_pre_call_deployment_hook",
     "dynamic_credential_lists": "unsupported",
@@ -21,7 +21,8 @@
       "backend_manifest",
       "credential_fingerprint",
       "credential_epoch",
-      "contract_id"
+      "contract_id",
+      "endpoint"
     ]
   },
   "service_keys": {
@@ -85,7 +86,12 @@
     "project",
     "region_name",
     "vertex_project",
-    "vertex_location"
+    "vertex_location",
+    "allow_client_keepalive_override",
+    "merge_reasoning_content_in_choices",
+    "use_in_pass_through",
+    "use_litellm_proxy",
+    "use_xai_oauth"
   ],
   "known_execution_fields": [
     "custom_llm_provider",
@@ -97,18 +103,23 @@
     "project",
     "organization",
     "deployment_name",
-    "base_model"
+    "base_model",
+    "allow_client_keepalive_override",
+    "merge_reasoning_content_in_choices",
+    "use_in_pass_through",
+    "use_litellm_proxy",
+    "use_xai_oauth"
   ],
   "endpoints": [
-    {"name": "chat", "method": "POST", "path": "/v1/chat/completions", "model_locator": "json.model", "receipt_header": "x-litellm-model-id", "guard_required": true},
-    {"name": "text", "method": "POST", "path": "/v1/completions", "model_locator": "json.model", "receipt_header": "x-litellm-model-id", "guard_required": true},
-    {"name": "responses", "method": "POST", "path": "/v1/responses", "model_locator": "json.model", "receipt_header": "x-litellm-model-id", "guard_required": true},
-    {"name": "messages", "method": "POST", "path": "/v1/messages", "model_locator": "json.model", "receipt_header": "x-litellm-model-id", "guard_required": true},
-    {"name": "embeddings", "method": "POST", "path": "/v1/embeddings", "model_locator": "json.model", "receipt_header": "x-litellm-model-id", "guard_required": true},
-    {"name": "rerank", "method": "POST", "path": "/v1/rerank", "model_locator": "json.model", "receipt_header": "x-litellm-model-id", "guard_required": true},
-    {"name": "audio_speech", "method": "POST", "path": "/v1/audio/speech", "model_locator": "json.model", "receipt_header": "x-litellm-model-id", "guard_required": true},
-    {"name": "audio_transcription", "method": "POST", "path": "/v1/audio/transcriptions", "model_locator": "multipart.model", "receipt_header": "x-litellm-model-id", "guard_required": true},
-    {"name": "image", "method": "POST", "path": "/v1/images/generations", "model_locator": "json.model", "receipt_header": "x-litellm-model-id", "guard_required": true}
+    {"name": "chat", "method": "POST", "path": "/v1/chat/completions", "model_locator": "json.model", "fence_locator": "json.metadata", "execution_normalizers": {}, "receipt_header": "x-litellm-model-id", "guard_required": true},
+    {"name": "text", "method": "POST", "path": "/v1/completions", "model_locator": "json.model", "fence_locator": "json.metadata", "execution_normalizers": {}, "receipt_header": "x-litellm-model-id", "guard_required": true},
+    {"name": "responses", "method": "POST", "path": "/v1/responses", "model_locator": "json.model", "fence_locator": "json.metadata", "execution_normalizers": {}, "receipt_header": "x-litellm-model-id", "guard_required": true},
+    {"name": "messages", "method": "POST", "path": "/v1/messages", "model_locator": "json.model", "fence_locator": "json.litellm_metadata", "execution_normalizers": {"model": "provider_prefix_removed"}, "receipt_header": "x-litellm-model-id", "guard_required": true},
+    {"name": "embeddings", "method": "POST", "path": "/v1/embeddings", "model_locator": "json.model", "fence_locator": "json.metadata", "execution_normalizers": {}, "receipt_header": "x-litellm-model-id", "guard_required": true},
+    {"name": "rerank", "method": "POST", "path": "/v1/rerank", "model_locator": "json.model", "fence_locator": "json.metadata", "execution_normalizers": {}, "receipt_header": "x-litellm-model-id", "guard_required": true},
+    {"name": "audio_speech", "method": "POST", "path": "/v1/audio/speech", "model_locator": "json.model", "fence_locator": "json.metadata", "execution_normalizers": {}, "receipt_header": "x-litellm-model-id", "guard_required": true},
+    {"name": "audio_transcription", "method": "POST", "path": "/v1/audio/transcriptions", "model_locator": "multipart.model", "fence_locator": "multipart.metadata", "execution_normalizers": {}, "receipt_header": "x-litellm-model-id", "guard_required": true},
+    {"name": "image", "method": "POST", "path": "/v1/images/generations", "model_locator": "json.model", "fence_locator": "json.metadata", "execution_normalizers": {}, "receipt_header": "x-litellm-model-id", "guard_required": true}
   ],
   "unsupported": [
     "responses_stateful_get",

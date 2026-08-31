@@ -47,6 +47,7 @@ class GuardContract(_Frozen):
             "credential_fingerprint",
             "credential_epoch",
             "contract_id",
+            "endpoint",
         }
         if set(self.fence_fields) != expected or len(self.fence_fields) != len(expected):
             raise ValueError("guard fence fields do not match the certified hook")
@@ -100,6 +101,12 @@ class CertifiedEndpoint(_Frozen):
     method: Literal["POST"]
     path: str = Field(pattern=r"^/v1/")
     model_locator: Literal["json.model", "multipart.model"]
+    fence_locator: Literal[
+        "json.metadata",
+        "json.litellm_metadata",
+        "multipart.metadata",
+    ]
+    execution_normalizers: dict[str, Literal["provider_prefix_removed"]]
     receipt_header: Literal["x-litellm-model-id"]
     guard_required: Literal[True]
 
@@ -256,6 +263,12 @@ class PreparedDispatch(_Frozen):
     method: Literal["POST"]
     path: str
     model_locator: Literal["json.model", "multipart.model"]
+    fence_locator: Literal[
+        "json.metadata",
+        "json.litellm_metadata",
+        "multipart.metadata",
+    ]
+    execution_normalizers: dict[str, Literal["provider_prefix_removed"]]
     hidden_alias: str = Field(pattern=r"^[^/\s]+/[^/\s]+$")
     expected_deployment_id: str
     generation_id: DeploymentGenerationId

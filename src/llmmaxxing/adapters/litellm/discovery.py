@@ -224,10 +224,10 @@ class LiteLLMAdapter:
             raise DiscoveryError(f"unknown execution fields: {sorted(unknown)}")
         if params.get("num_retries") != metadata.routing.num_retries:
             raise DiscoveryError("deployment retry authority mismatch")
-        if params.get("custom_llm_provider") != metadata.execution.get("custom_llm_provider"):
-            raise DiscoveryError("deployment provider projection mismatch")
-        if params.get("model") != metadata.execution.get("model"):
-            raise DiscoveryError("deployment upstream model projection mismatch")
+        projected = set(params) & set(self.contract.known_execution_fields)
+        for field in projected:
+            if metadata.execution.get(field) != params[field]:
+                raise DiscoveryError(f"deployment execution projection mismatch: {field}")
         runtime_id = info.get("id")
         mode = info.get("mode")
         if not isinstance(runtime_id, str) or not runtime_id or not isinstance(mode, str) or not mode:

@@ -33,13 +33,13 @@ from llmmaxxing.adapters.litellm.contract import (
 )
 from llmmaxxing.adapters.litellm.discovery import LiteLLMAdapter
 from llmmaxxing.adapters.litellm.guard import deployment_generation
+from llmmaxxing.core.canonical import canonical_json_bytes
 
 POSTGRES_IMAGE = (
     "postgres@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777"
 )
 ACCOUNT_ID = "acc_99999999-9999-4999-8999-999999999999"
 ACCOUNT_BINDING = "pinned-contract-fixture"
-BACKEND_PLACEHOLDER = "bm1_" + "0" * 64
 
 ENDPOINT_SPECS: dict[str, dict[str, str]] = {
     "chat": {
@@ -123,6 +123,7 @@ class StackMaterial:
     config_path: Path
     manifest_path: Path
     endpoint_targets: dict[str, dict[str, str]]
+    backend_manifest: str
     master_key: str
     provider_secret: str
     fingerprint_key: str
@@ -139,6 +140,11 @@ def _metadata(spec: Mapping[str, str], fingerprint: str, endpoint: str) -> dict[
             "custom_llm_provider": spec["provider"],
             "model": spec["model"],
             "api_base": spec["api_base"],
+            "allow_client_keepalive_override": False,
+            "merge_reasoning_content_in_choices": False,
+            "use_in_pass_through": False,
+            "use_litellm_proxy": False,
+            "use_xai_oauth": False,
         },
         "capabilities": {"endpoints": [endpoint], "modalities": ["text"]},
         "context": {"max_input_tokens": 8192, "max_output_tokens": 1024},
@@ -233,9 +239,19 @@ def materialize_stack(root: Path) -> StackMaterial:
             "allow_public_health_readiness_details": False,
         },
     }
+    backend_payload = {
+        "contract_id": contract.contract_id,
+        "deployments": {
+            alias: deployment.model_dump(mode="json")
+            for alias, deployment in expected.items()
+        },
+    }
+    backend_manifest = "bm1_" + hashlib.sha256(
+        canonical_json_bytes(backend_payload)
+    ).hexdigest()
     manifest = GuardManifest(
         contract_id=contract.contract_id,
-        backend_manifest=BACKEND_PLACEHOLDER,
+        backend_manifest=backend_manifest,
         guard_digest=contract.guard.digest,
         deployments=expected,
     )
@@ -330,6 +346,7 @@ def materialize_stack(root: Path) -> StackMaterial:
         config_path=config_path,
         manifest_path=manifest_path,
         endpoint_targets=targets,
+        backend_manifest=backend_manifest,
         master_key=master_key,
         provider_secret=provider_secret,
         fingerprint_key=fingerprint_key,
@@ -386,6 +403,8 @@ def _request(
         except (UnicodeDecodeError, json.JSONDecodeError):
             payload = {}
         return exc.code, payload
+    except urllib.error.URLError:
+        return 0, {}
 
 
 class _DiscoveryTransport:
@@ -436,6 +455,27 @@ def _wait_ready(base_url: str, timeout: float = 240) -> None:
     raise RuntimeError("pinned LiteLLM did not become ready")
 
 
+def _wait_guard_last(
+    base_url: str,
+    master_key: str,
+    identity: str,
+    timeout: float = 60,
+) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        status, payload = _request(base_url, "GET", "/active/callbacks", master_key)
+        callbacks = payload.get("litellm.callbacks")
+        if (
+            status == 200
+            and isinstance(callbacks, list)
+            and callbacks.count(identity) == 1
+            and callbacks[-1] == identity
+        ):
+            return
+        time.sleep(0.1)
+    raise RuntimeError("certified generation guard did not register once and last")
+
+
 def _provision_key(base_url: str, master: str, user_id: str, role: str, request: dict[str, Any]) -> str:
     status, _ = _request(
         base_url,
@@ -455,7 +495,11 @@ def _provision_key(base_url: str, master: str, user_id: str, role: str, request:
 
 def main() -> int:
     contract = load_contract()
-    with tempfile.TemporaryDirectory(prefix="llmmaxxing-litellm-1.98-") as temporary:
+    preserve = os.environ.get("LLMMAXXING_PINNED_DEBUG_PRESERVE") == "1"
+    with tempfile.TemporaryDirectory(
+        prefix="llmmaxxing-litellm-1.98-",
+        delete=not preserve,
+    ) as temporary:
         material = materialize_stack(Path(temporary))
         project = "lmx-contract-" + secrets.token_hex(4)
         os.environ["COMPOSE_PROJECT_NAME"] = project
@@ -464,6 +508,11 @@ def main() -> int:
             port = _compose(material, "port", "litellm", "4000").stdout.strip().rsplit(":", 1)[-1]
             base_url = f"http://127.0.0.1:{port}"
             _wait_ready(base_url)
+            _wait_guard_last(
+                base_url,
+                material.master_key,
+                contract.guard.active_callback_identity,
+            )
 
             inference_user = "contract-inference-" + secrets.token_hex(8)
             discovery_user = "contract-discovery-" + secrets.token_hex(8)
@@ -491,11 +540,14 @@ def main() -> int:
             snapshot = asyncio.run(adapter.discover_complete())
             from llmmaxxing.adapters.litellm.guard import build_guard_manifest
 
-            material.manifest_path.write_text(
-                build_guard_manifest(snapshot, contract).model_dump_json(indent=2) + "\n"
+            configured_manifest = GuardManifest.model_validate_json(
+                material.manifest_path.read_text()
             )
-            _compose(material, "restart", "litellm")
-            _wait_ready(base_url)
+            live_manifest = build_guard_manifest(snapshot, contract)
+            if live_manifest.deployments != configured_manifest.deployments:
+                raise RuntimeError(
+                    "live deployment generations differ from immutable guard manifest"
+                )
 
             environment = os.environ.copy()
             environment.update(
@@ -503,9 +555,12 @@ def main() -> int:
                     "LLMMAXXING_PINNED_LITELLM_URL": base_url,
                     "LLMMAXXING_PINNED_DISCOVERY_KEY": discovery_key,
                     "LLMMAXXING_PINNED_INFERENCE_KEY": inference_key,
-                    "LLMMAXXING_PINNED_ENDPOINT_TARGETS_JSON": json.dumps(material.endpoint_targets),
+                    "LLMMAXXING_PINNED_ENDPOINT_TARGETS_JSON": json.dumps(
+                        material.endpoint_targets
+                    ),
                     "LLMMAXXING_PINNED_IMAGE": contract.litellm.image,
                     "LLMMAXXING_PINNED_SOURCE_COMMIT": contract.litellm.source_commit,
+                    "LLMMAXXING_PINNED_BACKEND_MANIFEST": material.backend_manifest,
                 }
             )
             result = subprocess.run(
@@ -523,7 +578,13 @@ def main() -> int:
             )
             return result.returncode
         finally:
-            _compose(material, "down", "-v", "--remove-orphans", check=False)
+            if preserve:
+                print(
+                    f"Preserving pinned stack {project} at {material.compose_path}",
+                    file=sys.stderr,
+                )
+            else:
+                _compose(material, "down", "-v", "--remove-orphans", check=False)
 
 
 if __name__ == "__main__":

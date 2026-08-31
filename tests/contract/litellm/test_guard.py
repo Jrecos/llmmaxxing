@@ -67,6 +67,7 @@ def request_kwargs(manifest: dict[str, Any], provider_secret: str) -> dict[str, 
                 "credential_fingerprint": expected["credential_fingerprint"],
                 "credential_epoch": expected["credential_epoch"],
                 "contract_id": manifest["contract_id"],
+                "endpoint": "chat",
             },
         },
     }
@@ -82,6 +83,14 @@ def test_guard_has_stable_active_callbacks_digest_identity() -> None:
     digest = hashlib.sha256(GUARD_PATH.read_bytes()).hexdigest()
     assert str(guard) == f"llmmaxxing_guard@sha256:{digest}"
     assert guard.callback_name == "llmmaxxing_guard"
+
+
+def test_guard_registration_helper_deduplicates_and_moves_last() -> None:
+    module, guard, _, _ = make_guard()
+    other = object()
+    callbacks = [guard, other, guard]
+    module._move_guard_last(callbacks, guard)
+    assert callbacks == [other, guard]
 
 
 def test_guard_accepts_exact_atomic_fence_before_provider_call() -> None:
@@ -103,6 +112,14 @@ def test_guard_accepts_identical_metadata_copy_but_rejects_conflicting_copy() ->
     kwargs["litellm_metadata"]["llmmaxxing_guard"]["alias"] = "lmx/other"
     with pytest.raises(module.GuardViolation, match="ambiguous"):
         asyncio.run(guard.async_pre_call_deployment_hook(kwargs, None))
+
+
+def test_messages_normalizes_only_provider_prefixed_model_field() -> None:
+    _, guard, manifest, secret = make_guard()
+    kwargs = request_kwargs(manifest, secret)
+    kwargs["metadata"]["llmmaxxing_guard"]["endpoint"] = "messages"
+    kwargs["model"] = "electron-v1"
+    assert asyncio.run(guard.async_pre_call_deployment_hook(kwargs, None)) is kwargs
 
 
 @pytest.mark.parametrize(

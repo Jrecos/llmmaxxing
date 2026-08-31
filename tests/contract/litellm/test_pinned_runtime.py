@@ -144,27 +144,33 @@ def test_pinned_build_complete_discovery_key_isolation_and_native_receipts() -> 
             endpoint=endpoint.name,
             deployment=deployment,
             generation=deployment_generation(deployment, contract),
-            backend_manifest=snapshot.manifest_revision,
+            backend_manifest=os.environ["LLMMAXXING_PINNED_BACKEND_MANIFEST"],
         )
         selected = deepcopy(selector_fixtures[endpoint.name])
         if endpoint.model_locator == "json.model":
             body = selected["body"]
             body["model"] = prepared.hidden_alias
-            body["metadata"] = prepared.trusted_metadata
+            fence_field = prepared.fence_locator.removeprefix("json.")
+            body[fence_field] = prepared.trusted_metadata
             content_type = "application/json"
             raw = json.dumps(body, separators=(",", ":")).encode()
         else:
             fields = selected["fields"]
             fields["model"] = prepared.hidden_alias
-            fields["metadata"] = json.dumps(prepared.trusted_metadata, separators=(",", ":"))
+            fence_field = prepared.fence_locator.removeprefix("multipart.")
+            fields[fence_field] = json.dumps(
+                prepared.trusted_metadata,
+                separators=(",", ":"),
+            )
             content_type, raw = _multipart(fields, selected["file"])
-        status, headers, _ = _http(
+        status, headers, response_body = _http(
             prepared.method,
             prepared.path,
             INFERENCE_KEY,
             body=raw,
             content_type=content_type,
         )
+        assert status == 200, (endpoint.name, status, response_body[:1000])
         receipt = adapter.reconcile_dispatch(
             prepared,
             status_code=status,

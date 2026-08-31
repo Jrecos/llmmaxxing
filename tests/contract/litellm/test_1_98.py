@@ -91,6 +91,7 @@ def test_contract_binds_one_exact_build_guard_and_explicit_service_keys() -> Non
         "credential_fingerprint",
         "credential_epoch",
         "contract_id",
+        "endpoint",
     }
     discovery = contract.service_keys.discovery
     assert inference.allowed_routes and discovery.allowed_routes
@@ -119,6 +120,32 @@ def test_contract_certifies_only_native_receipt_endpoints_and_exact_locators() -
         ("audio_speech", "POST", "/v1/audio/speech", "json.model"),
         ("audio_transcription", "POST", "/v1/audio/transcriptions", "multipart.model"),
         ("image", "POST", "/v1/images/generations", "json.model"),
+    }
+    assert {endpoint.name: endpoint.fence_locator for endpoint in contract.endpoints} == {
+        "chat": "json.metadata",
+        "text": "json.metadata",
+        "responses": "json.metadata",
+        "messages": "json.litellm_metadata",
+        "embeddings": "json.metadata",
+        "rerank": "json.metadata",
+        "audio_speech": "json.metadata",
+        "audio_transcription": "multipart.metadata",
+        "image": "json.metadata",
+    }
+    assert {
+        endpoint.name: endpoint.execution_normalizers for endpoint in contract.endpoints
+    } == {"messages": {"model": "provider_prefix_removed"}} | {
+        name: {}
+        for name in (
+            "chat",
+            "text",
+            "responses",
+            "embeddings",
+            "rerank",
+            "audio_speech",
+            "audio_transcription",
+            "image",
+        )
     }
     assert all(e.guard_required and e.receipt_header == "x-litellm-model-id" for e in contract.endpoints)
     assert {

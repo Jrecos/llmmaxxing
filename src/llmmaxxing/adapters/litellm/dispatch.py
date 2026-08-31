@@ -75,6 +75,7 @@ def prepare_dispatch(
         "credential_fingerprint": deployment.credential_fingerprint,
         "credential_epoch": deployment.credential_epoch,
         "contract_id": contract.contract_id,
+        "endpoint": certified.name,
     }
     trusted_metadata: dict[str, JsonValue] = {"llmmaxxing_guard": metadata}
     return PreparedDispatch(
@@ -82,6 +83,8 @@ def prepare_dispatch(
         method=certified.method,
         path=certified.path,
         model_locator=certified.model_locator,
+        fence_locator=certified.fence_locator,
+        execution_normalizers=certified.execution_normalizers,
         hidden_alias=deployment.hidden_alias,
         expected_deployment_id=deployment.runtime_id,
         generation_id=generation.generation_id,
