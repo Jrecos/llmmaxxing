@@ -347,6 +347,7 @@ def test_delta_bounds_overlap_requires_exact_reassignment_and_rejects_clock_roll
             ),
         )
 
+
 def test_new_verifier_not_before_is_bounded_by_transition_high_waters() -> None:
     advanced = suspend_key(issue().record, now_s=NOW + 10)
     current = advanced.credential_verifiers[-1]
@@ -378,7 +379,6 @@ def test_new_verifier_not_before_is_bounded_by_transition_high_waters() -> None:
         validate_key_record_delta(advanced, rotated(NOW + 5))
     with pytest.raises(ValueError, match="future.*not-before"):
         validate_key_record_delta(advanced, rotated(NOW + 21))
-
 
 
 def test_activation_is_draft_only() -> None:

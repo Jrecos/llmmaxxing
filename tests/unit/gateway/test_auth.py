@@ -137,6 +137,7 @@ def test_unknown_id_runs_dummy_hmac_and_errors_are_non_enumerating(
         nonlocal compare_calls
         compare_calls += 1
         return real_compare(left, right)
+
     preparation_calls = 0
     real_prepare = auth._prepare_verifier
 
@@ -149,7 +150,6 @@ def test_unknown_id_runs_dummy_hmac_and_errors_are_non_enumerating(
         assert record.credential_verifiers
         preparation_calls += 1
         return real_prepare(*args)
-
 
     monkeypatch.setattr(auth, "compute_client_key_verifier", counted)
     monkeypatch.setattr(auth.hmac, "compare_digest", compared)

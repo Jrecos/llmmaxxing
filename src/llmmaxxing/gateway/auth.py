@@ -145,12 +145,7 @@ def _prepare_verifier(
     now_s = runtime_view.trusted_now_s
     window_is_accepted = verifier.not_before_s <= now_s < verifier.not_after_s
     record_is_live = now_s < record.expires_at_s
-    eligible = (
-        status_is_accepted
-        and pepper_is_accepted
-        and window_is_accepted
-        and record_is_live
-    )
+    eligible = status_is_accepted and pepper_is_accepted and window_is_accepted and record_is_live
     return pepper, expected, eligible
 
 
@@ -164,16 +159,12 @@ def verify_client_key(
     )
     record = runtime_view.key_index.get(parsed.key_id)
     prepared_record = record if record is not None else _DUMMY_RECORD
-    verifiers = (
-        record.credential_verifiers if record is not None else _DUMMY_CREDENTIALS
-    )
+    verifiers = record.credential_verifiers if record is not None else _DUMMY_CREDENTIALS
     fallback_pepper = next(iter(runtime_view.accepted_peppers.values()), _DUMMY_PEPPER)
     accepted_generation: int | None = None
 
     for index in range(2):
-        verifier = (
-            verifiers[index] if index < len(verifiers) else _DUMMY_CREDENTIALS[index]
-        )
+        verifier = verifiers[index] if index < len(verifiers) else _DUMMY_CREDENTIALS[index]
         pepper, expected, credential_is_accepted = _prepare_verifier(
             verifier,
             prepared_record,
@@ -182,11 +173,7 @@ def verify_client_key(
         )
         candidate = compute_client_key_verifier(pepper, parsed.key_id_bytes, parsed.secret)
         matches = hmac.compare_digest(candidate, expected)
-        if (
-            matches
-            and record is not None
-            and credential_is_accepted
-        ):
+        if matches and record is not None and credential_is_accepted:
             accepted_generation = verifier.generation
 
     if (

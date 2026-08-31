@@ -213,8 +213,7 @@ def expire_key(record: ClientKeyRecord, *, now_s: int) -> ClientKeyRecord:
                 "not_after_s": min(item.not_after_s, record.expires_at_s),
             }
         )
-        if item.status
-        in (CredentialVerifierStatus.ACTIVE, CredentialVerifierStatus.RETIRING)
+        if item.status in (CredentialVerifierStatus.ACTIVE, CredentialVerifierStatus.RETIRING)
         else item
         for item in record.credential_verifiers
     )
