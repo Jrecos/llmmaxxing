@@ -54,10 +54,23 @@ def test_hostile_label_churn_stays_finite_and_private() -> None:
         metrics.circuit(account, f"untrusted-circuit-{index}")
         metrics.outcome(outcome, f"untrusted-outcome-{index}")
 
+    for index in range(6_000):
+        metrics.request(
+            allowed_routes[(index // len(allowed_accounts)) % len(allowed_routes)],
+            allowed_accounts[index % len(allowed_accounts)],
+            tuple(TerminalOutcome)[index % len(TerminalOutcome)],
+        )
+
     first = metrics.render()
     first_series = metrics.series_count
-    assert first_series <= MAX_SERIES
-    assert len(first) <= MAX_SCRAPE_BYTES
+    overflow = next(
+        float(line.split()[1])
+        for line in first.decode().splitlines()
+        if line.startswith("llmmaxxing_metrics_series_overflow_total ")
+    )
+    assert overflow > 0
+    assert 9_900 <= first_series <= MAX_SERIES
+    assert 1_000_000 < len(first) <= MAX_SCRAPE_BYTES
     assert b'account="other"' in first
     assert b'route_group="other"' in first
     assert b'reason="other"' in first
@@ -105,28 +118,36 @@ def test_writer_sustains_reference_event_rate_without_blocking_request_path(
 ) -> None:
     writer = LifecycleSpool.create(
         tmp_path,
-        max_bytes=16 * 1024 * 1024,
-        queue_capacity=4_096,
+        max_bytes=64 * 1024 * 1024,
+        queue_capacity=512,
         segment_bytes=64 * 1024 * 1024,
         segment_seconds=300,
     )
+    request_rate = 250
+    request_count = 600
     started = time.monotonic()
     index = 0
-    for _ in range(250):
+    max_queue_depth = 0
+    for request_index in range(request_count):
+        due = started + request_index / request_rate
+        if (delay := due - time.monotonic()) > 0:
+            time.sleep(delay)
         reservation = writer.try_reserve(12)
         assert reservation is not None
         for _ in range(12):
             reservation.emit(event(index))
             index += 1
         reservation.release_unused()
+        max_queue_depth = max(max_queue_depth, writer.queue_depth)
     enqueue_elapsed = time.monotonic() - started
     writer.flush(timeout=10)
     stats = writer.stats
-    records = tuple(writer.replay())
+    record_count = sum(1 for _ in writer.replay())
     writer.close()
 
-    assert len(records) == 3_000
+    assert record_count == request_count * 12 > writer.queue_capacity
+    assert max_queue_depth <= writer.queue_capacity
     assert stats.max_batch_records <= 256
     assert stats.max_fdatasync_interval_ms <= 250
     assert stats.invariant_violations == 0
-    assert enqueue_elapsed < 5, "put_nowait hot path must not wait for disk batches"
+    assert 2.2 <= enqueue_elapsed < 3.5

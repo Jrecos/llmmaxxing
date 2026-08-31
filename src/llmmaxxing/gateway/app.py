@@ -87,12 +87,17 @@ class RequestLifecycle(Protocol):
 
     async def attempt_started(self, lease: DispatchLease, *, shadow: bool) -> None: ...
 
+    def attempt_headers(self, lease: DispatchLease) -> None: ...
+
+    def attempt_first_byte(self, lease: DispatchLease) -> None: ...
+
     async def attempt_finished(
         self,
         lease: DispatchLease,
         outcome: TerminalOutcome,
         *,
         uncertain: bool,
+        capacity_released: bool,
     ) -> None: ...
 
     async def finished(self, outcome: TerminalOutcome) -> None: ...
@@ -656,7 +661,14 @@ class GatewayApp:
             nonlocal attempt_event_recorded
             if attempt_event_recorded:
                 return
-            await _shielded(lifecycle.attempt_finished(dispatch, outcome, uncertain=uncertain))
+            await _shielded(
+                lifecycle.attempt_finished(
+                    dispatch,
+                    outcome,
+                    uncertain=uncertain,
+                    capacity_released=not uncertain,
+                )
+            )
             attempt_event_recorded = True
 
         try:
@@ -688,6 +700,7 @@ class GatewayApp:
                     headers=headers,
                     content=rewritten,
                 )
+                lifecycle.attempt_headers(dispatch)
             except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout):
                 pending_outcome = TerminalOutcome.UPSTREAM_FAILED
                 await dispatch.fail_before_send()
@@ -730,6 +743,7 @@ class GatewayApp:
                     error_body = await read_prestart_error(
                         response,
                         read_inactivity_timeout_s=self.http.config.read_inactivity_timeout_s,
+                        on_first_byte=lambda: lifecycle.attempt_first_byte(dispatch),
                     )
                     dispatch.lease.provider_send_completed()
                 except UpstreamStreamError:
@@ -839,6 +853,7 @@ class GatewayApp:
                     send,
                     deadline.response_start,
                     read_inactivity_timeout_s=self.http.config.read_inactivity_timeout_s,
+                    on_first_byte=lambda: lifecycle.attempt_first_byte(dispatch),
                 )
             except DownstreamDisconnected:
                 pending_outcome = TerminalOutcome.CLIENT_CANCELLED
@@ -962,7 +977,14 @@ class GatewayApp:
             nonlocal event_recorded
             if dispatch is None or event_recorded:
                 return
-            await _shielded(lifecycle.attempt_finished(dispatch, outcome, uncertain=uncertain))
+            await _shielded(
+                lifecycle.attempt_finished(
+                    dispatch,
+                    outcome,
+                    uncertain=uncertain,
+                    capacity_released=not uncertain,
+                )
+            )
             event_recorded = True
 
         try:
@@ -994,6 +1016,7 @@ class GatewayApp:
                     headers=headers,
                     content=rewritten,
                 )
+                lifecycle.attempt_headers(dispatch)
             except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout):
                 await dispatch.fail_before_send()
                 await record(TerminalOutcome.UPSTREAM_FAILED, uncertain=False)
@@ -1002,6 +1025,7 @@ class GatewayApp:
                 await read_prestart_error(
                     response,
                     read_inactivity_timeout_s=self.http.config.read_inactivity_timeout_s,
+                    on_first_byte=lambda: lifecycle.attempt_first_byte(dispatch),
                 )
                 dispatch.lease.provider_send_completed()
                 await dispatch.finish_async(
@@ -1035,6 +1059,7 @@ class GatewayApp:
             await drain_raw_response(
                 response,
                 read_inactivity_timeout_s=self.http.config.read_inactivity_timeout_s,
+                on_first_byte=lambda: lifecycle.attempt_first_byte(dispatch),
             )
             dispatch.lease.provider_send_completed()
             await dispatch.finish_async(

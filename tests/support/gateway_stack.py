@@ -137,14 +137,23 @@ class Lifecycle(RequestLifecycle):
             raise OSError("lifecycle attempt-start failure")
         self.events.append(("attempt_started", (lease.attempt_id, shadow)))
 
+    def attempt_headers(self, lease) -> None:  # type: ignore[no-untyped-def]
+        self.events.append(("attempt_headers", lease.attempt_id))
+
+    def attempt_first_byte(self, lease) -> None:  # type: ignore[no-untyped-def]
+        self.events.append(("attempt_first_byte", lease.attempt_id))
+
     async def attempt_finished(
         self,
         lease,  # type: ignore[no-untyped-def]
         outcome: TerminalOutcome,
         *,
         uncertain: bool,
+        capacity_released: bool,
     ) -> None:
-        self.events.append(("attempt_finished", (lease.attempt_id, outcome, uncertain)))
+        self.events.append(
+            ("attempt_finished", (lease.attempt_id, outcome, uncertain, capacity_released))
+        )
 
     async def finished(self, outcome: TerminalOutcome) -> None:
         if self.fail_finished:

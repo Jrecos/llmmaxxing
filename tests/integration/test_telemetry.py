@@ -8,7 +8,9 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from opentelemetry import trace as api_trace
 from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult
+from opentelemetry.trace import NonRecordingSpan, SpanContext, TraceFlags, TraceState
 from pydantic import ValidationError
 
 from llmmaxxing.core.ids import (
@@ -98,6 +100,22 @@ class FakeExporter(SpanExporter):
 
     def force_flush(self, timeout_millis: int = 30_000) -> bool:
         return True
+
+@dataclass(frozen=True, slots=True)
+class HungExporter(SpanExporter):
+    entered: threading.Event
+    release: threading.Event
+
+    def export(self, spans):  # type: ignore[no-untyped-def]
+        self.entered.set()
+        self.release.wait()
+        return SpanExportResult.SUCCESS
+
+    def shutdown(self) -> None:
+        self.release.wait()
+
+    def force_flush(self, timeout_millis: int = 30_000) -> bool:
+        return False
 
 
 def make_event(
@@ -276,10 +294,13 @@ def test_production_lifecycle_reserves_exact_budget_and_one_terminal(tmp_path: P
         for _ in range(3):
             lease = dispatch()
             await lifecycle.attempt_started(lease, shadow=False)
+            lifecycle.attempt_headers(lease)
+            lifecycle.attempt_first_byte(lease)
             await lifecycle.attempt_finished(
                 lease,
                 TerminalOutcome.UPSTREAM_FAILED,
                 uncertain=False,
+                capacity_released=True,
             )
         with pytest.raises(RuntimeError, match="attempt budget"):
             await lifecycle.attempt_started(dispatch(), shadow=False)
@@ -300,6 +321,10 @@ def test_production_lifecycle_reserves_exact_budget_and_one_terminal(tmp_path: P
         assert len(events) == 10
         assert sum(event.kind is LifecycleEventKind.REQUEST_TERMINAL for event in events) == 1
         assert events[-1].outcome is TerminalOutcome.UPSTREAM_FAILED
+        resolved = [event for event in events if event.kind is LifecycleEventKind.ATTEMPT_RESOLVED]
+        assert all(event.headers_at_ms is not None for event in resolved)
+        assert all(event.first_byte_at_ms is not None for event in resolved)
+        assert all(event.timings_ms is not None and event.timings_ms.ttft_ms == 2 for event in resolved)
         assert all(len(canonical_event_bytes(event)) <= MAX_EVENT_BYTES for event in events)
     finally:
         reopened.close()
@@ -325,13 +350,19 @@ def test_shadow_budget_cancel_and_spill_are_bounded(tmp_path: Path) -> None:
         await lifecycle.queued()
         primary = dispatch()
         await lifecycle.attempt_started(primary, shadow=False)
-        await lifecycle.attempt_finished(primary, TerminalOutcome.UPSTREAM_FAILED, uncertain=False)
+        await lifecycle.attempt_finished(
+            primary,
+            TerminalOutcome.UPSTREAM_FAILED,
+            uncertain=False,
+            capacity_released=True,
+        )
         spill = dispatch(account_id=OTHER_ACCOUNT_ID, cause=DispatchCause.CAPACITY)
         await lifecycle.attempt_started(spill, shadow=False)
         await lifecycle.attempt_finished(
             spill,
             TerminalOutcome.CLIENT_CANCELLED,
             uncertain=True,
+            capacity_released=False,
         )
         await lifecycle.finished(TerminalOutcome.CLIENT_CANCELLED)
         await lifecycle.release()
@@ -347,6 +378,7 @@ def test_shadow_budget_cancel_and_spill_are_bounded(tmp_path: Path) -> None:
         assert resolved[-1].uncertain is True
         assert resolved[-1].reason is LifecycleReason.CLIENT_CANCELLED
         assert resolved[-1].spill_from_account_id == ACCOUNT_ID
+        assert resolved[-1].lease_released_at_ms is None
         assert sum(event.kind is LifecycleEventKind.REQUEST_TERMINAL for event in events) == 1
     finally:
         reopened.close()
@@ -354,11 +386,21 @@ def test_shadow_budget_cancel_and_spill_are_bounded(tmp_path: Path) -> None:
 
 def test_reserved_watermark_stops_only_new_admission_without_overwrite(tmp_path: Path) -> None:
     writer = spool(tmp_path, max_bytes=24 * MAX_EVENT_BYTES, queue_capacity=24)
+    capacity = TelemetryLifecycleCapacity(
+        writer,
+        installation_id=INSTALLATION_ID,
+        boot_id=BOOT_ID,
+        clock=Clock(),
+    )
     first = writer.try_reserve(12)
     second = writer.try_reserve(12)
     assert first is not None and second is not None
     assert writer.try_reserve(10) is None
     assert writer.status is SpoolStatus.ADMISSION_STOP
+    assert capacity.ready is True
+    import asyncio
+
+    assert asyncio.run(capacity.reserve(RequestId.new(), client(), 10)) is None
 
     expected = make_event(event_id=EventId.new())
     second.emit(expected)
@@ -367,9 +409,11 @@ def test_reserved_watermark_stops_only_new_admission_without_overwrite(tmp_path:
     assert [record.event for record in writer.replay() if record.event is not None] == [expected]
 
     first.release_unused()
-    assert writer.try_reserve(10) is not None
+    third = writer.try_reserve(10)
+    assert third is not None
+    third.release_unused()
     assert [record.event for record in writer.replay() if record.event is not None] == [expected]
-    writer.close()
+    asyncio.run(capacity.aclose())
 
 
 def test_replay_is_at_least_once_deduped_and_ack_is_strict(tmp_path: Path) -> None:
@@ -406,6 +450,41 @@ def test_replay_is_at_least_once_deduped_and_ack_is_strict(tmp_path: Path) -> No
     assert not first_path.exists()
     assert tuple(writer.replay()) == ()
     assert tuple(writer.replay(AckCursor.origin())), "a lost ACK must redeliver"
+    writer.close()
+
+def test_replay_and_ack_decode_incrementally_outside_hot_accounting_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    writer = spool(tmp_path, segment_bytes=1_200)
+    reservation = writer.try_reserve(6)
+    assert reservation is not None
+    for _ in range(6):
+        reservation.emit(make_event(event_id=EventId.new()))
+    reservation.release_unused()
+    writer.flush()
+    cursor = AckCursor(
+        writer.segment_manifests[-1].index,
+        writer.segment_manifests[-1].last_sequence,
+    )
+
+    original = LifecycleSpool._decode_record
+    decoded = 0
+
+    def counted(*args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal decoded
+        decoded += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(LifecycleSpool, "_decode_record", staticmethod(counted))
+    replay = writer.replay(AckCursor.origin())
+    assert decoded == 0
+    assert next(replay).event is not None
+    assert decoded == 1
+    tuple(replay)
+    decoded_before_ack = decoded
+    writer.ack(cursor)
+    assert decoded == decoded_before_ack
     writer.close()
 
 
@@ -463,6 +542,29 @@ def test_complete_corruption_fails_closed_instead_of_becoming_a_gap(tmp_path: Pa
     with pytest.raises(SpoolCorruptionError):
         LifecycleSpool.open(tmp_path, max_bytes=512 * 4096)
 
+def test_recovery_rejects_missing_manifest_segment_and_forward_ack(tmp_path: Path) -> None:
+    missing = spool(tmp_path / "missing", segment_bytes=900)
+    reservation = missing.try_reserve(4)
+    assert reservation is not None
+    for _ in range(4):
+        reservation.emit(make_event(event_id=EventId.new()))
+    missing.close()
+    newest = sorted((tmp_path / "missing").glob("segment-*.jsonl"))[-1]
+    newest.unlink()
+    with pytest.raises(SpoolCorruptionError, match="manifest segment"):
+        LifecycleSpool.open(tmp_path / "missing", max_bytes=512 * 4096)
+
+    forward = spool(tmp_path / "forward")
+    reserved = forward.try_reserve(1)
+    assert reserved is not None
+    reserved.emit(make_event())
+    forward.close()
+    (tmp_path / "forward" / "ack-v1.json").write_text(
+        json.dumps({"segment": 99, "sequence": 99, "version": 1}, sort_keys=True) + "\n"
+    )
+    with pytest.raises(SpoolCorruptionError, match="ACK"):
+        LifecycleSpool.open(tmp_path / "forward", max_bytes=512 * 4096)
+
 
 def test_writer_failure_stops_admission_but_records_one_live_terminal(tmp_path: Path) -> None:
     def fail(boundary: str) -> None:
@@ -498,6 +600,53 @@ def test_writer_failure_stops_admission_but_records_one_live_terminal(tmp_path: 
     assert "writer_io_failure" in fatal
     assert "raw disk error" not in fatal
 
+@pytest.mark.parametrize("batch_records", (1, 256))
+def test_writer_failure_preserves_terminal_from_failing_batch_or_drained_queue(
+    tmp_path: Path,
+    batch_records: int,
+) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+
+    def fail(boundary: str) -> None:
+        if boundary == "before_batch":
+            entered.set()
+            release.wait(timeout=2)
+            raise OSError("disk unavailable")
+
+    writer = spool(
+        tmp_path,
+        queue_capacity=16,
+        batch_records=batch_records,
+        failure_injector=fail,
+    )
+    capacity = TelemetryLifecycleCapacity(
+        writer,
+        installation_id=INSTALLATION_ID,
+        boot_id=BOOT_ID,
+        clock=Clock(),
+    )
+
+    async def scenario() -> None:
+        lifecycle = await capacity.reserve(REQUEST_ID, client(), 10)
+        assert lifecycle is not None
+        await lifecycle.profile_accepted(profile())
+        await lifecycle.queued()
+        await lifecycle.finished(TerminalOutcome.UPSTREAM_FAILED)
+        assert entered.wait(timeout=1)
+        release.set()
+        assert await asyncio.to_thread(writer.wait_stopped, 2)
+        terminals = writer.failed_terminal_events
+        assert len(terminals) == 1
+        assert terminals[0].kind is LifecycleEventKind.REQUEST_TERMINAL
+        assert terminals[0].outcome is TerminalOutcome.UPSTREAM_FAILED
+        await lifecycle.release()
+        await capacity.aclose()
+
+    import asyncio
+
+    asyncio.run(scenario())
+
 
 def test_full_spool_records_fit_the_reserved_four_kib_slot(tmp_path: Path) -> None:
     writer = spool(tmp_path)
@@ -522,6 +671,8 @@ def test_spool_sizing_rejects_below_floor_formula_or_physical_volume() -> None:
         defaults.validate(MIN_SPOOL_BYTES - 1, MIN_SPOOL_BYTES)
     with pytest.raises(ValueError, match="physical spool"):
         defaults.validate(MIN_SPOOL_BYTES, MIN_SPOOL_BYTES - 1)
+    with pytest.raises(ValueError, match="at least 12"):
+        SpoolSizing(max_events_per_request=11)
 
     larger = SpoolSizing(rate_rps=1_000, outage_window_s=900, max_events_per_request=12)
     assert larger.minimum_bytes == larger.formula_bytes > MIN_SPOOL_BYTES
@@ -535,6 +686,36 @@ def test_spool_sizing_rejects_below_floor_formula_or_physical_volume() -> None:
             max_bytes=MIN_SPOOL_BYTES - 1,
             physical_bytes=MIN_SPOOL_BYTES,
         )
+
+def test_writer_activity_updates_prometheus_after_async_idle(tmp_path: Path) -> None:
+    metrics = TelemetryMetrics(account_ids=(ACCOUNT_ID,), route_group_ids=(ROUTE_ID,))
+    writer = spool(tmp_path)
+    capacity = TelemetryLifecycleCapacity(
+        writer,
+        installation_id=INSTALLATION_ID,
+        boot_id=BOOT_ID,
+        clock=Clock(),
+        metrics=metrics,
+    )
+
+    async def scenario() -> None:
+        lifecycle = await capacity.reserve(REQUEST_ID, client(), 10)
+        assert lifecycle is not None
+        await lifecycle.finished(TerminalOutcome.UPSTREAM_FAILED)
+        await lifecycle.release()
+        await capacity.aclose()
+
+    import asyncio
+
+    asyncio.run(scenario())
+    samples = {
+        line.split()[0]: float(line.split()[1])
+        for line in metrics.render().decode().splitlines()
+        if line and not line.startswith("#") and "{" not in line
+    }
+    assert samples["llmmaxxing_writer_batch_records_count"] >= 1
+    assert samples["llmmaxxing_writer_fdatasync_seconds_count"] >= 1
+    assert samples["llmmaxxing_spool_bytes"] == writer.backlog_bytes
 
 
 def test_deterministic_otel_sampling_and_exporter_outage_never_touch_spool(
@@ -571,7 +752,12 @@ def test_deterministic_otel_sampling_and_exporter_outage_never_touch_spool(
         await lifecycle.queued()
         lease = dispatch()
         await lifecycle.attempt_started(lease, shadow=False)
-        await lifecycle.attempt_finished(lease, TerminalOutcome.COMPLETED, uncertain=False)
+        await lifecycle.attempt_finished(
+            lease,
+            TerminalOutcome.COMPLETED,
+            uncertain=False,
+            capacity_released=True,
+        )
         await lifecycle.finished(TerminalOutcome.COMPLETED)
         await lifecycle.release()
         otel.flush(2)
@@ -619,3 +805,58 @@ def test_otel_queue_is_bounded_drop_oldest_and_metadata_only() -> None:
     ).lower()
     for banned in ("prompt", "body", "tool_argument", "credential", "model_alias", "client_ip"):
         assert banned not in serialized
+
+
+def test_sampled_request_ignores_ambient_trace_context() -> None:
+    exported: list[object] = []
+    metrics = TelemetryMetrics(account_ids=(ACCOUNT_ID,), route_group_ids=(ROUTE_ID,))
+    otel = OptionalOtel(
+        metrics,
+        exporter=FakeExporter(exported=exported),
+        queue_size=8,
+        batch_size=1,
+        export_interval_ms=1,
+    )
+    sampled = RequestId("req_00000000-0000-4000-8000-000000000003")
+    ambient = NonRecordingSpan(
+        SpanContext(
+            trace_id=0x123456789ABCDEF123456789ABCDEF,
+            span_id=0x123456789ABCDEF,
+            is_remote=True,
+            trace_flags=TraceFlags(0),
+            trace_state=TraceState(),
+        )
+    )
+    with api_trace.use_span(ambient, end_on_exit=False):
+        otel.request_started(sampled)
+        otel.request_finished(sampled, ROUTE_ID, TerminalOutcome.COMPLETED)
+    assert otel.flush(2)
+    otel.shutdown()
+    roots = [span for span in exported if span.name == "llmmaxxing.request"]  # type: ignore[attr-defined]
+    assert len(roots) == 1
+    assert roots[0].parent is None  # type: ignore[attr-defined]
+
+
+def test_hung_optional_otel_exporter_cannot_block_shutdown() -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    metrics = TelemetryMetrics()
+    otel = OptionalOtel(
+        metrics,
+        exporter=HungExporter(entered, release),
+        queue_size=2,
+        batch_size=1,
+        export_interval_ms=1,
+    )
+    sampled = RequestId("req_00000000-0000-4000-8000-000000000003")
+    otel.request_started(sampled)
+    otel.request_finished(sampled, ROUTE_ID, TerminalOutcome.COMPLETED)
+    assert entered.wait(timeout=1)
+
+    returned = threading.Event()
+    shutdown = threading.Thread(target=lambda: (otel.shutdown(), returned.set()), daemon=True)
+    shutdown.start()
+    bounded = returned.wait(timeout=0.75)
+    release.set()
+    shutdown.join(timeout=3)
+    assert bounded, "optional exporter shutdown must have a short outer deadline"

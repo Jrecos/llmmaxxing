@@ -11,6 +11,7 @@ from collections.abc import Sequence
 from typing import Any
 
 from opentelemetry import trace
+from opentelemetry.context import Context
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import ReadableSpan, Span, SpanProcessor, TracerProvider
 from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult
@@ -25,6 +26,9 @@ from llmmaxxing.core.ids import (
 )
 from llmmaxxing.core.reasons import RouteTrigger, TerminalOutcome
 from llmmaxxing.telemetry.metrics import TelemetryMetrics
+
+_PROCESSOR_SHUTDOWN_SECONDS = 0.2
+_OTEL_SHUTDOWN_SECONDS = 0.6
 
 
 def deterministic_head_sample(request_id: RequestId) -> bool:
@@ -108,10 +112,35 @@ class _BoundedSpanProcessor(SpanProcessor):
                 return
             self._stopping = True
             self._condition.notify_all()
-        self._thread.join(timeout=30)
-        try:
-            self._exporter.shutdown()
-        except Exception:
+        self._thread.join(timeout=_PROCESSOR_SHUTDOWN_SECONDS)
+        if self._thread.is_alive():
+            with self._condition:
+                dropped = len(self._queue)
+                self._queue.clear()
+                self._dropped += dropped
+                self._failed += 1
+            if dropped:
+                self._metrics.otel_dropped(dropped)
+            self._metrics.otel_failed()
+
+        exporter_done = threading.Event()
+
+        def stop_exporter() -> None:
+            try:
+                self._exporter.shutdown()
+            except Exception:
+                with self._condition:
+                    self._failed += 1
+                self._metrics.otel_failed()
+            finally:
+                exporter_done.set()
+
+        threading.Thread(
+            target=stop_exporter,
+            name="llmmaxxing-otel-shutdown",
+            daemon=True,
+        ).start()
+        if not exporter_done.wait(timeout=_PROCESSOR_SHUTDOWN_SECONDS):
             with self._condition:
                 self._failed += 1
             self._metrics.otel_failed()
@@ -223,6 +252,7 @@ class OptionalOtel:
                     "llmmaxxing.schema_version": 1,
                     "llmmaxxing.request_id": str(request_id),
                 },
+                context=Context(),
             )
             with self._lock:
                 if self._closed or request_id in self._requests:
@@ -330,14 +360,30 @@ class OptionalOtel:
             spans = (*self._attempts.values(), *self._requests.values())
             self._attempts.clear()
             self._requests.clear()
+            self._tracer = None
         for span in spans:
             self._safe_end(span)
         provider = self._provider
-        if provider is not None:
+        if provider is None:
+            return
+
+        stopped = threading.Event()
+
+        def stop_provider() -> None:
             try:
                 provider.shutdown()
             except Exception:
                 self._metrics.otel_failed()
+            finally:
+                stopped.set()
+
+        threading.Thread(
+            target=stop_provider,
+            name="llmmaxxing-otel-provider-shutdown",
+            daemon=True,
+        ).start()
+        if not stopped.wait(timeout=_OTEL_SHUTDOWN_SECONDS):
+            self._metrics.otel_failed()
 
     def _request(self, request_id: RequestId) -> Span | None:
         with self._lock:
@@ -346,8 +392,12 @@ class OptionalOtel:
     def _disable(self) -> None:
         self._initial_failures += 1
         self._metrics.otel_failed()
-        self.shutdown()
         self._tracer = None
+        threading.Thread(
+            target=self.shutdown,
+            name="llmmaxxing-otel-disable",
+            daemon=True,
+        ).start()
 
     @staticmethod
     def _safe_set(span: Span, name: str, value: str | bool) -> None:

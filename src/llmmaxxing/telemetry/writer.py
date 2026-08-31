@@ -58,8 +58,10 @@ class SpoolSizing:
     max_events_per_request: int = 12
 
     def __post_init__(self) -> None:
-        if self.rate_rps < 1 or self.outage_window_s < 1 or self.max_events_per_request < 1:
+        if self.rate_rps < 1 or self.outage_window_s < 1:
             raise ValueError("spool sizing inputs must be positive")
+        if self.max_events_per_request < 12:
+            raise ValueError("V1 spool sizing requires at least 12 events per request")
 
     @property
     def formula_bytes(self) -> int:
@@ -256,14 +258,20 @@ class LifecycleSpool:
         self._lock = threading.RLock()
         self._control_lock = threading.Lock()
         self._close_lock = threading.Lock()
+        self._maintenance_lock = threading.RLock()
+        self._replay_lock = threading.RLock()
         self._status = SpoolStatus.HEALTHY
         self._accepting = True
         self._outstanding_slots = 0
         self._queued_slots = 0
         self._stats = _MutableStats()
+        self._on_batch: Callable[[int], None] | None = None
+        self._on_fdatasync: Callable[[float], None] | None = None
+        self._on_state_change: Callable[[], None] | None = None
         self._segments: list[SegmentManifest] = []
         self._physical_bytes = 0
         self._anchor_sequence = 0
+        self._anchor_segment = 0
         self._anchor_digest = _ZERO_DIGEST
         self._last_sequence = 0
         self._last_digest = _ZERO_DIGEST
@@ -274,6 +282,7 @@ class LifecycleSpool:
         self._dirty_since: float | None = None
         self._crashed = False
         self._failed_terminal_events: list[LifecycleEventV1] = []
+        self._failed_terminal_ids: set[EventId] = set()
 
         self._initialize(create=create)
         self._thread = threading.Thread(
@@ -290,6 +299,18 @@ class LifecycleSpool:
     @classmethod
     def open(cls, root: Path, **kwargs: Any) -> Self:
         return cls(root, create=False, **kwargs)
+
+    def set_observer(
+        self,
+        *,
+        on_batch: Callable[[int], None],
+        on_fdatasync: Callable[[float], None],
+        on_state_change: Callable[[], None],
+    ) -> None:
+        with self._lock:
+            self._on_batch = on_batch
+            self._on_fdatasync = on_fdatasync
+            self._on_state_change = on_state_change
 
     @property
     def status(self) -> SpoolStatus:
@@ -384,10 +405,7 @@ class LifecycleSpool:
                 state.emitted += 1
                 self._outstanding_slots -= 1
                 state.closed = state.remaining == 0
-                if len(self._failed_terminal_events) >= self.queue_capacity:
-                    self._invariant("failed_terminal_capacity_exhausted")
-                self._failed_terminal_events.append(event)
-                self._write_fatal("terminal_not_durable")
+                self._preserve_failed_terminal(event)
                 return
             if self._status in {SpoolStatus.FAILED, SpoolStatus.CRASHED, SpoolStatus.CLOSED}:
                 self._invariant("writer_unavailable")
@@ -406,6 +424,28 @@ class LifecycleSpool:
                 self._outstanding_slots += 1
                 self._queued_slots -= 1
                 self._invariant("reserved_queue_full", cause=error)
+
+    def _preserve_failed_terminal(self, event: LifecycleEventV1) -> None:
+        if event.kind.value != "request_terminal":
+            return
+        recorded = False
+        with self._lock:
+            if event.event_id in self._failed_terminal_ids:
+                return
+            if len(self._failed_terminal_events) >= self.queue_capacity:
+                self._stats.invariant_violations += 1
+                self._write_fatal("failed_terminal_capacity_exhausted")
+                return
+            self._failed_terminal_ids.add(event.event_id)
+            self._failed_terminal_events.append(event)
+            recorded = True
+        if recorded:
+            self._write_fatal("terminal_not_durable")
+
+    def _preserve_terminal_commands(self, commands: Iterable[_EventCommand]) -> None:
+        for command in commands:
+            if command.terminal:
+                self._preserve_failed_terminal(command.event)
 
     def _release_unused(self, state: _ReservationState, count: int | None) -> int:
         with self._lock:
@@ -474,61 +514,89 @@ class LifecycleSpool:
 
     def replay(self, cursor: AckCursor | None = None) -> Iterator[SpoolRecord]:
         with self._lock:
-            healthy = self._status is SpoolStatus.HEALTHY
-        if healthy:
+            writable = self._status is SpoolStatus.HEALTHY
+        if writable:
             self.flush()
-        start = cursor or self.ack_cursor
-        records, _, _, _ = self._scan_segments(repair_tail=False, update_manifests=False)
-        return (record for record in records if record.sequence > start.sequence)
+
+        def records() -> Iterator[SpoolRecord]:
+            with self._replay_lock:
+                with self._maintenance_lock, self._lock:
+                    start = cursor or self._ack_cursor
+                    anchor = AckCursor(self._anchor_segment, self._anchor_sequence)
+                    anchor_digest = self._anchor_digest
+                    segments = tuple(self._segments)
+                yield from self._stream_replay(start, anchor, anchor_digest, segments)
+
+        return records()
 
     def ack(self, cursor: AckCursor) -> None:
-        self.flush()
-        with self._lock:
-            if cursor.sequence < self._ack_cursor.sequence:
-                raise ValueError("ACK cursor cannot move backwards")
-            if cursor.sequence > self._last_sequence:
-                raise ValueError("ACK cursor exceeds the durable spool")
-            if cursor != self._ack_cursor:
-                records, _, _, _ = self._scan_segments(
-                    repair_tail=False,
-                    update_manifests=False,
-                )
-                if not any(record.cursor == cursor for record in records):
-                    raise ValueError("ACK cursor does not identify a durable record")
-            self._ack_cursor = cursor
-            self._write_ack()
-            current = self._segments[-1].index if self._segments else 0
-            deleted = [
-                segment
-                for segment in self._segments
-                if segment.index != current
-                and segment.last_sequence > 0
-                and segment.last_sequence < cursor.sequence
-            ]
-            if deleted:
-                retained = [segment for segment in self._segments if segment not in deleted]
-                renamed: list[tuple[Path, SegmentManifest]] = []
+        with self._replay_lock:
+            self.flush()
+            with self._maintenance_lock:
+                with self._lock:
+                    current_ack = self._ack_cursor
+                    anchor = AckCursor(self._anchor_segment, self._anchor_sequence)
+                    segments = tuple(self._segments)
+                    if cursor.sequence < current_ack.sequence:
+                        raise ValueError("ACK cursor cannot move backwards")
+                    if not self._cursor_is_durable(cursor, anchor, segments):
+                        raise ValueError("ACK cursor does not identify a durable record")
+                    current = segments[-1].index if segments else 0
+                    deleted = tuple(
+                        segment
+                        for segment in segments
+                        if segment.index != current
+                        and segment.last_sequence > 0
+                        and segment.last_sequence < cursor.sequence
+                    )
+                    retained = tuple(segment for segment in segments if segment not in deleted)
+                    self._ack_cursor = cursor
                 try:
+                    self._write_ack()
+                    renamed: list[tuple[Path, SegmentManifest]] = []
                     for segment in deleted:
                         source = self.root / segment.name
                         staged = source.with_name(source.name + ".acked")
                         os.replace(source, staged)
                         renamed.append((staged, segment))
-                    self._fsync_directory()
-                    newest = deleted[-1]
-                    self._anchor_sequence = newest.last_sequence
-                    self._anchor_digest = newest.digest
-                    self._segments = retained
-                    self._write_manifest(clean=False)
-                    for staged, segment in renamed:
-                        staged.unlink()
-                        self._physical_bytes -= segment.bytes
-                    self._fsync_directory()
+                    if renamed:
+                        self._fsync_directory()
+                        newest = deleted[-1]
+                        with self._lock:
+                            self._anchor_segment = newest.index
+                            self._anchor_sequence = newest.last_sequence
+                            self._anchor_digest = newest.digest
+                            self._segments = list(retained)
+                        self._write_manifest(clean=False)
+                        for staged, segment in renamed:
+                            staged.unlink()
+                            with self._lock:
+                                self._physical_bytes -= segment.bytes
+                        self._fsync_directory()
                 except OSError as error:
-                    self._accepting = False
-                    self._status = SpoolStatus.FAILED
+                    with self._lock:
+                        self._accepting = False
+                        self._status = SpoolStatus.FAILED
                     self._write_fatal("ack_cleanup_failure")
                     raise SpoolUnavailable("durable ACK cleanup failed") from error
+        self._notify(self._on_state_change)
+
+    @staticmethod
+    def _cursor_is_durable(
+        cursor: AckCursor,
+        anchor: AckCursor,
+        segments: tuple[SegmentManifest, ...],
+    ) -> bool:
+        if cursor == AckCursor.origin():
+            return anchor == AckCursor.origin()
+        if cursor == anchor:
+            return True
+        return any(
+            segment.index == cursor.segment
+            and segment.first_sequence <= cursor.sequence <= segment.last_sequence
+            for segment in segments
+            if segment.first_sequence > 0
+        )
 
     def _initialize(self, *, create: bool) -> None:
         if create:
@@ -539,6 +607,7 @@ class LifecycleSpool:
             self._write_manifest(clean=True)
             self._write_ack()
             was_clean = True
+            manifest_names: set[str] = set()
         else:
             if not self.root.is_dir():
                 raise SpoolCorruptionError("missing spool directory")
@@ -552,12 +621,16 @@ class LifecycleSpool:
             anchor = manifest.get("chain_anchor")
             if not isinstance(anchor, dict):
                 raise SpoolCorruptionError("invalid chain anchor")
+            self._anchor_segment = self._nonnegative_int(
+                anchor.get("segment"),
+                "anchor segment",
+            )
             self._anchor_sequence = self._nonnegative_int(anchor.get("sequence"), "anchor sequence")
             self._anchor_digest = self._digest(anchor.get("digest"), "anchor digest")
             raw_segments = manifest.get("segments")
             if not isinstance(raw_segments, list):
                 raise SpoolCorruptionError("invalid segment manifest list")
-            manifest_names: set[str] = set()
+            manifest_names = set()
             for item in raw_segments:
                 if not isinstance(item, dict) or not isinstance(item.get("name"), str):
                     raise SpoolCorruptionError("invalid segment manifest entry")
@@ -570,14 +643,27 @@ class LifecycleSpool:
                     raise SpoolCorruptionError("invalid segment manifest name")
                 manifest_names.add(name)
             self._repair_ack_deletions(manifest_names)
+            disk_names = {path.name for path in self.root.glob("segment-*.jsonl")}
+            missing = manifest_names - disk_names
+            if missing:
+                raise SpoolCorruptionError("manifest segment is missing")
+            if was_clean and disk_names != manifest_names:
+                raise SpoolCorruptionError("clean spool contains an unlisted segment")
             self._ack_cursor = self._read_ack()
 
-        records, partial, last_sequence, last_digest = self._scan_segments(
+        partial, last_sequence, last_digest = self._scan_segments(
             repair_tail=not was_clean
         )
         self._last_sequence = last_sequence
         self._last_digest = last_digest
         self._physical_bytes = sum(segment.bytes for segment in self._segments)
+        anchor_cursor = AckCursor(self._anchor_segment, self._anchor_sequence)
+        if not self._cursor_is_durable(
+            self._ack_cursor,
+            anchor_cursor,
+            tuple(self._segments),
+        ):
+            raise SpoolCorruptionError("ACK cursor is ahead of the recovered spool")
         self._open_new_segment()
         if not was_clean:
             gap = SpoolGap(
@@ -593,6 +679,7 @@ class LifecycleSpool:
 
     def _writer_loop(self) -> None:
         stop: _ControlCommand | None = None
+        in_flight: list[_EventCommand] = []
         try:
             while stop is None:
                 try:
@@ -610,6 +697,7 @@ class LifecycleSpool:
 
                 batch = [first]
                 force = first.terminal
+                trailing_control: _ControlCommand | None = None
                 deadline = self._monotonic() + self._batch_delay_s
                 while len(batch) < self._batch_records and not force:
                     remaining = deadline - self._monotonic()
@@ -620,19 +708,23 @@ class LifecycleSpool:
                     except queue.Empty:
                         break
                     if isinstance(command, _ControlCommand):
-                        if command.kind == "flush":
-                            self._write_batch(batch)
-                            batch = []
-                            self._sync(force=True)
-                            command.done.set()
-                            continue
-                        stop = command
+                        trailing_control = command
                         break
                     batch.append(command)
                     force = command.terminal
-                if batch:
-                    self._write_batch(batch)
-                self._sync(force=force)
+
+                in_flight = batch
+                self._write_batch(batch)
+                self._sync(
+                    force=force
+                    or (trailing_control is not None and trailing_control.kind == "flush")
+                )
+                in_flight = []
+                if trailing_control is not None:
+                    if trailing_control.kind == "flush":
+                        trailing_control.done.set()
+                    else:
+                        stop = trailing_control
             self._sync(force=True)
             self._close_current_segment()
             self._write_manifest(clean=True)
@@ -646,6 +738,7 @@ class LifecycleSpool:
             if stop is not None:
                 stop.done.set()
         except BaseException:
+            self._preserve_terminal_commands(in_flight)
             with self._lock:
                 self._accepting = False
                 self._status = SpoolStatus.FAILED
@@ -658,15 +751,32 @@ class LifecycleSpool:
                 self._close_fd()
 
     def _write_batch(self, batch: list[_EventCommand]) -> None:
-        if self._failure_injector is not None:
-            self._failure_injector("before_batch")
-        for command in batch:
-            self._append_event(command.event)
+        with self._maintenance_lock:
+            if self._failure_injector is not None:
+                self._failure_injector("before_batch")
+            for command in batch:
+                self._append_event(command.event)
+                with self._lock:
+                    self._queued_slots -= 1
             with self._lock:
-                self._queued_slots -= 1
-        with self._lock:
-            self._stats.batches += 1
-            self._stats.max_batch_records = max(self._stats.max_batch_records, len(batch))
+                self._stats.batches += 1
+                self._stats.max_batch_records = max(
+                    self._stats.max_batch_records,
+                    len(batch),
+                )
+                on_batch = self._on_batch
+                on_state_change = self._on_state_change
+        self._notify(on_batch, len(batch))
+        self._notify(on_state_change)
+
+    @staticmethod
+    def _notify(callback: Callable[..., None] | None, *args: object) -> None:
+        if callback is None:
+            return
+        try:
+            callback(*args)
+        except Exception:
+            pass
 
     def _append_event(self, event: LifecycleEventV1) -> None:
         document = json.loads(canonical_event_bytes(event))
@@ -720,25 +830,26 @@ class LifecycleSpool:
             self._write_all(fd, line[split:])
         if self._dirty_since is None:
             self._dirty_since = self._monotonic()
-        current = self._segments[-1]
-        first_sequence = current.first_sequence or sequence
-        first_event_id = current.first_event_id or event_id
-        self._segments[-1] = replace(
-            current,
-            first_sequence=first_sequence,
-            last_sequence=sequence,
-            first_event_id=first_event_id,
-            last_event_id=event_id or current.last_event_id,
-            digest=digest,
-            bytes=current.bytes + len(line),
-        )
         with self._lock:
+            current = self._segments[-1]
+            first_sequence = current.first_sequence or sequence
+            first_event_id = current.first_event_id or event_id
+            self._segments[-1] = replace(
+                current,
+                first_sequence=first_sequence,
+                last_sequence=sequence,
+                first_event_id=first_event_id,
+                last_event_id=event_id or current.last_event_id,
+                digest=digest,
+                bytes=current.bytes + len(line),
+            )
             self._physical_bytes += len(line)
             self._last_sequence = sequence
             self._last_digest = digest
 
     def _rotate_if_needed(self, line_bytes: int) -> None:
-        current = self._segments[-1]
+        with self._lock:
+            current = self._segments[-1]
         age = self._monotonic() - self._segment_started_monotonic
         if current.bytes and (
             current.bytes + line_bytes > self._segment_bytes or age >= self._segment_seconds
@@ -748,25 +859,27 @@ class LifecycleSpool:
             self._open_new_segment()
 
     def _open_new_segment(self) -> None:
-        index = max((segment.index for segment in self._segments), default=0) + 1
+        with self._lock:
+            index = max((segment.index for segment in self._segments), default=0) + 1
         name = f"segment-{index:020d}.jsonl"
         path = self.root / name
         self._segment_fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         now = self._clock_ms()
-        self._segments.append(
-            SegmentManifest(
-                index=index,
-                name=name,
-                first_sequence=0,
-                last_sequence=0,
-                first_event_id=None,
-                last_event_id=None,
-                digest=self._last_digest,
-                bytes=0,
-                opened_at_ms=now,
-                open=True,
+        with self._lock:
+            self._segments.append(
+                SegmentManifest(
+                    index=index,
+                    name=name,
+                    first_sequence=0,
+                    last_sequence=0,
+                    first_event_id=None,
+                    last_event_id=None,
+                    digest=self._last_digest,
+                    bytes=0,
+                    opened_at_ms=now,
+                    open=True,
+                )
             )
-        )
         self._segment_started_monotonic = self._monotonic()
 
     def _close_current_segment(self) -> None:
@@ -775,8 +888,9 @@ class LifecycleSpool:
         self._sync(force=True)
         os.close(self._segment_fd)
         self._segment_fd = None
-        if self._segments:
-            self._segments[-1] = replace(self._segments[-1], open=False)
+        with self._lock:
+            if self._segments:
+                self._segments[-1] = replace(self._segments[-1], open=False)
 
     def _close_fd(self) -> None:
         fd = self._segment_fd
@@ -786,33 +900,73 @@ class LifecycleSpool:
                 os.close(fd)
 
     def _sync(self, *, force: bool) -> None:
-        fd = self._segment_fd
-        dirty_since = self._dirty_since
-        if fd is None or dirty_since is None:
-            return
-        now = self._monotonic()
-        if not force and now - dirty_since < self._sync_trigger_s:
-            return
-        if self._failure_injector is not None:
-            self._failure_injector("before_fdatasync")
-        os.fdatasync(fd)
-        elapsed_ms = (self._monotonic() - dirty_since) * 1_000
-        with self._lock:
-            self._stats.fdatasyncs += 1
-            self._stats.max_fdatasync_interval_ms = max(
-                self._stats.max_fdatasync_interval_ms, elapsed_ms
-            )
-        self._dirty_since = None
-        self._write_manifest(clean=False)
+        with self._maintenance_lock:
+            fd = self._segment_fd
+            dirty_since = self._dirty_since
+            if fd is None or dirty_since is None:
+                return
+            now = self._monotonic()
+            if not force and now - dirty_since < self._sync_trigger_s:
+                return
+            if self._failure_injector is not None:
+                self._failure_injector("before_fdatasync")
+            sync_started = self._monotonic()
+            os.fdatasync(fd)
+            synced_at = self._monotonic()
+            elapsed_ms = (synced_at - dirty_since) * 1_000
+            latency_s = max(0.0, synced_at - sync_started)
+            with self._lock:
+                self._stats.fdatasyncs += 1
+                self._stats.max_fdatasync_interval_ms = max(
+                    self._stats.max_fdatasync_interval_ms,
+                    elapsed_ms,
+                )
+                on_fdatasync = self._on_fdatasync
+                on_state_change = self._on_state_change
+            self._dirty_since = None
+            self._write_manifest(clean=False)
+        self._notify(on_fdatasync, latency_s)
+        self._notify(on_state_change)
 
-    def _scan_segments(
+    def _stream_replay(
         self,
-        *,
-        repair_tail: bool,
-        update_manifests: bool = True,
-    ) -> tuple[list[SpoolRecord], bool, int, str]:
+        cursor: AckCursor,
+        anchor: AckCursor,
+        anchor_digest: str,
+        segments: tuple[SegmentManifest, ...],
+    ) -> Iterator[SpoolRecord]:
+        previous = anchor_digest
+        sequence = anchor.sequence
+        for segment in segments:
+            if segment.last_sequence == 0:
+                continue
+            path = self.root / segment.name
+            try:
+                handle = path.open("rb")
+            except OSError as error:
+                raise SpoolCorruptionError("manifest segment is missing") from error
+            with handle:
+                while sequence < segment.last_sequence:
+                    line = handle.readline()
+                    if not line or not line.endswith(b"\n"):
+                        raise SpoolCorruptionError(
+                            "manifest segment ended before its durable cursor"
+                        )
+                    record = self._decode_record(
+                        line[:-1],
+                        previous,
+                        sequence + 1,
+                        segment.index,
+                    )
+                    sequence = record.sequence
+                    previous = record.digest
+                    if record.sequence > cursor.sequence:
+                        yield record
+            if sequence != segment.last_sequence or previous != segment.digest:
+                raise SpoolCorruptionError("manifest segment cursor or digest mismatch")
+
+    def _scan_segments(self, *, repair_tail: bool) -> tuple[bool, int, str]:
         paths = sorted(self.root.glob("segment-*.jsonl"))
-        records: list[SpoolRecord] = []
         manifests: list[SegmentManifest] = []
         previous = self._anchor_digest
         sequence = self._anchor_sequence
@@ -843,7 +997,6 @@ class LifecycleSpool:
                         partial = True
                         break
                     record = self._decode_record(line[:-1], previous, sequence + 1, index)
-                    records.append(record)
                     sequence = record.sequence
                     previous = record.digest
                     last_digest = record.digest
@@ -868,10 +1021,9 @@ class LifecycleSpool:
                     open=False,
                 )
             )
-        if update_manifests:
-            with self._lock:
-                self._segments = manifests
-        return records, partial, sequence, previous
+        with self._lock:
+            self._segments = manifests
+        return partial, sequence, previous
 
     @staticmethod
     def _decode_record(
@@ -937,33 +1089,36 @@ class LifecycleSpool:
         raise SpoolCorruptionError("unknown spool record type or fields")
 
     def _write_manifest(self, *, clean: bool) -> None:
-        if clean:
-            self._last_clean_at_ms = self._clock_ms()
-        document = {
-            "version": 1,
-            "clean": clean,
-            "last_clean_at_ms": self._last_clean_at_ms,
-            "chain_anchor": {
-                "sequence": self._anchor_sequence,
-                "digest": self._anchor_digest,
-            },
-            "segments": [
-                {
-                    "index": item.index,
-                    "name": item.name,
-                    "first_sequence": item.first_sequence,
-                    "last_sequence": item.last_sequence,
-                    "first_event_id": item.first_event_id,
-                    "last_event_id": item.last_event_id,
-                    "digest": item.digest,
-                    "bytes": item.bytes,
-                    "opened_at_ms": item.opened_at_ms,
-                    "open": item.open and not clean,
+        with self._maintenance_lock:
+            with self._lock:
+                if clean:
+                    self._last_clean_at_ms = self._clock_ms()
+                document = {
+                    "version": 1,
+                    "clean": clean,
+                    "last_clean_at_ms": self._last_clean_at_ms,
+                    "chain_anchor": {
+                        "segment": self._anchor_segment,
+                        "sequence": self._anchor_sequence,
+                        "digest": self._anchor_digest,
+                    },
+                    "segments": [
+                        {
+                            "index": item.index,
+                            "name": item.name,
+                            "first_sequence": item.first_sequence,
+                            "last_sequence": item.last_sequence,
+                            "first_event_id": item.first_event_id,
+                            "last_event_id": item.last_event_id,
+                            "digest": item.digest,
+                            "bytes": item.bytes,
+                            "opened_at_ms": item.opened_at_ms,
+                            "open": item.open and not clean,
+                        }
+                        for item in self._segments
+                    ],
                 }
-                for item in self._segments
-            ],
-        }
-        self._atomic_json(self.root / _MANIFEST, document)
+            self._atomic_json(self.root / _MANIFEST, document)
 
     def _read_ack(self) -> AckCursor:
         document = self._read_json(self.root / _ACK, "ACK cursor")
@@ -1052,6 +1207,8 @@ class LifecycleSpool:
                 return
             if isinstance(command, _ControlCommand):
                 command.done.set()
+            elif command.terminal:
+                self._preserve_failed_terminal(command.event)
 
     def _require_fd(self) -> int:
         if self._segment_fd is None:

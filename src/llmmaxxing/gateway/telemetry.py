@@ -64,6 +64,8 @@ class _AttemptState:
     route_group_id: RouteGroupId
     trigger: RouteTrigger
     started_at_ms: int
+    headers_at_ms: int | None = None
+    first_byte_at_ms: int | None = None
     resolved: bool = False
 
 
@@ -198,12 +200,37 @@ class LifecycleReservation:
         )
         self._capacity._refresh_metrics()
 
+    def attempt_headers(self, lease: DispatchLease) -> None:
+        with self._state.lock:
+            self._open()
+            attempt = self._state.attempts.get(lease.attempt_id)
+            if attempt is None:
+                raise RuntimeError("attempt headers have no reserved event pair")
+            if attempt.resolved:
+                raise RuntimeError("resolved attempt cannot record headers")
+            if attempt.headers_at_ms is None:
+                attempt.headers_at_ms = self._capacity.clock.now_ms()
+
+    def attempt_first_byte(self, lease: DispatchLease) -> None:
+        with self._state.lock:
+            self._open()
+            attempt = self._state.attempts.get(lease.attempt_id)
+            if attempt is None:
+                raise RuntimeError("attempt first byte has no reserved event pair")
+            if attempt.resolved:
+                raise RuntimeError("resolved attempt cannot record first byte")
+            if attempt.headers_at_ms is None:
+                raise RuntimeError("attempt first byte cannot precede response headers")
+            if attempt.first_byte_at_ms is None:
+                attempt.first_byte_at_ms = self._capacity.clock.now_ms()
+
     async def attempt_finished(
         self,
         lease: DispatchLease,
         outcome: TerminalOutcome,
         *,
         uncertain: bool,
+        capacity_released: bool,
     ) -> None:
         attempt_id = lease.attempt_id
         with self._state.lock:
@@ -214,6 +241,8 @@ class LifecycleReservation:
             if attempt.resolved:
                 return
             now = self._capacity.clock.now_ms()
+            if uncertain and capacity_released:
+                raise ValueError("uncertain provider capacity cannot be reported released")
             reason = _attempt_reason(outcome, uncertain)
             spill_from = (
                 self._state.first_account_id
@@ -234,9 +263,18 @@ class LifecycleReservation:
                     reason=reason,
                     spill_from_account_id=spill_from,
                     uncertain=uncertain,
-                    timings_ms=LifecycleTimingsV1(duration_ms=max(0, now - attempt.started_at_ms)),
+                    timings_ms=LifecycleTimingsV1(
+                        ttft_ms=(
+                            None
+                            if attempt.first_byte_at_ms is None
+                            else max(0, attempt.first_byte_at_ms - attempt.started_at_ms)
+                        ),
+                        duration_ms=max(0, now - attempt.started_at_ms),
+                    ),
+                    headers_at_ms=attempt.headers_at_ms,
+                    first_byte_at_ms=attempt.first_byte_at_ms,
                     final_byte_at_ms=(now if outcome is TerminalOutcome.COMPLETED else None),
-                    lease_released_at_ms=now,
+                    lease_released_at_ms=(now if capacity_released else None),
                 )
             )
             attempt.resolved = True
@@ -345,6 +383,11 @@ class TelemetryLifecycleCapacity:
         self._active: dict[RequestId, LifecycleReservation] = {}
         self._lock = threading.Lock()
         self._closed = False
+        self.spool.set_observer(
+            on_batch=self.metrics.writer_batch,
+            on_fdatasync=self.metrics.writer_fdatasync,
+            on_state_change=self._refresh_metrics,
+        )
         self._refresh_metrics()
 
     @classmethod
@@ -382,7 +425,10 @@ class TelemetryLifecycleCapacity:
     @property
     def ready(self) -> bool:
         with self._lock:
-            return not self._closed and self.spool.status is SpoolStatus.HEALTHY
+            return not self._closed and self.spool.status in {
+                SpoolStatus.HEALTHY,
+                SpoolStatus.ADMISSION_STOP,
+            }
 
     async def reserve(
         self,

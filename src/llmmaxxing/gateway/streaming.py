@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
@@ -361,6 +361,7 @@ async def relay_raw_response(
     send: ASGISend,
     response_start: ResponseStart,
     read_inactivity_timeout_s: float,
+    on_first_byte: Callable[[], None] | None = None,
 ) -> int:
     """Start once and relay bounded raw bytes while observing ASGI disconnects."""
     disconnect = asyncio.create_task(_watch_disconnect(receive))
@@ -379,6 +380,7 @@ async def relay_raw_response(
         except Exception as error:
             raise DownstreamStreamError("downstream rejected response headers") from error
         sent = 0
+        first_observed = False
         iterator = response.aiter_raw(RAW_CHUNK_BYTES).__aiter__()
         while True:
             chunk = await _await_or_disconnect(
@@ -387,6 +389,10 @@ async def relay_raw_response(
             )
             if chunk is None:
                 break
+            if chunk and not first_observed:
+                first_observed = True
+                if on_first_byte is not None:
+                    on_first_byte()
             try:
                 await _await_or_disconnect(
                     send(
@@ -426,13 +432,19 @@ async def read_prestart_error(
     response: httpx.Response,
     *,
     read_inactivity_timeout_s: float,
+    on_first_byte: Callable[[], None] | None = None,
 ) -> bytes:
     result = bytearray()
+    first_observed = False
     iterator = response.aiter_raw(RAW_CHUNK_BYTES).__aiter__()
     while True:
         chunk = await _next_with_timeout(iterator, read_inactivity_timeout_s)
         if chunk is None:
             return bytes(result)
+        if chunk and not first_observed:
+            first_observed = True
+            if on_first_byte is not None:
+                on_first_byte()
         if len(result) + len(chunk) > MAX_PRESTART_ERROR_BYTES:
             raise UpstreamStreamError(
                 "upstream error envelope exceeds the bounded classifier input"
@@ -444,14 +456,20 @@ async def drain_raw_response(
     response: httpx.Response,
     *,
     read_inactivity_timeout_s: float,
+    on_first_byte: Callable[[], None] | None = None,
 ) -> int:
     """Consume one non-serving response with the same bounded raw iterator."""
     total = 0
+    first_observed = False
     iterator = response.aiter_raw(RAW_CHUNK_BYTES).__aiter__()
     while True:
         chunk = await _next_with_timeout(iterator, read_inactivity_timeout_s)
         if chunk is None:
             return total
+        if chunk and not first_observed:
+            first_observed = True
+            if on_first_byte is not None:
+                on_first_byte()
         total += len(chunk)
 
 

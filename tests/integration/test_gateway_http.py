@@ -174,6 +174,8 @@ def test_lifecycle_capacity_is_reserved_before_body_and_body_is_released_once(tm
                 "profile",
                 "queued",
                 "attempt_started",
+                "attempt_headers",
+                "attempt_first_byte",
                 "attempt_finished",
                 "finished",
                 "release",
