@@ -12,6 +12,8 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
 ]
 dependencies = [
+    "aiosqlite>=0.20,<1",
+    "alembic>=1.14,<2",
     "cryptography>=44,<47",
     "httpx>=0.28,<1",
     "pydantic>=2.9,<3",
@@ -19,6 +21,7 @@ dependencies = [
     "opentelemetry-exporter-otlp-proto-http>=1.30,<2",
     "opentelemetry-sdk>=1.30,<2",
     "prometheus-client>=0.21,<1",
+    "sqlalchemy[asyncio]>=2.0,<3",
     "uvicorn>=0.35,<1",
 ]
 
@@ -27,9 +30,11 @@ llmmaxxing = "llmmaxxing.cli.main:main"
 
 [dependency-groups]
 dev = [
+    "asyncpg>=0.30,<1",
     "pytest>=8.0",
     "ruff>=0.8",
     "mypy>=1.13",
+    "pytest-asyncio>=0.24,<2",
     "jsonschema>=4,<5",
 ]
 
@@ -43,6 +48,8 @@ packages = ["src/llmmaxxing"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+asyncio_mode = "strict"
+asyncio_default_fixture_loop_scope = "function"
 
 [tool.ruff]
 line-length = 100
