@@ -77,9 +77,41 @@ def _run_control(_args: argparse.Namespace) -> int:
     raise NotImplementedError("control daemon ships in a later implementation task")
 
 
+def _run_db(args: argparse.Namespace) -> int:
+    import json
+
+    from llmmaxxing.storage import migrations
+
+    if args.db_action == "migrate":
+        try:
+            status = migrations.migrate_database(args.database_url)
+        except migrations.StorageError as error:
+            print(f"db migrate refused: {error}")
+            return 2
+        print(f"database at revision {status.current_revision} (head {status.head_revision})")
+        return 0
+    if args.db_action == "status":
+        status = migrations.schema_status(args.database_url)
+        print(
+            json.dumps(
+                {
+                    "revision": status.current_revision,
+                    "head": status.head_revision,
+                    "pending": status.pending,
+                    "installed": status.installed,
+                }
+            )
+        )
+        return 0 if status.at_head else 1
+    report = migrations.doctor(args.database_url)
+    print(json.dumps(report, indent=2, sort_keys=True))
+    return 0 if report["ok"] else 1
+
+
 DAEMONS: dict[str, Callable[[argparse.Namespace], int]] = {
     "gateway": _run_gateway,
     "control": _run_control,
+    "db": _run_db,
 }
 
 
@@ -89,7 +121,9 @@ def build_parser() -> argparse.ArgumentParser:
         description="LiteLLM admission, fair-queue and routing-policy control plane",
     )
     parser.add_argument("--version", action="version", version=f"llmmaxxing {__version__}")
-    subparsers = parser.add_subparsers(dest="command", required=True, metavar="{gateway,control}")
+    subparsers = parser.add_subparsers(
+        dest="command", required=True, metavar="{gateway,control,db}"
+    )
     gateway = subparsers.add_parser("gateway", help="run the gateway daemon")
     gateway.add_argument(
         "--factory",
@@ -103,6 +137,20 @@ def build_parser() -> argparse.ArgumentParser:
     gateway.add_argument("--host", default="0.0.0.0")
     gateway.add_argument("--port", type=int, default=4000)
     subparsers.add_parser("control", help="run the control daemon")
+    db = subparsers.add_parser("db", help="explicit Control database maintenance")
+    db_actions = db.add_subparsers(dest="db_action", required=True, metavar="{migrate,status,doctor}")
+    for action, help_text in (
+        ("migrate", "apply pending Control schema revisions (never automatic)"),
+        ("status", "report the applied revision against this build's head"),
+        ("doctor", "non-mutating schema and integrity health report"),
+    ):
+        command = db_actions.add_parser(action, help=help_text)
+        command.add_argument(
+            "--database-url",
+            default=os.environ.get("LLMMAXXING_DATABASE_URL"),
+            required=True,
+            help="sqlite / postgres DSN (LLMMAXXING_DATABASE_URL)",
+        )
     return parser
 
 
