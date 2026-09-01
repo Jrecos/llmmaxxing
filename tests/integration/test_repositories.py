@@ -522,7 +522,7 @@ async def test_outbox_audit_telemetry_and_backup_lifecycles_are_idempotent(store
         key_id="2" * 32,
         route_group_id="rg-1",
         policy_revision="pol-1",
-        terminal_outcome="succeeded",
+        terminal_outcome="completed",
         attempt_count=1,
         queue_wait_ms=5,
         ttft_ms=20,
